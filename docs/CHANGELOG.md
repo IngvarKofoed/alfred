@@ -3,4 +3,7 @@
 Each entry is numbered with a monotonically increasing integer. Append new entries to the end. Never reuse or reorder numbers. Numbers are globally unique across this file and any future `CHANGELOG-archive.md` — never reused.
 
 1. Scaffolded CLAUDE.md guidance (root + services/, packages/, clients/web/, clients/ios/, chrome-extension/) and split the column-level schema out of ARCHITECTURE.md §6.1 into docs/DATABASE.md.
+2. Wrote docs/specs/2026-06-01-foundation-web-ingress.md — spec for the first implementation increment (repo foundation + web ingress).
+3. Corrected ARCHITECTURE.md to be OS-agnostic: dropped the Windows-first framing and all WSL2 assumptions (§3/§4/§4.1/§5/§8/§18), and simplified §12 auth to "network position is the authentication" (single user, no per-request identity).
+4. Implemented the foundation + web ingress: pnpm workspace + tooling (tsconfig/eslint/prettier/vitest), packages/shared typed loadConfig(), services/webserver (Hono, /api/health, serves the SPA, loopback bind), clients/web (Vite + React + Tailwind stub showing "Alfred is reachable ✓"), and ecosystem.config.cjs. Builds, tests, lint all green.
 

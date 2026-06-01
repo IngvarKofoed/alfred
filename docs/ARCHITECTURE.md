@@ -22,7 +22,7 @@ Status: Initial design, pre-implementation
 
 - Single user (the owner). No multi-tenant concerns.
 - Self-hosted on a home server. No cloud VPS for the core platform.
-- **OS-agnostic**: the stack must run on Linux, macOS, or Windows (via WSL2). No OS-specific dependencies in the core.
+- **OS-agnostic**: the stack must run on Linux, macOS, or Windows natively. No OS-specific dependencies in the core.
 - **Pluggable LLM provider.** Default path is **OpenRouter** for multi-vendor access, but the agent core depends on a thin provider abstraction so direct Anthropic / OpenAI / Gemini / local Ollama can be swapped in by config without touching agent code.
 - Minimal moving parts. No infra component included "in case we need it later."
 
@@ -36,7 +36,7 @@ Status: Initial design, pre-implementation
 
 ## 2. High-Level Architecture
 
-OS-agnostic view. The same shape runs on Linux, macOS, or Windows+WSL2 — only filesystem paths and the process supervisor's host bindings differ. The Windows-specific seam is detailed in §4.1.
+OS-agnostic view. The same shape runs on Linux, macOS, or Windows — only filesystem paths and the process-supervisor registration differ. Windows-as-server notes are in §4.1.
 
 ```
 External clients
@@ -82,7 +82,7 @@ External clients
 
 ## 3. The Home Server
 
-**Hardware**: any always-on box at home — Mac mini, small Intel NUC, or a repurposed PC/laptop. The build assumes Windows 11 + WSL2 because that's the chosen target, but everything except the OS-specific supervisor would work the same on Linux or macOS.
+**Hardware**: any always-on box at home — Mac mini, small Intel NUC, or a repurposed PC/laptop. The stack is OS-agnostic and runs the simplest native way on whatever box the owner has; only the process-supervisor registration and a few filesystem paths differ by OS. (The owner's current box is a Windows machine, developed against from a Mac.)
 
 **Why a home box (not a VPS)**
 
@@ -104,32 +104,16 @@ The architecture is OS-agnostic. The same code runs on any of three deployment t
 |--------|--------------------|--------------|-------|
 | **Linux** (NUC, mini-PC, repurposed laptop) | pm2 (or systemd) | native Chrome on the same Linux box | Cleanest setup. No filesystem boundaries. |
 | **macOS** (Mac mini, old iMac) | pm2 (or launchd) | native Chrome on macOS | Quiet, low-power, "appliance" feel. |
-| **Windows 11 + WSL2** | pm2 inside WSL2 | native Chrome on Windows, talks to bridge in WSL2 via localhost | Requires care around the WSL2↔Windows seam (below). |
+| **Windows** | pm2 (or Task Scheduler) | native Chrome on Windows | Runs natively — no WSL2. See §4.1. |
 
 The stack itself (Node, Postgres, pg-boss, the apps) is identical across targets. Only the supervisor configuration and a few filesystem paths differ.
 
-### 4.1 Windows + WSL2 specifics
+### 4.1 Windows-as-server notes
 
-Only relevant if the chosen target is Windows.
-
-- Agent stack runs inside **WSL2 (Ubuntu)**. Chrome and Tailscale run on the Windows side.
-- Project code lives on the WSL2 ext4 filesystem (e.g. `/home/<user>/projects/alfred`), **never on `/mnt/c`** — DrvFS is order-of-magnitude slower for hot paths like `npm install` and file watchers.
-- Edit from Windows via VS Code's WSL Remote.
-- Cross-boundary file access (`/mnt/c/Users/.../Downloads`) is fine for occasional handoffs only.
-
-**The WSL2 ↔ Windows seams that matter**
-
-| Direction | Mechanism | Performance |
-|-----------|-----------|-------------|
-| Chrome extension (Win) → bridge (WSL) | WebSocket on `localhost:<port>` (WSL relay handles forwarding) | Negligible overhead |
-| Agent (WSL) → cloud APIs (internet) | Standard outbound HTTPS | Native |
-| Editor (Win) → code (WSL) | VS Code WSL Remote (`\\wsl$\Ubuntu\...`) | Fine for editing |
-| Anything (WSL) → Windows files (`/mnt/c/...`) | DrvFS | **Slow** — avoid for hot paths |
-
-**Windows-as-server hygiene**
+Only relevant if the box is Windows. The stack runs **natively** on Windows (Node + pnpm + pm2) — no WSL2, no DrvFS boundary, no relay. Develop on whatever machine (the owner's is a Mac); deploy the built stack to the Windows box. A few host settings make a desktop OS behave like a server:
 
 - Power: sleep set to "Never" on AC; display can sleep.
-- Auto-login enabled (the Chrome session needs a logged-in desktop).
+- Auto-login enabled (the Chrome session, later, needs a logged-in desktop).
 - Lock screen disabled on idle.
 - Windows Update active hours configured to never reboot mid-day.
 - Defender exclusions for the project directory and Chrome's working dirs.
@@ -138,7 +122,7 @@ Only relevant if the chosen target is Windows.
 
 ## 5. Process Topology
 
-All processes are native (no Docker). Managed by **pm2** — the same process supervisor on Linux, macOS, and inside WSL2. One config file (`ecosystem.config.js`) defines every process; one command (`pm2 start ecosystem.config.js`) brings everything up; `pm2 startup` registers pm2 itself with the host's init system (systemd on Linux, launchd on macOS, Task Scheduler on Windows) so everything survives reboot.
+All processes are native (no Docker). Managed by **pm2** — the same process supervisor on Linux, macOS, and Windows. One config file (`ecosystem.config.js`) defines every process; one command (`pm2 start ecosystem.config.js`) brings everything up; `pm2 startup` registers pm2 itself with the host's init system (systemd on Linux, launchd on macOS, Task Scheduler on Windows) so everything survives reboot.
 
 | Process | Language | Role | Restart policy |
 |---------|----------|------|----------------|
@@ -417,12 +401,12 @@ The agent uses the owner's real Chrome with all real logins. Automation is done 
 **Topology**
 
 ```
-Chrome (Windows, owner's profile)
+Chrome (owner's profile, on the server box)
 └─ Alfred extension (MV3)
      │
-     │ outbound WebSocket (auth token)
+     │ outbound WebSocket (auth token, localhost)
      ▼
-Browser bridge (WSL2)
+Browser bridge (same box)
    ├─ WebSocket server  ← extension connects here
    └─ MCP server (HTTP+SSE)  ← agent worker connects here
         │
@@ -439,7 +423,7 @@ Browser bridge (WSL2)
 
 **Bridge process**
 
-- WebSocket server on `0.0.0.0:<port>` inside WSL2 (wildcard bind so the WSL relay picks it up reliably).
+- WebSocket server on `127.0.0.1:<port>` — the extension and Chrome run on the same box, so it's a plain localhost connection (no WSL relay, no wildcard bind).
 - Auth: shared token presented by the extension on connect.
 - MCP server side uses **HTTP+SSE transport** (not stdio) so the bridge can outlive any single agent process — extension stays connected through worker restarts.
 - Exposes browser-shaped tools: `navigate`, `click`, `type`, `read_page`, `wait_for_selector`, `screenshot`, etc. Translates each into messages over the WebSocket.
@@ -747,13 +731,13 @@ Terminal (absorbing): `resolved`, `timed_out`, `cancelled`.
 
 ## 12. Authentication
 
-**Tailscale identity headers.** Hono middleware reads `Tailscale-User-Login` from incoming requests and trusts it because the server has no public exposure — only the owner's tailnet can reach it.
+**Network position is the authentication.** The server has no public exposure — only the owner's tailnet (and the LAN, behind the firewall) can reach it. For a single user there is no per-request identity to compute and nothing to log into: being able to connect *is* being the owner.
 
 - No login screen, no passwords, no Auth.js boilerplate.
-- Combine with a `tailscale serve` or Caddy-with-Tailscale-plugin frontend so the headers are populated cleanly.
-- The header check is a cheap second layer; the primary security is "no public network path to the server."
+- Expose the server via `tailscale serve` (or Caddy-with-Tailscale) — this also provides HTTPS, which the PWA's secure context needs.
+- Tailscale does inject identity headers (`Tailscale-User-Login`); reading them is **optional** and only matters if the system ever needs to distinguish *which* person is connecting. The single-user model doesn't, so the app reads no header.
 
-If access ever needs to extend beyond the tailnet (family, sharing), swap in Auth.js with magic-link or passkey at that point. Not before.
+If access ever needs to extend beyond a single owner (family, sharing), that's when real per-user auth goes in — Auth.js with magic-link or passkey, plus reading the identity header. Not before.
 
 Internal trust: Discord bot, voice service, and worker all run on the same machine in the same trust boundary — no inter-process auth needed.
 
@@ -974,7 +958,7 @@ Browser / phone (PWA, chat)      Native iOS app (chat + voice, post-MVP)
        │  Tailscale                       │  Tailscale
        ▼                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Home server (Linux / macOS / Windows+WSL2)                       │
+│ Home server (Linux / macOS / Windows — all native)              │
 │                                                                  │
 │  Chrome ─ extension ─ ws ─► browser-bridge                       │
 │                                  │                               │
@@ -1001,9 +985,9 @@ Browser / phone (PWA, chat)      Native iOS app (chat + voice, post-MVP)
 - **Tools are interchangeable**: MCP-sourced and built-in tools share one interface inside agent-core.
 - **Hand-rolled agent loop** — no framework dependency.
 - **Postgres is the only stateful infra** — state, job queue (pg-boss), and pub/sub (LISTEN/NOTIFY) all in one.
-- **Cross-platform**: pm2 supervises Node processes on Linux / macOS / Windows-via-WSL2 identically. No Docker.
+- **Cross-platform**: pm2 supervises Node processes natively on Linux / macOS / Windows identically. No Docker, no WSL2.
 - **Browser automation via Chrome extension** (undetectable) → bridge (MCP over HTTP+SSE) → agent.
 - **LLM provider abstraction**: OpenRouter by default, swappable to direct vendors or local models by config.
 - **Voice is native-iOS-app only** when it lands — cloud STT/TTS, server-side keys, OpenRouter still the brain.
 - **Observability from day one** via self-hosted Langfuse running alongside Postgres.
-- **Tailscale + Tailscale identity** = remote access + auth in one. No public exposure.
+- **Tailscale** = remote access; **network position is the auth** (no public exposure, single user — nothing to log into).
