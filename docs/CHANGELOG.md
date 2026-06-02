@@ -6,4 +6,6 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 2. Wrote docs/specs/2026-06-01-foundation-web-ingress.md — spec for the first implementation increment (repo foundation + web ingress).
 3. Corrected ARCHITECTURE.md to be OS-agnostic: dropped the Windows-first framing and all WSL2 assumptions (§3/§4/§4.1/§5/§8/§18), and simplified §12 auth to "network position is the authentication" (single user, no per-request identity).
 4. Implemented the foundation + web ingress: pnpm workspace + tooling (tsconfig/eslint/prettier/vitest), packages/shared typed loadConfig(), services/webserver (Hono, /api/health, serves the SPA, loopback bind), clients/web (Vite + React + Tailwind stub showing "Alfred is reachable ✓"), and ecosystem.config.cjs. Builds, tests, lint all green.
+5. Wrote docs/specs/2026-06-02-postgres-drizzle.md — spec for build-order step 2 (Postgres + Drizzle).
+6. Implemented build-order step 2: packages/db with the Drizzle schema (users/conversations/messages), a drizzle-kit migration, a typed node-postgres client, and app-side UUIDv7 IDs. Added POSTGRES_URL (optional) to the shared config. Integration test round-trips user→conversation→message in a rolled-back transaction (skips without POSTGRES_URL); verified end-to-end against a local Postgres 17.
 

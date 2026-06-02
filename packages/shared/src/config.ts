@@ -8,6 +8,9 @@ dotenv.config()
 // only the webserver port; later steps extend the schema.
 const schema = z.object({
   WEBSERVER_PORT: z.coerce.number().int().positive().default(3000),
+  // Optional so non-DB processes (e.g. the webserver) still boot without a database.
+  // packages/db enforces presence when a client is actually created.
+  POSTGRES_URL: z.string().url().optional(),
 })
 
 export type Config = z.infer<typeof schema>
