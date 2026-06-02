@@ -10,11 +10,18 @@
     "build": "pnpm -r build",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "db:start": "\"${ALFRED_PG_CTL:-/opt/homebrew/opt/postgresql@17/bin/pg_ctl}\" -D \"${ALFRED_PGDATA:-/opt/homebrew/var/postgresql@17}\" -l /tmp/alfred-pg.log start",
+    "db:stop": "\"${ALFRED_PG_CTL:-/opt/homebrew/opt/postgresql@17/bin/pg_ctl}\" -D \"${ALFRED_PGDATA:-/opt/homebrew/var/postgresql@17}\" stop",
+    "db:migrate": "pnpm --filter @alfred/db db:migrate",
+    "predev": "pnpm --filter \"./packages/*\" build",
+    "dev": "concurrently -k -n worker,server,web -c green,cyan,magenta \"pnpm --filter @alfred/worker dev\" \"pnpm --filter @alfred/webserver dev\" \"pnpm --filter @alfred/web dev\"",
+    "dev:up": "pnpm db:start ; pnpm db:migrate && pnpm dev"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
     "@types/node": "^22.7.0",
+    "concurrently": "^9.1.0",
     "eslint": "^9.13.0",
     "prettier": "^3.3.0",
     "typescript": "^5.6.0",

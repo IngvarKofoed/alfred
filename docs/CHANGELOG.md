@@ -15,4 +15,5 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 11. Fixed loadConfig (packages/shared) to load the repo-root .env regardless of cwd — it walks up to the pnpm-workspace.yaml root and loads its .env, so `pnpm --filter <pkg> dev` picks up a single root .env. Exported env vars still take precedence.
 12. Documented GEMINI_API_KEY + DEFAULT_MODEL in .env.example (the LLM keys added in step 3).
 13. Renamed the config key DEFAULT_MODEL -> GEMINI_MODEL (provider-scoped, so other providers can add OPENAI_MODEL/etc.). Updated shared config, the GeminiProvider, and .env.example.
+14. Added dev convenience scripts (root package.json): `dev` runs worker + webserver + web together via concurrently (predev builds the libs first); `dev:up` also starts Postgres and migrates; `db:start`/`db:stop`/`db:migrate` manage local Postgres (pg_ctl paths overridable via ALFRED_PG_CTL/ALFRED_PGDATA). Added the concurrently devDependency.
 
