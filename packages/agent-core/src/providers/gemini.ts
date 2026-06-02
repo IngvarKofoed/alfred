@@ -18,7 +18,7 @@ export class GeminiProvider implements LlmProvider {
       throw new Error('GEMINI_API_KEY is not set — required for the Gemini provider')
     }
     this.ai = new GoogleGenAI({ apiKey })
-    this.defaultModel = opts?.model ?? config.DEFAULT_MODEL
+    this.defaultModel = opts?.model ?? config.GEMINI_MODEL
   }
 
   async *stream(

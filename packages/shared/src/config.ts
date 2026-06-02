@@ -36,7 +36,8 @@ const schema = z.object({
   // Optional like POSTGRES_URL: agent-core's GeminiProvider fails fast if it's missing
   // when constructed, but non-LLM processes still boot without it.
   GEMINI_API_KEY: z.string().optional(),
-  DEFAULT_MODEL: z.string().default('gemini-2.5-flash'),
+  // Provider-scoped so other providers can add their own (OPENAI_MODEL, etc.).
+  GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
 })
 
 export type Config = z.infer<typeof schema>
