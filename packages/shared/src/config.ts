@@ -1,7 +1,29 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import dotenv from 'dotenv'
 import { z } from 'zod'
 
-dotenv.config()
+// Load the repo-root .env regardless of the process's cwd. `dotenv.config()` only looks
+// in cwd, which breaks `pnpm --filter <pkg> dev` (cwd = the package dir). Walk up to the
+// workspace root (where pnpm-workspace.yaml lives) and load its .env. dotenv never
+// overrides already-set env vars, so exported vars still win.
+function loadDotenv(): void {
+  let dir = process.cwd()
+  for (;;) {
+    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) {
+      dotenv.config({ path: path.join(dir, '.env') }) // missing file is a harmless no-op
+      return
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      dotenv.config() // not inside the workspace — fall back to cwd
+      return
+    }
+    dir = parent
+  }
+}
+
+loadDotenv()
 
 // The typed-config pattern (ARCHITECTURE §13): every process imports loadConfig(),
 // validates the subset it needs with zod, and fails fast at boot. This slice needs
