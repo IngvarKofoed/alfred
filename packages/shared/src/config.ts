@@ -11,6 +11,10 @@ const schema = z.object({
   // Optional so non-DB processes (e.g. the webserver) still boot without a database.
   // packages/db enforces presence when a client is actually created.
   POSTGRES_URL: z.string().url().optional(),
+  // Optional like POSTGRES_URL: agent-core's GeminiProvider fails fast if it's missing
+  // when constructed, but non-LLM processes still boot without it.
+  GEMINI_API_KEY: z.string().optional(),
+  DEFAULT_MODEL: z.string().default('gemini-2.5-flash'),
 })
 
 export type Config = z.infer<typeof schema>
