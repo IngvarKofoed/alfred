@@ -9,5 +9,12 @@ module.exports = {
       env: { NODE_ENV: 'production' },
       autorestart: true,
     },
+    {
+      name: 'alfred-worker',
+      cwd: __dirname,
+      script: 'services/worker/dist/index.js',
+      env: { NODE_ENV: 'production' },
+      autorestart: true,
+    },
   ],
 }

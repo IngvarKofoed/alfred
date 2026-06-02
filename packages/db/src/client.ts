@@ -5,23 +5,34 @@ import * as schema from './schema.js'
 
 export type Db = NodePgDatabase<typeof schema>
 
-// Build a client against an explicit connection string (used by tests and migrations).
+// Build a client against an explicit connection string (used by tests).
 export function createDb(connectionString: string): Db {
-  const pool = new pg.Pool({ connectionString })
-  return drizzle(pool, { schema })
+  return drizzle(new pg.Pool({ connectionString }), { schema })
 }
 
-let cached: Db | null = null
+let cachedPool: pg.Pool | null = null
+let cachedDb: Db | null = null
 
-// Lazy singleton for application processes. Fails fast if POSTGRES_URL is unset —
-// the URL is optional in the shared config so non-DB processes (e.g. the webserver)
-// still boot, but anything that actually opens a client requires it.
-export function getDb(): Db {
-  if (cached) return cached
+function requireUrl(): string {
   const { POSTGRES_URL } = loadConfig()
   if (!POSTGRES_URL) {
-    throw new Error('POSTGRES_URL is not set — required to create the database client')
+    throw new Error('POSTGRES_URL is not set — required to use the database')
   }
-  cached = createDb(POSTGRES_URL)
-  return cached
+  return POSTGRES_URL
+}
+
+// Shared connection pool for application processes (drizzle + raw queries like NOTIFY).
+export function getPool(): pg.Pool {
+  if (!cachedPool) cachedPool = new pg.Pool({ connectionString: requireUrl() })
+  return cachedPool
+}
+
+export function getDb(): Db {
+  if (!cachedDb) cachedDb = drizzle(getPool(), { schema })
+  return cachedDb
+}
+
+// Fire a Postgres NOTIFY on `channel` with a string `payload` (≤ 8000 bytes, §6.2).
+export async function pgNotify(channel: string, payload: string): Promise<void> {
+  await getPool().query('SELECT pg_notify($1, $2)', [channel, payload])
 }
