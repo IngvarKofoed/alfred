@@ -7,6 +7,7 @@ export interface LlmTrace {
   request: Message[]
   responseText: string
   promptTokens?: number
+  cachedTokens?: number
   completionTokens?: number
   finishReason?: string
   latencyMs: number
@@ -30,6 +31,7 @@ export class TracingProvider implements LlmProvider {
     let model = opts?.model ?? 'unknown'
     let responseText = ''
     let promptTokens: number | undefined
+    let cachedTokens: number | undefined
     let completionTokens: number | undefined
     let finishReason: string | undefined
     let error: string | undefined
@@ -41,6 +43,7 @@ export class TracingProvider implements LlmProvider {
         } else if (ev.type === 'usage') {
           model = ev.model
           promptTokens = ev.promptTokens
+          cachedTokens = ev.cachedTokens
           completionTokens = ev.completionTokens
           finishReason = ev.finishReason
         }
@@ -55,6 +58,7 @@ export class TracingProvider implements LlmProvider {
         request: messages,
         responseText,
         promptTokens,
+        cachedTokens,
         completionTokens,
         finishReason,
         latencyMs: Date.now() - start,

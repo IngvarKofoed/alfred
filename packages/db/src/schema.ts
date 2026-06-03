@@ -110,6 +110,7 @@ export const llmCalls = pgTable(
     responseText: text('response_text').notNull().default(''),
     promptTokens: integer('prompt_tokens').notNull().default(0),
     completionTokens: integer('completion_tokens').notNull().default(0),
+    costUsd: numeric('cost_usd', { precision: 10, scale: 6 }).notNull().default('0'),
     finishReason: text('finish_reason'),
     latencyMs: integer('latency_ms').notNull().default(0),
     error: text('error'),

@@ -42,6 +42,7 @@ export class GeminiProvider implements LlmProvider {
     // Gemini function calls carry no stable id; synthesize one per call for our model.
     let callIndex = 0
     let promptTokens: number | undefined
+    let cachedTokens: number | undefined
     let completionTokens: number | undefined
     let finishReason: string | undefined
     for await (const chunk of response) {
@@ -57,13 +58,15 @@ export class GeminiProvider implements LlmProvider {
       }
       if (chunk.usageMetadata) {
         promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens
+        // promptTokenCount is the TOTAL input incl. cached; this is the cached subset.
+        cachedTokens = chunk.usageMetadata.cachedContentTokenCount ?? cachedTokens
         completionTokens = chunk.usageMetadata.candidatesTokenCount ?? completionTokens
       }
       const fr = chunk.candidates?.[0]?.finishReason
       if (fr) finishReason = String(fr)
     }
 
-    yield { type: 'usage', model, promptTokens, completionTokens, finishReason }
+    yield { type: 'usage', model, promptTokens, cachedTokens, completionTokens, finishReason }
   }
 }
 

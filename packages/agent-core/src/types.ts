@@ -21,6 +21,9 @@ export type StreamEvent =
       type: 'usage'
       model: string
       promptTokens?: number
+      // Subset of promptTokens served from context cache (billed at the cheaper cached
+      // rate). Gemini 2.5 caches implicitly, so this can be non-zero without us asking.
+      cachedTokens?: number
       completionTokens?: number
       finishReason?: string
     }

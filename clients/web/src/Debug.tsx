@@ -9,6 +9,7 @@ type RunRow = {
   finishedAt: string | null
   promptTokens: number
   completionTokens: number
+  costUsd: string | null
   error: string | null
 }
 
@@ -19,6 +20,7 @@ type LlmCall = {
   responseText: string
   promptTokens: number
   completionTokens: number
+  costUsd: string | null
   finishReason: string | null
   latencyMs: number
   error: string | null
@@ -62,6 +64,7 @@ export default function Debug() {
               <th>Status</th>
               <th>Model</th>
               <th className="text-right">Tokens</th>
+              <th className="text-right">Cost</th>
             </tr>
           </thead>
           <tbody>
@@ -75,11 +78,12 @@ export default function Debug() {
                 <td className={statusColor(r.status)}>{r.status}</td>
                 <td className="text-zinc-400">{r.model ?? '—'}</td>
                 <td className="text-right text-zinc-400">{r.promptTokens + r.completionTokens}</td>
+                <td className="text-right text-zinc-400">{usd(r.costUsd)}</td>
               </tr>
             ))}
             {runs.length === 0 && (
               <tr>
-                <td colSpan={4} className="py-4 text-center text-zinc-500">
+                <td colSpan={5} className="py-4 text-center text-zinc-500">
                   No runs yet.
                 </td>
               </tr>
@@ -98,6 +102,8 @@ export default function Debug() {
             <div key={call.id} className="rounded-md bg-zinc-900 p-3">
               <div className="text-zinc-400">
                 {call.model} · {call.latencyMs}ms · {call.promptTokens}+{call.completionTokens} tok
+                {' · '}
+                {usd(call.costUsd)}
                 {call.finishReason ? ` · ${call.finishReason}` : ''}
               </div>
               {call.error && <div className="mt-1 text-red-400">{call.error}</div>}
@@ -118,6 +124,16 @@ export default function Debug() {
       )}
     </div>
   )
+}
+
+// cost_usd arrives as a numeric string. Trim trailing zeros so sub-cent costs stay
+// legible (e.g. $0.0012) without padding every value to 6 decimals.
+function usd(v: string | null): string {
+  if (v == null) return '—'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '—'
+  if (n === 0) return '$0'
+  return '$' + n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')
 }
 
 function when(r: RunRow): string {

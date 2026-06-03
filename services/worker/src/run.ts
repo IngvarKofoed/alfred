@@ -1,6 +1,7 @@
 import {
   type ApprovalRequest,
   type ApprovalVerdict,
+  computeCostUsd,
   echoTool,
   GeminiProvider,
   type LlmProvider,
@@ -57,13 +58,21 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     const base = deps.provider ?? new GeminiProvider()
     // Decorate with tracing: each provider call persists an llm_calls row (observability).
     const provider = new TracingProvider(base, async (trace) => {
+      const promptTokens = trace.promptTokens ?? 0
+      const completionTokens = trace.completionTokens ?? 0
       await db.insert(llmCalls).values({
         agentRunId: runId,
         model: trace.model,
         request: trace.request,
         responseText: trace.responseText,
-        promptTokens: trace.promptTokens ?? 0,
-        completionTokens: trace.completionTokens ?? 0,
+        promptTokens,
+        completionTokens,
+        costUsd: computeCostUsd(
+          trace.model,
+          promptTokens,
+          completionTokens,
+          trace.cachedTokens ?? 0,
+        ).toFixed(6),
         finishReason: trace.finishReason ?? null,
         latencyMs: trace.latencyMs,
         error: trace.error ?? null,
@@ -129,36 +138,48 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       }
     }
 
-    // Roll up token usage + model from the run's llm_calls onto the run.
-    const calls = await db
-      .select({
-        promptTokens: llmCalls.promptTokens,
-        completionTokens: llmCalls.completionTokens,
-        model: llmCalls.model,
-      })
-      .from(llmCalls)
-      .where(eq(llmCalls.agentRunId, runId))
-    const promptTokens = calls.reduce((sum, row) => sum + row.promptTokens, 0)
-    const completionTokens = calls.reduce((sum, row) => sum + row.completionTokens, 0)
-
     await db
       .update(agentRuns)
-      .set({
-        status: 'done',
-        finishedAt: new Date(),
-        promptTokens,
-        completionTokens,
-        model: calls.at(-1)?.model ?? null,
-      })
+      .set({ status: 'done', finishedAt: new Date(), ...(await rollupUsage(db, runId)) })
       .where(eq(agentRuns.id, runId))
     await notifyRun(run.conversationId, { type: 'done' })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    // Roll up usage on failure too: llm_calls rows are written per call (even when the
+    // run later throws), so a run that made paid calls before failing still reports its
+    // true cost/tokens rather than the 0 default.
     await db
       .update(agentRuns)
-      .set({ status: 'failed', finishedAt: new Date(), error: message })
+      .set({
+        status: 'failed',
+        finishedAt: new Date(),
+        error: message,
+        ...(await rollupUsage(db, runId)),
+      })
       .where(eq(agentRuns.id, runId))
     await notifyRun(run.conversationId, { type: 'error', message })
+  }
+}
+
+// Sum token usage + cost (and pick the model) from a run's llm_calls, shaped for an
+// agent_runs update. costUsd is numeric → string in JS; summed as floats and stored at
+// 6-decimal scale. Used on both the done and failed paths so cost accounting is honest
+// regardless of outcome.
+async function rollupUsage(db: ReturnType<typeof getDb>, runId: string) {
+  const calls = await db
+    .select({
+      promptTokens: llmCalls.promptTokens,
+      completionTokens: llmCalls.completionTokens,
+      costUsd: llmCalls.costUsd,
+      model: llmCalls.model,
+    })
+    .from(llmCalls)
+    .where(eq(llmCalls.agentRunId, runId))
+  return {
+    promptTokens: calls.reduce((sum, row) => sum + row.promptTokens, 0),
+    completionTokens: calls.reduce((sum, row) => sum + row.completionTokens, 0),
+    costUsd: calls.reduce((sum, row) => sum + Number(row.costUsd), 0).toFixed(6),
+    model: calls.at(-1)?.model ?? null,
   }
 }
 

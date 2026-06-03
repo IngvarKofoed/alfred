@@ -172,6 +172,7 @@ app.get('/api/debug/runs', async (c) => {
       finishedAt: agentRuns.finishedAt,
       promptTokens: agentRuns.promptTokens,
       completionTokens: agentRuns.completionTokens,
+      costUsd: agentRuns.costUsd,
       error: agentRuns.error,
     })
     .from(agentRuns)
