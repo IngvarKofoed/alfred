@@ -10,22 +10,11 @@ type RunEvent =
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
   | { type: 'interaction_resolved'; interactionId: string }
 
-function getConversationId(): string {
-  const KEY = 'alfred.conversationId'
-  let id = localStorage.getItem(KEY)
-  if (!id) {
-    id = crypto.randomUUID()
-    localStorage.setItem(KEY, id)
-  }
-  return id
-}
-
 function textOf(content: ContentPart[]): string {
   return content.map((p) => (p.type === 'text' ? (p.text ?? '') : '')).join('')
 }
 
-export default function Chat() {
-  const conversationId = useRef(getConversationId()).current
+export default function Chat({ conversationId }: { conversationId: string }) {
   const [history, setHistory] = useState<ChatMessage[]>([])
   const [streaming, setStreaming] = useState('')
   const [busy, setBusy] = useState(false)
@@ -33,6 +22,9 @@ export default function Chat() {
   const [approval, setApproval] = useState<{ interactionId: string; prompt: ApprovalPrompt } | null>(
     null,
   )
+  const scrollRef = useRef<HTMLDivElement>(null)
+  // Whether to keep pinning to the bottom; false once the user scrolls up to read.
+  const stick = useRef(true)
 
   const loadHistory = () =>
     fetch(`/api/conversations/${conversationId}/messages`)
@@ -68,11 +60,26 @@ export default function Chat() {
     return () => es.close()
   }, [conversationId])
 
+  // Keep the latest turn in view as messages arrive and tokens stream in.
+  // Instant (not smooth) so it reliably tracks fast token updates; only pins
+  // when the user is already at the bottom, so scrolling up to read isn't fought.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el && stick.current) el.scrollTop = el.scrollHeight
+  }, [history, streaming, busy, approval])
+
+  const onScroll = () => {
+    const el = scrollRef.current
+    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
+
   const send = async () => {
     const text = input.trim()
     if (!text || busy) return
     setInput('')
     setBusy(true)
+    stick.current = true // sending implies wanting to follow the new turn
+
     setHistory((h) => [...h, { role: 'user', content: [{ type: 'text', text }] }])
     const res = await fetch(`/api/conversations/${conversationId}/messages`, {
       method: 'POST',
@@ -102,71 +109,84 @@ export default function Chat() {
     }).catch(() => {})
   }
 
+  const empty = history.length === 0 && !streaming
+
   return (
     <>
-      <div className="flex-1 space-y-3 overflow-y-auto p-4">
-        {history.length === 0 && !streaming && (
-          <p className="pt-8 text-center text-zinc-500">Say hello to Alfred.</p>
+      <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-5 py-6">
+        {empty && (
+          <div className="flex h-full flex-col items-center justify-center text-center">
+            <p className="text-2xl font-medium text-ink-dim">Good day, Ingvar.</p>
+            <p className="mt-2 text-sm text-muted">How may I be of service?</p>
+          </div>
         )}
-        {history.map((m, i) => (
-          <Bubble key={m.id ?? i} role={m.role} text={textOf(m.content)} />
-        ))}
-        {streaming && <Bubble role="assistant" text={streaming} />}
+        <div className="mx-auto flex max-w-xl flex-col gap-5">
+          {history.map((m, i) => (
+            <Bubble key={m.id ?? i} role={m.role} text={textOf(m.content)} />
+          ))}
+          {streaming ? (
+            <Bubble role="assistant" text={streaming} />
+          ) : (
+            busy && <Thinking />
+          )}
+        </div>
       </div>
+
       {approval && (
-        <div className="border-t border-zinc-800 p-3">
-          <div className="rounded-xl border border-emerald-700/50 bg-zinc-900 p-4">
-            <p className="font-medium text-zinc-100">
-              {approval.prompt?.summary ?? 'Approve action'}
-            </p>
+        <div className="px-5 pb-3">
+          <div className="mx-auto max-w-xl rounded-2xl border border-brass/40 bg-paper-raised p-4 shadow-lg">
+            <p className="text-base font-medium text-ink">{approval.prompt?.summary ?? 'Approve action'}</p>
             {approval.prompt?.tool && (
-              <p className="mt-1 text-sm text-zinc-400">
-                Tool: <span className="font-mono text-emerald-400">{approval.prompt.tool}</span>
+              <p className="mt-1 text-sm text-muted">
+                Tool: <span className="font-mono text-brass">{approval.prompt.tool}</span>
               </p>
             )}
-            <pre className="mt-2 max-h-48 overflow-auto rounded-md bg-zinc-950 p-3 text-xs text-zinc-300">
+            <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-paper p-3 font-mono text-xs text-ink-dim">
               {JSON.stringify(approval.prompt?.args ?? {}, null, 2)}
             </pre>
-            <div className="mt-3 flex gap-2">
+            <div className="mt-4 flex gap-2">
               <button
                 type="button"
                 onClick={() => void resolveApproval(true)}
-                className="rounded-md bg-emerald-600 px-4 py-2 font-medium hover:bg-emerald-500"
+                className="rounded-full bg-brass px-5 py-2 font-medium text-paper transition-colors hover:bg-brass-soft"
               >
-                ✅ Approve
+                Approve
               </button>
               <button
                 type="button"
                 onClick={() => void resolveApproval(false)}
-                className="rounded-md bg-zinc-700 px-4 py-2 font-medium hover:bg-zinc-600"
+                className="rounded-full border border-line px-5 py-2 font-medium text-ink-dim transition-colors hover:border-ink-dim hover:text-ink"
               >
-                ❌ Reject
+                Decline
               </button>
             </div>
           </div>
         </div>
       )}
+
       <form
-        className="flex gap-2 border-t border-zinc-800 p-3"
+        className="border-t border-line px-5 py-4"
         onSubmit={(e) => {
           e.preventDefault()
           void send()
         }}
       >
-        <input
-          className="flex-1 rounded-md bg-zinc-900 px-3 py-2 outline-none placeholder:text-zinc-500"
-          placeholder={busy ? 'Alfred is thinking…' : 'Message Alfred…'}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          disabled={busy}
-        />
-        <button
-          type="submit"
-          disabled={busy || !input.trim()}
-          className="rounded-md bg-emerald-600 px-4 py-2 font-medium disabled:opacity-40"
-        >
-          Send
-        </button>
+        <div className="mx-auto flex max-w-xl items-center gap-2 rounded-full border border-line bg-paper-raised px-2 py-1 transition-colors focus-within:border-brass/60">
+          <input
+            className="flex-1 bg-transparent px-3 py-2 text-ink outline-none placeholder:text-muted"
+            placeholder={busy ? 'Alfred is attending to this…' : 'Message Alfred…'}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={busy}
+          />
+          <button
+            type="submit"
+            disabled={busy || !input.trim()}
+            className="rounded-full bg-brass px-4 py-2 text-sm font-medium text-paper transition-colors hover:bg-brass-soft disabled:opacity-30"
+          >
+            Send
+          </button>
+        </div>
       </form>
     </>
   )
@@ -174,15 +194,38 @@ export default function Chat() {
 
 function Bubble({ role, text }: { role: string; text: string }) {
   const isUser = role === 'user'
+  if (isUser) {
+    return (
+      <div className="flex justify-end" style={{ animation: 'alfred-rise 0.25s ease-out' }}>
+        <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-surface px-4 py-2.5 text-ink">
+          {text}
+        </div>
+      </div>
+    )
+  }
   return (
-    <div className={isUser ? 'text-right' : 'text-left'}>
-      <span
-        className={`inline-block max-w-[85%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-left ${
-          isUser ? 'bg-emerald-700' : 'bg-zinc-800'
-        }`}
-      >
+    <div className="flex flex-col gap-1" style={{ animation: 'alfred-rise 0.25s ease-out' }}>
+      <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
+      <div className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink">
         {text}
-      </span>
+      </div>
+    </div>
+  )
+}
+
+function Thinking() {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
+      <div className="flex gap-1 py-1">
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className="h-1.5 w-1.5 rounded-full bg-brass"
+            style={{ animation: `alfred-blink 1.2s ease-in-out ${i * 0.18}s infinite` }}
+          />
+        ))}
+      </div>
     </div>
   )
 }

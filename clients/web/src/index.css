@@ -1,1 +1,74 @@
 @import 'tailwindcss';
+
+/* Alfred — "study at night": warm espresso ground, cream ink, a single brass accent.
+   Hanken Grotesk throughout — a clean, highly legible grotesque. */
+@theme {
+  --color-paper: #1b1714;
+  --color-paper-raised: #221d18;
+  --color-surface: #2a241d;
+  --color-ink: #ece3d3;
+  --color-ink-dim: #b6ab98;
+  --color-muted: #8c8170;
+  --color-line: #3a3228;
+  --color-brass: #cda35f;
+  --color-brass-soft: #e0c692;
+
+  --font-sans: 'Hanken Grotesk Variable', ui-sans-serif, system-ui, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  background-color: var(--color-paper);
+  /* A faint warm vignette + paper grain so the ground reads as a lamplit desk,
+     not a flat fill. */
+  background-image:
+    radial-gradient(120% 90% at 50% -10%, rgba(205, 163, 95, 0.08), transparent 55%),
+    radial-gradient(100% 80% at 50% 120%, rgba(0, 0, 0, 0.35), transparent 60%);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Quiet brass-tinted scrollbars to match the palette. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: var(--color-line);
+  border-radius: 9999px;
+}
+
+@keyframes alfred-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes alfred-blink {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
