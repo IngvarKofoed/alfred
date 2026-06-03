@@ -1,14 +1,24 @@
 import {
+  type ApprovalRequest,
+  type ApprovalVerdict,
+  echoTool,
   GeminiProvider,
   type LlmProvider,
   type Message,
   runAgent,
   TracingProvider,
 } from '@alfred/agent-core'
-import { agentRuns, getDb, llmCalls, messages } from '@alfred/db'
-import { asc, eq } from 'drizzle-orm'
+import { agentRuns, getDb, llmCalls, messages, toolCalls, userInteractions } from '@alfred/db'
+import { loadConfig } from '@alfred/shared'
+import { and, asc, eq } from 'drizzle-orm'
+import pg from 'pg'
 import { notifyRun } from './events.js'
 import { rowsToMessages } from './messages.js'
+import { makeSetTitleTool } from './tools.js'
+
+// MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
+// lease sits just above it so a job blocked on approval outlives the timeout.
+const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
 
 // Minimal system prompt for now; full persona assembly (§7.5) is deferred.
 const SYSTEM_PROMPT = 'You are Alfred, a helpful personal assistant. Be concise and direct.'
@@ -60,9 +70,16 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       })
     })
 
+    // Built-in tools for this run: echo (read, runs freely) + a context-bound write tool.
+    const tools = [echoTool, makeSetTitleTool(run.conversationId)]
+
+    // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval
+    // can update the row the loop is talking about.
+    const toolCallRowIds = new Map<string, string>()
+
     const finalMessages = await runAgent({
       provider,
-      tools: [],
+      tools,
       messages: history,
       model: run.model ?? undefined,
       onText: (delta) => {
@@ -70,6 +87,34 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
           notifyRun(run.conversationId, { type: 'token', text: delta }),
         )
       },
+      onToolStart: async (call) => {
+        const [row] = await db
+          .insert(toolCalls)
+          .values({
+            agentRunId: runId,
+            toolName: call.name,
+            args: call.args,
+            trustTier: call.trustTier,
+            status: call.trustTier === 'read' ? 'running' : 'pending',
+            startedAt: new Date(),
+          })
+          .returning({ id: toolCalls.id })
+        toolCallRowIds.set(call.id, row!.id)
+      },
+      onToolEnd: async (call, outcome) => {
+        const rowId = toolCallRowIds.get(call.id)
+        if (!rowId) return
+        await db
+          .update(toolCalls)
+          .set({
+            status: outcome.status,
+            result: outcome.result ?? null,
+            error: outcome.error ?? null,
+            finishedAt: new Date(),
+          })
+          .where(eq(toolCalls.id, rowId))
+      },
+      requestApproval: (call) => requestApproval(db, run.conversationId, runId, toolCallRowIds, call),
     })
     await notifyChain
 
@@ -115,4 +160,116 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       .where(eq(agentRuns.id, runId))
     await notifyRun(run.conversationId, { type: 'error', message })
   }
+}
+
+// The approval gate (§10.2–§10.4, §16). For a write/destructive call: persist the
+// interaction, surface it over NOTIFY, and BLOCK on a dedicated LISTEN until the owner
+// resolves it (or a 1h timeout flips it to timed_out). No durable resume — a crash
+// sweeps the run to failed on startup (§7.6).
+async function requestApproval(
+  db: ReturnType<typeof getDb>,
+  conversationId: string,
+  runId: string,
+  toolCallRowIds: Map<string, string>,
+  call: ApprovalRequest,
+): Promise<ApprovalVerdict> {
+  const toolCallId = toolCallRowIds.get(call.id) ?? null
+
+  // (a) the tool_call is now waiting on the user.
+  if (toolCallId) {
+    await db
+      .update(toolCalls)
+      .set({ status: 'awaiting_user' })
+      .where(eq(toolCalls.id, toolCallId))
+  }
+
+  // (b) record the pending interaction (the approval card the client renders).
+  const [interaction] = await db
+    .insert(userInteractions)
+    .values({
+      agentRunId: runId,
+      toolCallId,
+      kind: 'approval',
+      prompt: {
+        summary: 'Run ' + call.name,
+        tool: call.name,
+        args: call.args,
+        trust_tier: call.trustTier,
+      },
+      status: 'pending',
+    })
+    .returning({ id: userInteractions.id })
+  const interactionId = interaction!.id
+
+  // (c) the run is parked awaiting approval; (d) tell the client.
+  await db
+    .update(agentRuns)
+    .set({ status: 'awaiting_approval' })
+    .where(eq(agentRuns.id, runId))
+  await notifyRun(conversationId, { type: 'interaction_required', interactionId, kind: 'approval' })
+
+  // (e) block until resolved on a dedicated LISTEN connection.
+  const { POSTGRES_URL } = loadConfig()
+  if (!POSTGRES_URL) throw new Error('POSTGRES_URL is not set — required to await approval')
+  const client = new pg.Client({ connectionString: POSTGRES_URL })
+  await client.connect()
+
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    await new Promise<void>((resolve) => {
+      let done = false
+      const finish = () => {
+        if (done) return
+        done = true
+        resolve()
+      }
+
+      client.on('notification', (msg) => {
+        if (!msg.payload) return
+        try {
+          const event = JSON.parse(msg.payload)
+          if (event.type === 'interaction_resolved' && event.interactionId === interactionId) {
+            finish()
+          }
+        } catch {
+          // ignore malformed payloads
+        }
+      })
+
+      // 1h timeout: conditionally flip a still-pending interaction to timed_out, then wake.
+      timeout = setTimeout(() => {
+        void db
+          .update(userInteractions)
+          .set({ status: 'timed_out', resolvedAt: new Date() })
+          .where(and(eq(userInteractions.id, interactionId), eq(userInteractions.status, 'pending')))
+          .then(() => finish())
+      }, APPROVAL_TIMEOUT_MS)
+
+      // Subscribe, then check once for a resolution that raced the LISTEN.
+      client
+        .query(`LISTEN "conversation:${conversationId}"`)
+        .then(() => db.select().from(userInteractions).where(eq(userInteractions.id, interactionId)))
+        .then(([row]) => {
+          if (row && row.status !== 'pending') finish()
+        })
+    })
+  } finally {
+    if (timeout) clearTimeout(timeout)
+    await client.query(`UNLISTEN "conversation:${conversationId}"`).catch(() => {})
+    await client.end().catch(() => {})
+  }
+
+  // (f) read the verdict, resume the run, return it.
+  const [resolved] = await db
+    .select({ response: userInteractions.response })
+    .from(userInteractions)
+    .where(eq(userInteractions.id, interactionId))
+  const response = resolved?.response as { approved?: boolean; note?: string } | null
+  const verdict: ApprovalVerdict = response?.approved
+    ? { approved: true, note: response.note }
+    : { approved: false, note: response?.note }
+
+  await db.update(agentRuns).set({ status: 'running' }).where(eq(agentRuns.id, runId))
+
+  return verdict
 }

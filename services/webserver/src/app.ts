@@ -6,10 +6,12 @@ import {
   llmCalls,
   messages,
   OWNER_USER_ID,
+  pgNotify,
+  userInteractions,
   users,
 } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
-import { asc, desc, eq } from 'drizzle-orm'
+import { and, asc, desc, eq } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import pg from 'pg'
@@ -111,6 +113,49 @@ app.get('/api/conversations/:id/stream', (c) => {
     await client.query(`UNLISTEN "${channel}"`).catch(() => {})
     await client.end().catch(() => {})
   })
+})
+
+// Fetch an interaction (e.g. an approval prompt) so the client can render its card.
+app.get('/api/interactions/:id', async (c) => {
+  const id = c.req.param('id')
+  if (!UUID_RE.test(id)) return c.json({ error: 'invalid interaction id' }, 400)
+  const [row] = await getDb().select().from(userInteractions).where(eq(userInteractions.id, id))
+  if (!row) return c.json({ error: 'not found' }, 404)
+  return c.json({ interaction: row })
+})
+
+// Resolve an interaction (first-writer-wins): the conditional UPDATE only matches a
+// still-pending row, so a second resolver (or a timeout) loses -> 409.
+app.post('/api/interactions/:id', async (c) => {
+  const id = c.req.param('id')
+  if (!UUID_RE.test(id)) return c.json({ error: 'invalid interaction id' }, 400)
+
+  const body = (await c.req.json().catch(() => ({}))) as { approved?: boolean; note?: string }
+  const { approved, note } = body
+  if (typeof approved !== 'boolean') return c.json({ error: 'approved is required' }, 400)
+
+  const db = getDb()
+  const [row] = await db
+    .update(userInteractions)
+    .set({
+      response: { approved, note },
+      status: 'resolved',
+      resolvedVia: 'web',
+      resolvedAt: new Date(),
+    })
+    .where(and(eq(userInteractions.id, id), eq(userInteractions.status, 'pending')))
+    .returning()
+  if (!row) return c.json({ error: 'already resolved' }, 409)
+
+  const [run] = await db
+    .select({ conversationId: agentRuns.conversationId })
+    .from(agentRuns)
+    .where(eq(agentRuns.id, row.agentRunId))
+  await pgNotify(
+    `conversation:${run!.conversationId}`,
+    JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
+  )
+  return c.json({ ok: true })
 })
 
 // --- Debug / observability (read-only) ---

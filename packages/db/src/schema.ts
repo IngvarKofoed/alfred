@@ -117,3 +117,57 @@ export const llmCalls = pgTable(
   },
   (t) => [index('llm_calls_run_created_idx').on(t.agentRunId, t.createdAt)],
 )
+
+// tool_calls: one row per tool invocation, the audit trail (ARCHITECTURE §16).
+// status: pending -> running -> done | failed (read), or pending -> awaiting_user ->
+// running -> done | failed | rejected (write/destructive). trust_tier is declared in
+// code for built-ins, never server-declared (§7.3).
+export const toolCalls = pgTable(
+  'tool_calls',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    agentRunId: uuid('agent_run_id')
+      .notNull()
+      .references(() => agentRuns.id),
+    toolName: text('tool_name').notNull(),
+    args: jsonb('args').notNull(),
+    result: jsonb('result'), // nullable until completion
+    trustTier: text('trust_tier').notNull(), // 'read' | 'write' | 'destructive'
+    status: text('status').notNull(), // 'pending' | 'awaiting_user' | 'running' | 'done' | 'rejected' | 'failed'
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+    error: text('error'),
+  },
+  (t) => [index('tool_calls_run_started_idx').on(t.agentRunId, t.startedAt)],
+)
+
+// user_interactions: any moment the run pauses for user input (approval | question).
+// status: pending -> resolved | timed_out | cancelled (single exit, conditional UPDATE).
+// The partial pending index powers the "pending interactions" inbox lookup.
+export const userInteractions = pgTable(
+  'user_interactions',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    agentRunId: uuid('agent_run_id')
+      .notNull()
+      .references(() => agentRuns.id),
+    toolCallId: uuid('tool_call_id').references(() => toolCalls.id), // the call that triggered this
+    kind: text('kind').notNull(), // 'approval' | 'question'
+    prompt: jsonb('prompt').notNull(), // structured; shape depends on kind
+    response: jsonb('response'), // structured; nullable until resolved
+    status: text('status').notNull(), // 'pending' | 'resolved' | 'cancelled' | 'timed_out'
+    resolvedVia: text('resolved_via'), // nullable: 'web' | 'discord' | 'voice'
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('user_interactions_run_idx').on(t.agentRunId),
+    index('user_interactions_pending_idx')
+      .on(t.status)
+      .where(sql`status = 'pending'`),
+  ],
+)

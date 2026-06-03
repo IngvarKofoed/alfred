@@ -36,7 +36,7 @@ export async function enqueueAgentRun(runId: string): Promise<void> {
   const b = await getBoss()
   await b.send(AGENT_RUN_QUEUE, { runId } satisfies AgentJob, {
     retryLimit: 0,
-    expireInSeconds: 60 * 60,
+    expireInSeconds: 4500,
   })
 }
 

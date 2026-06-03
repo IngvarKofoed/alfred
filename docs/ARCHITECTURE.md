@@ -429,6 +429,8 @@ Browser bridge (same box)
 
 **Tab model & mutex**: the browser is a single physical resource shared across all runs, so it is serialized by an **in-process mutex** (§7.6), not driven concurrently. The bridge tracks one "active tab" for whichever run currently holds the mutex; because a run releases the mutex when it pauses, the next run starts from a clean handle rather than inheriting stale state. There is no persisted lease — on a crash everything restarts (§7.6), so the mutex simply dies with the worker. Passing tab IDs around per call would be the alternative; a single active-tab is simpler to reason about for a single-agent system.
 
+**Approval strategy**: the bridge needs its *own* containment, not the per-tool trust tiers of §16 — its primitives (`click`/`type`) are mechanical, so the danger is in the page, not the tool. Containment is profile isolation + sensitive-domain gating + task-scoped approval, designed here at step 5 (§15). The browser bridge is the single highest-risk component in the system (§16).
+
 **Open question**: build extension + bridge in-house vs. adopt an existing project like Browser MCP. Read their source first; adopt if it fits, otherwise borrow patterns. See §17.
 
 ---
@@ -919,7 +921,9 @@ An agent with browser access to the owner's email, banking, and messaging accoun
 - **Per-integration scoping**: the Gmail tool exposes `read`/`draft`/`label` as `read`-tier and `send` as `write`-tier — same MCP server, different per-tool tiers.
 - **Same machinery, different trigger**: structured questions (agent calls `ask_user`) use the same `user_interactions` table and ingress surfacing as approvals. One UI/Discord/voice flow handles both — easier to make robust, easier to reason about.
 - **Auditable trail**: every tool invocation logged in `tool_calls`; every owner decision logged in `user_interactions` with timestamp and ingress used. Together they are the audit log.
-- **Browser profile isolation** (consider later): separate "untrusted reading" profile for arbitrary web pages vs. "trusted actions" profile for logged-in services. The agent decides which to use based on the task.
+- **Trust tiers are owner-assigned, never server-declared.** Built-in tools declare their tier in code (§7.3); MCP-sourced tools are config-mapped with a safe default — the system never trusts an MCP server's own claim about how dangerous its tools are. A compromised or careless server cannot self-promote to `read`.
+- **Per-tool tiers gate *semantic* tools, not the browser.** Trust-tier approval works for semantic tools whose name *is* the intent — a future Gmail `send` is `write`, so it pauses for ✅. It is **insufficient for the browser**: its primitives (`click`/`type`) are mechanical, and the danger lives in the *page*, not the tool. Gating `click` as `read` is unsafe (one click can send money); gating it `destructive` means approving every click — approval fatigue, and the card can't show real intent. So the browser is **not** contained by per-click tiers.
+- **The browser's containment is structural**: separate browser profiles (untrusted-reading vs. trusted-action), sensitive-domain gating, and task-scoped approval (one approval for an objective, not per primitive). This is designed at the browser-bridge step (§15 step 5), not retrofitted onto per-tool tiers. See §8.
 
 This is the actual hard problem — the architecture should make it easy to enforce, not the other way around.
 

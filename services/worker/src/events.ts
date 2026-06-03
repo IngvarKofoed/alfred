@@ -6,6 +6,8 @@ export type RunEvent =
   | { type: 'token'; text: string }
   | { type: 'done' }
   | { type: 'error'; message: string }
+  | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
+  | { type: 'interaction_resolved'; interactionId: string }
 
 export async function notifyRun(conversationId: string, event: RunEvent): Promise<void> {
   await pgNotify(`conversation:${conversationId}`, JSON.stringify(event))
