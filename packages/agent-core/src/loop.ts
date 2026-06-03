@@ -29,9 +29,10 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
       if (ev.type === 'text') {
         text += ev.text
         onText?.(ev.text)
-      } else {
+      } else if (ev.type === 'tool_call') {
         toolCalls.push({ id: ev.id, name: ev.name, args: ev.args })
       }
+      // other event types (e.g. 'usage') are observability-only — ignored here
     }
 
     const assistantParts: ContentPart[] = []

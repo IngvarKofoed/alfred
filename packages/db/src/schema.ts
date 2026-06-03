@@ -93,3 +93,27 @@ export const agentRuns = pgTable(
     uniqueIndex('agent_runs_one_active_per_conversation').on(t.conversationId).where(ACTIVE),
   ],
 )
+
+// llm_calls: one row per provider stream() call, for observability (see the
+// observability spec). The detail a trace needs, kept out of agent_runs itself.
+export const llmCalls = pgTable(
+  'llm_calls',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    agentRunId: uuid('agent_run_id')
+      .notNull()
+      .references(() => agentRuns.id),
+    model: text('model').notNull(),
+    request: jsonb('request').notNull(), // the Message[] sent to the provider
+    responseText: text('response_text').notNull().default(''),
+    promptTokens: integer('prompt_tokens').notNull().default(0),
+    completionTokens: integer('completion_tokens').notNull().default(0),
+    finishReason: text('finish_reason'),
+    latencyMs: integer('latency_ms').notNull().default(0),
+    error: text('error'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('llm_calls_run_created_idx').on(t.agentRunId, t.createdAt)],
+)

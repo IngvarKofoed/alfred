@@ -59,6 +59,20 @@ agent_runs
   -- one active run per conversation (the concurrency "actor", ARCHITECTURE §7.6):
   unique (conversation_id) where status in ('pending', 'running', 'awaiting_approval')
 
+llm_calls                               -- one row per LLM provider call (observability)
+  id                  uuid pk
+  agent_run_id        uuid fk → agent_runs.id
+  model               text
+  request             jsonb         -- the Message[] sent to the provider
+  response_text       text
+  prompt_tokens       int default 0
+  completion_tokens   int default 0
+  finish_reason       text          -- nullable
+  latency_ms          int
+  error               text          -- nullable
+  created_at          timestamptz default now()
+  index (agent_run_id, created_at)
+
 tool_calls
   id                  uuid pk
   agent_run_id        uuid fk → agent_runs.id
@@ -109,7 +123,8 @@ memory_facts                          -- placeholder; expanded post-MVP
   - *Question* is **agent-initiated**: the agent calls a built-in `ask_user` tool whose `invoke()` creates a question interaction and waits for the response, then returns the structured answer as the tool result.
 - **`tool_calls.status`** carries `awaiting_user` while an interaction is open. The `tool_calls ← user_interactions` link gives the full context of *why* the run is paused.
 - **`messages.content` as JSONB**, not plain text. Lets a single message carry text, attachments, tool-use blocks, tool-result blocks — matches the structure the LLM API returns and avoids fan-out tables for every variant.
-- **Token + cost accounting on `agent_runs`** so cost dashboards (and Langfuse cross-checks) don't have to walk tool_calls.
+- **Token + cost accounting on `agent_runs`** (rolled up from `llm_calls`) so cost views don't have to walk per-call rows.
+- **`llm_calls` is the observability trace** — one row per provider call (request, response, tokens, latency, errors), rolled up onto `agent_runs` and surfaced on the web `/debug` page. It's the in-Postgres alternative to Langfuse (ARCHITECTURE §17).
 - **No `audit_log` table** — `agent_runs` + `tool_calls` + `user_interactions` form the audit log. Every action the agent took is a row with args, result, and (if applicable) the owner's response.
 - **No `attachments` table yet** — file references go inline in `messages.content` as `{type: 'attachment', path: '...'}`. Promote to a real table the first time multiple messages need to share a file.
 - **Status columns are governed by explicit state machines** — the legal transitions and cross-entity invariants for `agent_runs`, `tool_calls`, and `user_interactions` are specified in `ARCHITECTURE.md` §10.9, not left implicit in the runtime-flow prose of §10.

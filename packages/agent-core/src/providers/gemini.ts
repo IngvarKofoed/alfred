@@ -26,11 +26,12 @@ export class GeminiProvider implements LlmProvider {
     tools: Tool[],
     opts?: StreamOptions,
   ): AsyncIterable<StreamEvent> {
+    const model = opts?.model ?? this.defaultModel
     const systemInstruction = systemText(messages)
     const functionDeclarations = tools.map(toFunctionDeclaration)
 
     const response = await this.ai.models.generateContentStream({
-      model: opts?.model ?? this.defaultModel,
+      model,
       contents: toGeminiContents(messages),
       config: {
         ...(systemInstruction ? { systemInstruction } : {}),
@@ -40,6 +41,9 @@ export class GeminiProvider implements LlmProvider {
 
     // Gemini function calls carry no stable id; synthesize one per call for our model.
     let callIndex = 0
+    let promptTokens: number | undefined
+    let completionTokens: number | undefined
+    let finishReason: string | undefined
     for await (const chunk of response) {
       const text = chunk.text
       if (text) yield { type: 'text', text }
@@ -51,7 +55,15 @@ export class GeminiProvider implements LlmProvider {
           args: call.args ?? {},
         }
       }
+      if (chunk.usageMetadata) {
+        promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens
+        completionTokens = chunk.usageMetadata.candidatesTokenCount ?? completionTokens
+      }
+      const fr = chunk.candidates?.[0]?.finishReason
+      if (fr) finishReason = String(fr)
     }
+
+    yield { type: 'usage', model, promptTokens, completionTokens, finishReason }
   }
 }
 

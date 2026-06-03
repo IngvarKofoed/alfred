@@ -15,3 +15,12 @@ export type Message = { role: Role; content: ContentPart[] }
 export type StreamEvent =
   | { type: 'text'; text: string } // a streamed text delta
   | { type: 'tool_call'; id: string; name: string; args: unknown }
+  // Terminal metadata for observability (ARCHITECTURE §6 / observability spec). The
+  // loop ignores it; TracingProvider records it.
+  | {
+      type: 'usage'
+      model: string
+      promptTokens?: number
+      completionTokens?: number
+      finishReason?: string
+    }

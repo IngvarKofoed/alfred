@@ -1,5 +1,5 @@
 import type { LlmProvider } from '@alfred/agent-core'
-import { agentRuns, conversations, getDb, messages, OWNER_USER_ID, users } from '@alfred/db'
+import { agentRuns, conversations, getDb, llmCalls, messages, OWNER_USER_ID, users } from '@alfred/db'
 import { asc, eq } from 'drizzle-orm'
 import { describe, expect, it } from 'vitest'
 import { textOf } from './messages.js'
@@ -47,8 +47,13 @@ describe.skipIf(!process.env.POSTGRES_URL)('worker runJob', () => {
       const assistant = rows.find((r) => r.role === 'assistant')
       expect(assistant).toBeTruthy()
       expect(textOf(assistant!.content as never)).toBe('hello world')
+
+      const trace = await db.select().from(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
+      expect(trace).toHaveLength(1)
+      expect(trace[0]!.responseText).toBe('hello world')
     } finally {
-      // agent_runs.trigger_message_id FKs messages, so delete runs before messages.
+      // FK order: llm_calls -> agent_runs -> messages -> conversations
+      await db.delete(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
       await db.delete(agentRuns).where(eq(agentRuns.conversationId, convId))
       await db.delete(messages).where(eq(messages.conversationId, convId))
       await db.delete(conversations).where(eq(conversations.id, convId))

@@ -234,8 +234,7 @@ Open: extraction strategy (LLM-summarized after each run? user-flagged "remember
 | API keys / secrets (OpenRouter, Discord, ElevenLabs, …) | `.env` file, OS keychain | DB compromise should not leak credentials |
 | Large attachments (images, PDFs, audio) | Local filesystem under `data/attachments/`, referenced by path | Postgres is bad at large blobs; FS is fine and backs up trivially |
 | Chrome browser profile | Wherever the OS puts it; backed up separately | Owned by Chrome, not us |
-| Langfuse traces | Langfuse's own Postgres database (same server, separate DB) | Their schema, their problem |
-| LLM responses' full request/response logs | Langfuse | Already captured there; no value duplicating |
+| LLM request/response + token/latency traces | `llm_calls` table in our Postgres, rolled up onto `agent_runs` | Lightweight in-house observability, surfaced on the `/debug` page. Replaces Langfuse — see §17. |
 
 ---
 
@@ -938,7 +937,7 @@ This is the actual hard problem — the architecture should make it easy to enfo
 - **Voice provider lean: ElevenLabs or Google.** Final choice deferred to when the voice orchestrator is the active build target.
 - **Native app platform: iOS** (when voice rollout begins). Tech choice (Swift vs. React Native vs. Expo) deferred until then.
 - **Process supervisor: pm2.** Cross-platform default; native supervisors as fallback.
-- **Observability: in from MVP, self-hosted Langfuse.** Wired in at build-order step 4 (§15). Reasoning: when an agent does something weird, the cost of *not* having traces is high, and Langfuse is cheap to run alongside Postgres on the same box.
+- **Observability: lightweight, in-Postgres.** Every LLM call is traced to an `llm_calls` table (rolled up onto `agent_runs`) and surfaced on a `/debug` page in the web app. Langfuse was reconsidered and rejected — modern self-host drags in ClickHouse + Redis + Docker (vs. no-Docker/minimal), and the cloud option ships personal prompt/response data off-box (vs. the privacy principle). (Stale Langfuse mentions remain in §15 step 4 and §18 pending a full doc-reconcile pass.)
 - **Concurrency & crash model: serialize, don't recover.** One active run per conversation (DB constraint); the browser is serialized by an in-process mutex released on pause; crashes fail-and-restart — no durable resume, `retryLimit: 0`, startup sweep marks orphans `failed`. Deliberately simple for single-user-local, and reversible later. See §7.6.
 - **Autonomous lifecycle seams reserved.** Presence-dependent overflow policy, durable objective scratchpad for cross-run continuity, agent self-scheduling, and layered (run/objective/daily) budget. Defined now, built when triggers ship. See §7.7.
 

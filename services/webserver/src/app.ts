@@ -3,12 +3,13 @@ import {
   conversations,
   enqueueAgentRun,
   getDb,
+  llmCalls,
   messages,
   OWNER_USER_ID,
   users,
 } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
-import { asc, eq } from 'drizzle-orm'
+import { asc, desc, eq } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import pg from 'pg'
@@ -110,6 +111,42 @@ app.get('/api/conversations/:id/stream', (c) => {
     await client.query(`UNLISTEN "${channel}"`).catch(() => {})
     await client.end().catch(() => {})
   })
+})
+
+// --- Debug / observability (read-only) ---
+
+app.get('/api/debug/runs', async (c) => {
+  const limit = Math.min(Number(c.req.query('limit')) || 50, 200)
+  const runs = await getDb()
+    .select({
+      id: agentRuns.id,
+      conversationId: agentRuns.conversationId,
+      status: agentRuns.status,
+      model: agentRuns.model,
+      startedAt: agentRuns.startedAt,
+      finishedAt: agentRuns.finishedAt,
+      promptTokens: agentRuns.promptTokens,
+      completionTokens: agentRuns.completionTokens,
+      error: agentRuns.error,
+    })
+    .from(agentRuns)
+    .orderBy(desc(agentRuns.id)) // uuidv7 ids are time-ordered → newest first
+    .limit(limit)
+  return c.json({ runs })
+})
+
+app.get('/api/debug/runs/:id', async (c) => {
+  const id = c.req.param('id')
+  if (!UUID_RE.test(id)) return c.json({ error: 'invalid run id' }, 400)
+  const db = getDb()
+  const [run] = await db.select().from(agentRuns).where(eq(agentRuns.id, id))
+  if (!run) return c.json({ error: 'not found' }, 404)
+  const calls = await db
+    .select()
+    .from(llmCalls)
+    .where(eq(llmCalls.agentRunId, id))
+    .orderBy(asc(llmCalls.createdAt))
+  return c.json({ run, calls })
 })
 
 function isUniqueViolation(err: unknown): boolean {
