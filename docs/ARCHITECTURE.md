@@ -23,7 +23,7 @@ Status: Initial design, pre-implementation
 - Single user (the owner). No multi-tenant concerns.
 - Self-hosted on a home server. No cloud VPS for the core platform.
 - **OS-agnostic**: the stack must run on Linux, macOS, or Windows natively. No OS-specific dependencies in the core.
-- **Pluggable LLM provider.** Default path is **OpenRouter** for multi-vendor access, but the agent core depends on a thin provider abstraction so direct Anthropic / OpenAI / Gemini / local Ollama can be swapped in by config without touching agent code.
+- **Pluggable LLM provider.** Default is **Google Gemini** (`@google/genai`), behind a thin provider abstraction so other vendors — OpenRouter for multi-vendor access, direct Anthropic / OpenAI, or local Ollama — can be swapped in by config without touching agent code.
 - Minimal moving parts. No infra component included "in case we need it later."
 
 **Explicit non-goals (for now)**
@@ -63,14 +63,14 @@ External clients
 │        │                                       Agent worker(s)         │
 │  Ingresses (interchangeable):                  ├─ hand-rolled loop     │
 │  ├─ Hono webserver (PWA chat, SSE)             ├─ Provider abstraction │
-│  ├─ Discord bot                                │   (OpenRouter, …)     │
+│  ├─ Discord bot                                │   (Gemini, …)         │
 │  ├─ Voice orchestrator (native app, post-MVP)  └─ Tool interface       │
 │  └─ Triggers (cron/inbox/webhook, post-MVP)        ├─ MCP-sourced      │
 │                                                    └─ built-in        │
 └──────────────────────────────────────────────────────────────────────┘
                                                        │
                                                        ▼
-                                       LLM providers (OpenRouter, etc.)
+                                       LLM providers (Gemini, etc.)
                                        Other MCP servers (Gmail, Calendar, …)
 ```
 
@@ -231,7 +231,7 @@ Open: extraction strategy (LLM-summarized after each run? user-flagged "remember
 
 | Thing | Where | Why |
 |-------|-------|-----|
-| API keys / secrets (OpenRouter, Discord, ElevenLabs, …) | `.env` file, OS keychain | DB compromise should not leak credentials |
+| API keys / secrets (Gemini, Discord, ElevenLabs, …) | `.env` file, OS keychain | DB compromise should not leak credentials |
 | Large attachments (images, PDFs, audio) | Local filesystem under `data/attachments/`, referenced by path | Postgres is bad at large blobs; FS is fine and backs up trivially |
 | Chrome browser profile | Wherever the OS puts it; backed up separately | Owned by Chrome, not us |
 | LLM request/response + token/latency traces | `llm_calls` table in our Postgres, rolled up onto `agent_runs` | Lightweight in-house observability, surfaced on the `/debug` page. Replaces Langfuse — see §17. |
@@ -263,14 +263,14 @@ No framework wrapper sits between us and the model. Streaming, tool-call parsing
 
 ### 7.2 Provider abstraction
 
-A thin interface inside `agent-core` wraps the underlying model client. The default implementation talks to **OpenRouter** via the OpenAI-compatible API. Alternative implementations (direct Anthropic, direct OpenAI, direct Gemini, local Ollama) plug in behind the same interface. Provider selection is a config/env decision, not a code change.
+A thin interface inside `agent-core` wraps the underlying model client. The default (and currently only-built) implementation talks to **Google Gemini** via the `@google/genai` SDK. Alternative implementations (OpenRouter for multi-vendor access, direct Anthropic / OpenAI, local Ollama) plug in behind the same interface. Provider selection is a config/env decision, not a code change.
 
 ```ts
 interface LlmProvider {
   stream(messages, tools, options): AsyncIterable<TokenOrToolCall>
 }
-// implementations: OpenRouterProvider, AnthropicProvider, GeminiProvider,
-//                   OllamaProvider, ...
+// implementations: GeminiProvider (built), OpenRouterProvider,
+//                   AnthropicProvider, OllamaProvider, ...
 ```
 
 Optionally **LiteLLM** can sit in front of all of them as a proxy for unified logging and provider fallback, but it's optional — the in-process abstraction is what matters.
@@ -334,7 +334,7 @@ A run's context is assembled fresh every invocation. The agent has no in-process
 **History strategy (post-MVP)** — summarization, but explicit. Two options to choose between when it becomes needed:
 
 - *Interaction-gated*: on overflow, the worker raises a `question` interaction ("history too long; summarize the oldest N messages?") via the standard mechanism (§10.2). The owner sees what's about to happen and approves. Aligns with the rest of the human-in-the-loop design.
-- *Auto-with-trace*: summarize automatically, but record the action prominently (a synthetic message in the conversation, a Langfuse trace tag, a NOTIFY event for the UI to surface). Lower friction, still visible.
+- *Auto-with-trace*: summarize automatically, but record the action prominently (a synthetic message in the conversation, a trace record, a NOTIFY event for the UI to surface). Lower friction, still visible.
 
 Decided when summarization is actually needed, not before.
 
@@ -381,7 +381,7 @@ Triggers (§9.4) are described as "just another ingress." That holds for the *tr
 | Presence | Context overflow | Tool error / ambiguity |
 |----------|------------------|------------------------|
 | Human in loop (web/discord/voice) | fail loudly (§7.5) | may raise `ask_user` / approval |
-| Autonomous (trigger) | **auto-summarize with trace** — synthetic message + Langfuse tag + NOTIFY event; mandatory, never silent-fail | `write`/`destructive` approvals still apply — surfaced as a notification, the run waits for the owner (or times out, §10.4); open-ended `ask_user` questions have no human to answer, so they defer the objective rather than block |
+| Autonomous (trigger) | **auto-summarize with trace** — synthetic message + trace record + NOTIFY event; mandatory, never silent-fail | `write`/`destructive` approvals still apply — surfaced as a notification, the run waits for the owner (or times out, §10.4); open-ended `ask_user` questions have no human to answer, so they defer the objective rather than block |
 
 **2. Continuity comes from durable working state, not full-history replay.** A long-horizon objective ("watch this inbox for a week and report") spans many runs over time. Its continuity is an explicit, agent-maintained **objective scratchpad** — a memory scope (§6.4) summarizing progress and next steps — *not* an ever-growing message log. This is what makes overflow tractable and lets a run days later resume with a bounded, relevant context.
 
@@ -498,7 +498,7 @@ native app mic ── PCM/Opus over WS ──► voice orchestrator (server)
 
 - Cloud APIs handle the heavy DSP. The orchestrator just routes audio + text streams.
 - API keys live server-side, **never in the client** — otherwise anyone with the app on their device could spend the owner's API budget.
-- OpenRouter remains the brain — no lock-in to GPT-4o Realtime or Gemini Live.
+- The agent core remains the brain (Gemini by default, any provider via the abstraction) — no lock-in to a realtime voice API like GPT-4o Realtime or Gemini Live.
 
 **Wake word**: runs on-device inside the native app — **Picovoice Porcupine** (commercial, good free tier) or **openWakeWord** (OSS). The app only opens the upstream WebSocket once the wake word fires.
 
@@ -629,7 +629,7 @@ Worst case: a tool already executing can't be cancelled cleanly (e.g. a browser 
 | Cost cap | Per-run cap (default $1, configurable). Checked after each LLM call. Exceeded: fail with `error='cost_exceeded'`. |
 | Stuck / abandoned run (worker died or hung) | Startup sweep marks any `running` / `awaiting_*` rows as `failed` on worker boot (§10.5). No dead-letter machinery — a crash means restart, and the owner re-issues. |
 
-Pattern across all of these: **fail loudly into structured rows**, never silently. Langfuse traces capture LLM-level detail; the DB captures run-level outcomes.
+Pattern across all of these: **fail loudly into structured rows**, never silently. The `llm_calls` table captures LLM-level detail; `agent_runs` / `tool_calls` capture run-level outcomes — all in the one Postgres.
 
 ### 10.8 Idempotency
 
@@ -760,10 +760,10 @@ ALLOWED_DISCORD_USER_ID=<owner's Discord ID>
 # === Data ===
 POSTGRES_URL=postgres://alfred:...@localhost:5432/alfred
 
-# === LLM ===
-OPENROUTER_API_KEY=sk-or-...
-DEFAULT_MODEL=anthropic/claude-3.5-sonnet
-ROUTING_MODEL=anthropic/claude-3.5-haiku    # cheap model for routing/summary
+# === LLM (Gemini) ===
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.5-flash
+# (provider-scoped: a future OpenAI/Anthropic provider adds OPENAI_MODEL/etc.)
 
 # === Browser bridge ===
 BRIDGE_AUTH_TOKEN=<random 32+ chars, shared with the Chrome extension>
@@ -775,9 +775,7 @@ WEBSERVER_PORT=3000
 DISCORD_BOT_TOKEN=<from Discord developer portal>
 
 # === Observability ===
-LANGFUSE_PUBLIC_KEY=...
-LANGFUSE_SECRET_KEY=...
-LANGFUSE_HOST=http://localhost:3001         # self-hosted next to Postgres
+# Lightweight, in-Postgres (llm_calls + the /debug page) — no keys needed.
 
 # === Voice (post-MVP) ===
 DEEPGRAM_API_KEY=...
@@ -806,7 +804,7 @@ Each process declares only the subset it needs (the Discord bot doesn't need `DE
 
 Manual for MVP — sufficient for one user:
 
-- **OpenRouter key**: generate new key in the dashboard, edit `.env`, `pm2 reload all`.
+- **Gemini key**: generate a new key in Google AI Studio, edit `.env`, `pm2 reload all`.
 - **Discord token**: regenerate in developer portal, same flow.
 - **Bridge auth token**: generate new value, update `.env` AND the extension's config (extension reads from `chrome.storage.local`; set via the extension's options page).
 
@@ -889,12 +887,13 @@ open clients/ios/Alfred.xcworkspace               # Xcode does the rest
 
 ## 15. Build Order
 
-Each step is independently verifiable. The seams (Postgres queue, SSE, MCP) don't change between steps — later steps just fill in pieces.
+Each step is independently verifiable. The seams (Postgres queue, SSE, MCP) don't change between steps — later steps just fill in pieces. **Status (kept current on reconcile): steps 1–4 are built; "tools + approval" is the current increment; steps 5–6 and all post-MVP steps are planned.**
 
-1. **Hono webserver + stub Vite+React page over HTTPS.** Tailscale auth middleware. Verify access from phone over tailnet.
-2. **Postgres + Drizzle schema.** `conversations`, `messages`, plus pg-boss tables (auto-created).
-3. **Agent core skeleton.** Provider abstraction in `packages/agent-core` with an OpenRouter implementation. Tool interface with one built-in tool (`echo`). Hand-rolled loop. Wired into a worker that streams text via `NOTIFY`. End-to-end "type → echo" through SSE.
-4. **Real model + observability.** Replace the echo tool with the actual agent loop talking to OpenRouter. Wire in **Langfuse** (self-hosted, runs alongside Postgres) from day one — every LLM call and tool invocation traced. This pays off immediately during debugging.
+1. ✅ **Hono webserver + stub Vite+React page over HTTPS.** Tailscale auth middleware. Verify access from phone over tailnet.
+2. ✅ **Postgres + Drizzle schema.** `users`, `conversations`, `messages`, `agent_runs`, `llm_calls`, plus pg-boss tables (auto-created).
+3. ✅ **Agent core.** Provider abstraction in `packages/agent-core` with a **Gemini** implementation (`@google/genai`). Hand-rolled loop; `Tool` interface + a built-in `echo` tool (built, but not yet wired through the worker — see "current" below).
+4. ✅ **Real model + observability, end to end.** The loop talks to real Gemini, wired into `alfred-worker` (pg-boss) streaming tokens via `NOTIFY` → SSE to the web chat. Observability is **lightweight in-Postgres** — every call traced to `llm_calls`, surfaced on a `/debug` page (not Langfuse; see §17).
+   - → **Current — tools + approval.** Wire tools through the worker with the trust-tier approval flow (§16 / §10.9) — the step that turns Alfred from chat into action.
 5. **Browser bridge + Chrome extension** as the first MCP-sourced tool. End-to-end browser automation through the agent. Built in-house, drawing from the owner's existing `chrome-mcp` project.
 6. **Discord bot** as a second ingress. Same conversation shape as the web ingress, separate thread, shared agent memory.
 
@@ -937,7 +936,7 @@ This is the actual hard problem — the architecture should make it easy to enfo
 - **Voice provider lean: ElevenLabs or Google.** Final choice deferred to when the voice orchestrator is the active build target.
 - **Native app platform: iOS** (when voice rollout begins). Tech choice (Swift vs. React Native vs. Expo) deferred until then.
 - **Process supervisor: pm2.** Cross-platform default; native supervisors as fallback.
-- **Observability: lightweight, in-Postgres.** Every LLM call is traced to an `llm_calls` table (rolled up onto `agent_runs`) and surfaced on a `/debug` page in the web app. Langfuse was reconsidered and rejected — modern self-host drags in ClickHouse + Redis + Docker (vs. no-Docker/minimal), and the cloud option ships personal prompt/response data off-box (vs. the privacy principle). (Stale Langfuse mentions remain in §15 step 4 and §18 pending a full doc-reconcile pass.)
+- **Observability: lightweight, in-Postgres.** Every LLM call is traced to an `llm_calls` table (rolled up onto `agent_runs`) and surfaced on a `/debug` page in the web app. Langfuse was reconsidered and rejected — modern self-host drags in ClickHouse + Redis + Docker (vs. no-Docker/minimal), and the cloud option ships personal prompt/response data off-box (vs. the privacy principle).
 - **Concurrency & crash model: serialize, don't recover.** One active run per conversation (DB constraint); the browser is serialized by an in-process mutex released on pause; crashes fail-and-restart — no durable resume, `retryLimit: 0`, startup sweep marks orphans `failed`. Deliberately simple for single-user-local, and reversible later. See §7.6.
 - **Autonomous lifecycle seams reserved.** Presence-dependent overflow policy, durable objective scratchpad for cross-run continuity, agent self-scheduling, and layered (run/objective/daily) budget. Defined now, built when triggers ship. See §7.7.
 
@@ -971,11 +970,11 @@ Browser / phone (PWA, chat)      Native iOS app (chat + voice, post-MVP)
 │                                ┌─────────────┴────────────┐      │
 │                                ▼                          ▼      │
 │                       LLM provider abstraction     Tool interface│
-│                        ├─ OpenRouter (default)     ├─ MCP-sourced│
-│                        ├─ Anthropic/OpenAI/Gemini  └─ built-in   │
+│                        ├─ Gemini (default)         ├─ MCP-sourced│
+│                        ├─ OpenRouter / Anthropic   └─ built-in   │
 │                        └─ Ollama (local, optional)               │
 │                                                                  │
-│  Langfuse (self-hosted) ◄── traces from worker ──┘               │
+│  Observability: each call → llm_calls (Postgres) → /debug       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -986,7 +985,7 @@ Browser / phone (PWA, chat)      Native iOS app (chat + voice, post-MVP)
 - **Postgres is the only stateful infra** — state, job queue (pg-boss), and pub/sub (LISTEN/NOTIFY) all in one.
 - **Cross-platform**: pm2 supervises Node processes natively on Linux / macOS / Windows identically. No Docker, no WSL2.
 - **Browser automation via Chrome extension** (undetectable) → bridge (MCP over HTTP+SSE) → agent.
-- **LLM provider abstraction**: OpenRouter by default, swappable to direct vendors or local models by config.
-- **Voice is native-iOS-app only** when it lands — cloud STT/TTS, server-side keys, OpenRouter still the brain.
-- **Observability from day one** via self-hosted Langfuse running alongside Postgres.
+- **LLM provider abstraction**: Gemini by default, swappable to OpenRouter / direct vendors / local models by config.
+- **Voice is native-iOS-app only** when it lands — cloud STT/TTS, server-side keys, the agent core (Gemini) still the brain.
+- **Observability from day one** — every LLM call traced to `llm_calls` in Postgres, surfaced on a `/debug` page. No Langfuse.
 - **Tailscale** = remote access; **network position is the auth** (no public exposure, single user — nothing to log into).
