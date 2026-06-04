@@ -80,7 +80,7 @@ function systemText(messages: Message[]): string | undefined {
   return text || undefined
 }
 
-function toGeminiContents(messages: Message[]): Content[] {
+export function toGeminiContents(messages: Message[]): Content[] {
   const contents: Content[] = []
   for (const m of messages) {
     if (m.role === 'system') continue
@@ -111,8 +111,13 @@ function toFunctionDeclaration(tool: Tool): FunctionDeclaration {
   }
 }
 
+// Gemini's functionResponse.response / functionCall.args are proto Structs — they MUST
+// be a JSON object. typeof [] === 'object', so an array (a tool returning a list, e.g.
+// get_links/list_tabs) would otherwise be sent as a Struct-that-starts-with-a-list and
+// the API rejects the whole request ("Proto field is not repeating, cannot start list").
+// Wrap arrays (and primitives/null) under a `value` key so the payload is always a Struct.
 function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object'
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : { value }
 }
