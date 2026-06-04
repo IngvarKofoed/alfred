@@ -158,6 +158,21 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   // Nothing to render yet (no streamed text, no running tool) but the run is live.
   const showThinking = busy && !streaming && activeTools.length === 0
 
+  // The "Alfred" label appears only on the first assistant bubble in a contiguous
+  // run of Alfred output, so a sequence of tool-call + text turns isn't labeled
+  // over and over. Tool-result messages and empty assistant turns (which render
+  // nothing) don't break the run.
+  const rendersNothing = (m: ChatMessage) =>
+    m.role === 'assistant' && !textOf(m.content) && toolUsesOf(m.content).length === 0
+  const showName = (i: number) => {
+    for (let j = i - 1; j >= 0; j--) {
+      const prev = history[j]
+      if (!prev || prev.role === 'tool' || rendersNothing(prev)) continue
+      return prev.role !== 'assistant'
+    }
+    return true
+  }
+
   return (
     <>
       <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-5 py-6">
@@ -177,6 +192,7 @@ export default function Chat({ conversationId }: { conversationId: string }) {
                 role={m.role}
                 text={textOf(m.content)}
                 toolUses={toolUsesOf(m.content)}
+                showName={showName(i)}
               />
             ),
           )}
@@ -262,10 +278,12 @@ function Bubble({
   role,
   text,
   toolUses = [],
+  showName = true,
 }: {
   role: string
   text: string
   toolUses?: ToolUse[]
+  showName?: boolean
 }) {
   const isUser = role === 'user'
   if (isUser) {
@@ -281,7 +299,9 @@ function Bubble({
   if (!text && toolUses.length === 0) return null
   return (
     <div className="flex flex-col gap-1" style={{ animation: 'alfred-rise 0.25s ease-out' }}>
-      <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
+      {showName && (
+        <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
+      )}
       {text && <div className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink">{text}</div>}
       {toolUses.length > 0 && (
         <div className="flex flex-wrap gap-1.5 pt-0.5">
