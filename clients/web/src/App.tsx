@@ -26,7 +26,7 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      <div className="mx-auto flex h-full max-w-2xl flex-col">
+      <div className="flex h-full flex-col">
         <Header onNew={newConversation} />
         <main className="flex min-h-0 flex-1 flex-col">
           <Routes>
