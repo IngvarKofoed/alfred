@@ -119,20 +119,22 @@ Only relevant if the box is Windows. The stack runs **natively** on Windows (Nod
 
 ## 5. Process Topology
 
-All processes are native (no Docker). Managed by **pm2** — the same process supervisor on Linux, macOS, and Windows. One config file (`ecosystem.config.js`) defines every process; one command (`pm2 start ecosystem.config.js`) brings everything up; `pm2 startup` registers pm2 itself with the host's init system (systemd on Linux, launchd on macOS, Task Scheduler on Windows) so everything survives reboot.
+All processes are native (no Docker). Managed by **pm2** — the same process supervisor on Linux, macOS, and Windows. One config file (`ecosystem.config.cjs`) defines every process; one command (`pm2 start ecosystem.config.cjs`) brings everything up; `pm2 startup` registers pm2 itself with the host's init system (systemd on Linux, launchd on macOS, Task Scheduler on Windows) so everything survives reboot.
 
 | Process | Language | Role | Restart policy |
 |---------|----------|------|----------------|
 | `postgres` | — | State, job queue, pub/sub | Auto-start via OS package manager; not under pm2 |
 | `alfred-webserver` | Node/TS | Browser ingress, serves PWA, SSE | Restart on failure |
 | `alfred-worker` | Node/TS | Agent execution loop + **embedded browser bridge** (WS server for the Chrome extension) | Restart on failure |
-| `alfred-discord` | Node/TS | Discord ingress | Restart on failure |
+| `alfred-discord` | Node/TS | Discord ingress (post-MVP) | Restart on failure |
 | `alfred-voice` | Node/TS | Voice orchestrator (native-app surface, post-MVP) | Restart on failure |
 | `alfred-triggers` | Node/TS | Scheduler / event-source ingress (post-MVP) | Restart on failure |
 
+**Built today:** only `alfred-webserver` and `alfred-worker` exist in `ecosystem.config.cjs`. The `discord` / `voice` / `triggers` rows are the reserved post-MVP shape — they're in the table so the topology is whole, not because the processes exist yet (see §15 build order).
+
 Each is its own pm2-managed process so a crash in one doesn't take the others down. The browser bridge was originally planned as a separate `alfred-browser-bridge` process (to keep the extension's WebSocket alive across worker restarts); it was instead **embedded in `alfred-worker`** (§8, Option C) — for a single user the extension's own auto-reconnect covers restarts, so the extra process wasn't worth it.
 
-Deploy: `git pull && pnpm install && pnpm build && pm2 reload ecosystem.config.js`.
+Deploy: `git pull && pnpm install && pnpm build && pm2 reload ecosystem.config.cjs`.
 
 Postgres is installed via the host's package manager (apt/brew/the official Windows installer) and managed by the OS, not by pm2 — data services benefit from the OS's mature service infrastructure, while application processes benefit from pm2's portability.
 
@@ -179,24 +181,30 @@ Topology only (see `DATABASE.md` for columns):
 
 Channel naming:
 
-- `run:<run_id>` — progress stream for a single agent run. Each ingress LISTENs on the run it enqueued.
+- `conversation:<conversation_id>` — progress stream for a conversation. The channel is keyed on the **conversation**, not the run: an ingress (e.g. the web SSE route) subscribes when it opens the conversation's stream and doesn't yet know the run id, and a conversation has at most one active run at a time (§7.6), so conversation-keyed delivery is unambiguous and lets the client follow successive runs over one subscription.
 
-Payload schema (JSON, sent via `pg_notify`):
+Payload schema (JSON, sent via `pg_notify`) — the actual shape emitted by the worker (`services/worker/src/events.ts`):
 
 ```ts
 type RunEvent =
-  | { type: 'token';                  text: string }
-  | { type: 'tool_call_start';        toolCallId: uuid; toolName: string; args: object }
-  | { type: 'tool_call_end';          toolCallId: uuid; result: object }
-  | { type: 'interaction_required';   interactionId: uuid; kind: 'approval' | 'question' }
-  | { type: 'interaction_resolved';   interactionId: uuid }
+  | { type: 'token';                text: string }
+  | { type: 'tool_call_start';      id: string; toolName: string; args?: unknown }
+  | { type: 'tool_call_end';        id: string }
+  | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
+  | { type: 'interaction_resolved'; interactionId: string }
   | { type: 'done' }
-  | { type: 'error';                  message: string }
+  | { type: 'cancelled' }
+  | { type: 'error';                message: string }
 ```
 
-Postgres `NOTIFY` payloads have an **8000-byte limit**. Tokens are tiny; full tool results and interaction prompts/responses are *not* sent inline — events reference IDs and consumers `SELECT` the rows if they want the full payload. This keeps the channel cheap and makes the DB the source of truth.
+Postgres `NOTIFY` payloads have an **8000-byte limit**. Tokens are tiny; full tool results and interaction prompts/responses are *not* sent inline — events reference IDs and consumers `SELECT` the rows if they want the full payload. This keeps the channel cheap and makes the DB the source of truth. Concretely:
 
-Ingresses subscribe to `run:<run_id>` to forward `token`s and to know when to render an interaction UI (`interaction_required` → fetch the row, show the prompt to the user) or close it (`interaction_resolved` → tear down the prompt).
+- `tool_call_start` carries the agent-core call `id` and tool name for a live UI chip; its `args` are included **only when their JSON is ≤1024 chars**, so a large argument (e.g. an `evaluate_javascript` script) can't breach the NOTIFY cap. The full args are always persisted on the `tool_calls` row regardless.
+- `tool_call_end` carries only the `id` — the result is never sent inline; it lives on the `tool_calls` row (and the `/debug` page).
+- `interaction_required.kind` is only `'approval'` today: approvals are runtime-injected and must be surfaced, whereas the `question` kind (the built-in `ask_user`, §7.3) isn't wired yet, so it's never NOTIFY'd. The DB column still allows `'question'` (§6.1) for when it lands.
+- `cancelled` is emitted on user-initiated cancellation (§10.6), distinct from `done`.
+
+Ingresses subscribe to `conversation:<conversation_id>` to forward `token`s and to know when to render an interaction UI (`interaction_required` → fetch the row, show the prompt to the user) or close it (`interaction_resolved` → tear down the prompt).
 
 ### 6.3 Job queue (pg-boss)
 
@@ -310,7 +318,7 @@ This means:
 
 A run's context is assembled fresh every invocation. The agent has no in-process state between runs — everything that matters lives in Postgres.
 
-**Persona** — a single global file at `packages/agent-core/personas/alfred.md`, loaded into a string at process boot. Plain markdown. Identifies the agent as Alfred and the owner as Ingvar; names tool families; sets defaults for tone, response length, when to ask vs. assume.
+**Persona** — the agent identity: it identifies the agent as Alfred and the owner as Ingvar, names tool families, and sets defaults for tone, response length, when to ask vs. assume. *Target shape:* a single global markdown file at `packages/agent-core/personas/alfred.md`, loaded into a string at process boot, so the persona is editable without touching code. *Built today:* the persona is a hardcoded `SYSTEM_PROMPT` string constant in `services/worker/src/run.ts`. Moving it to the markdown file (and out of the worker, into agent-core) is a small deferred refactor — the assembly below is unchanged either way.
 
 **Per-run context assembly** — when the worker picks up a job, it builds the model input as:
 
@@ -324,7 +332,7 @@ A run's context is assembled fresh every invocation. The agent has no in-process
 **History strategy (MVP)** — send the full history, fail loudly if it doesn't fit:
 
 - Default: every message in the conversation, in order, sent verbatim to the model.
-- If full history exceeds the model's context window (or a configured headroom, e.g. ~80%): the run fails with `error='context_overflow'`. The owner sees a clear failure in the UI and decides how to proceed (start a new conversation, manually trim, switch to a larger-context model).
+- *Intended:* if full history exceeds the model's context window (or a configured headroom, e.g. ~80%), the run fails with `error='context_overflow'` — the owner sees a clear failure in the UI and decides how to proceed (start a new conversation, manually trim, switch to a larger-context model). **Not yet built:** no pre-flight token/headroom check exists today; the full history is sent and an overflow surfaces only as whatever error the provider returns, captured raw on the run. Adding the dedicated `context_overflow` check is a small deferred guard.
 - **No automatic summarization in MVP.** Silent summarization loses context invisibly and aligns badly with the "fail loudly" principle (§10.7). Modern context windows (200k+ for Claude/Gemini) make this rarely hit in practice.
 - **Presence-dependent.** Fail-loudly only works when a human can react. Runs with no human at the other end (autonomous triggers, §9.4) cannot fail loudly — their overflow policy is defined in §7.7 and is *not* deferrable if/when triggers ship.
 
@@ -448,13 +456,17 @@ For a single-user, single-machine system, ingresses talk **directly to Postgres/
 
 **Framework**: **Hono**. Small, fast, no SSR opinions — appropriate because the UI is a single-page chat behind auth (none of Next.js's wins apply for this shape).
 
-**Responsibilities**:
+**Responsibilities** (actual routes in `services/webserver/src/app.ts`):
 
-- `GET /*` — serve the built React PWA (static files).
-- `POST /api/messages` — receive a user message, create job.
-- `GET /api/conversations/:id/stream` — **SSE** stream of agent tokens (subscribes to `LISTEN` on the conversation channel, forwards `NOTIFY`s).
-- `GET /api/conversations`, `GET /api/conversations/:id` — history.
-- `POST /api/tool-approvals/:id` — human-in-the-loop approvals (the agent asks → owner clicks ✅/❌ → confirmation comes back).
+- `GET /*` — serve the built React PWA (static files), falling back to `index.html`.
+- `POST /api/conversations/:id/messages` — receive a user message for that conversation, create the run + job.
+- `GET /api/conversations/:id/messages` — message history for the conversation.
+- `GET /api/conversations/:id/stream` — **SSE** stream (subscribes to `LISTEN conversation:<id>` and forwards each `NOTIFY` payload raw).
+- `GET /api/interactions/:id`, `POST /api/interactions/:id` — the generic interaction endpoints: fetch the prompt, and resolve it (approval ✅/❌ or a question answer) first-writer-wins. This serves *both* approvals and questions (§10.2), so it's not approval-specific.
+- `GET /api/tools`, `PATCH /api/tools` — the worker-published tool catalog + the owner's per-tool approval settings (§16).
+- `GET /api/debug/runs`, `GET /api/debug/runs/:id` — observability for the `/debug` page (§6.5).
+
+There is no conversation-*list* route yet — the web client opens a single conversation by id (a list view is a post-MVP screen, §11).
 
 ### 9.2 Discord bot (`alfred-discord`)
 
@@ -527,24 +539,24 @@ The data shape (§6) and process topology (§5) are set; this section spells out
 Single user message, one model call, no tools.
 
 ```
-Ingress              Worker                       LLM provider
-   │ POST message      │                              │
-   │ INSERT messages   │                              │
-   │ INSERT agent_runs │                              │
-   │ boss.send(runId)  │                              │
-   │ ─────────────────►│ pg-boss delivers job         │
-   │ LISTEN run:<id>   │                              │
-   │                   │ load context (§7.5)          │
-   │                   │ provider.stream(...)         │
-   │                   │ ───────────────────────────► │
-   │                   │ ◄── token chunks ─────────── │
-   │                   │ NOTIFY run:<id> {token}      │
-   │ ◄── token ────────┤                              │
-   │ forward to client │                              │
-   │                   │ done → INSERT messages       │
-   │                   │ UPDATE agent_runs.status     │
-   │                   │ NOTIFY run:<id> {done}       │
-   │ ◄── done ─────────┤                              │
+Ingress                  Worker                       LLM provider
+   │ POST message          │                              │
+   │ INSERT messages       │                              │
+   │ INSERT agent_runs     │                              │
+   │ boss.send(runId)      │                              │
+   │ ─────────────────────►│ pg-boss delivers job         │
+   │ LISTEN conversation:… │                              │
+   │                       │ load context (§7.5)          │
+   │                       │ provider.stream(...)         │
+   │                       │ ───────────────────────────► │
+   │                       │ ◄── token chunks ─────────── │
+   │                       │ NOTIFY conversation:… {token}│
+   │ ◄── token ────────────┤                              │
+   │ forward to client     │                              │
+   │                       │ done → INSERT messages       │
+   │                       │ UPDATE agent_runs.status     │
+   │                       │ NOTIFY conversation:… {done} │
+   │ ◄── done ─────────────┤                              │
 ```
 
 ### 10.2 Interaction protocol
@@ -555,7 +567,7 @@ The agent needs the user — either a `write`/`destructive` tool call (runtime-i
 
 1. INSERT a `user_interactions` row with kind, prompt, `status='pending'`.
 2. UPDATE `tool_calls.status='awaiting_user'`, `agent_runs.status='awaiting_approval'`.
-3. `NOTIFY run:<run_id> { type:'interaction_required', interactionId, kind }`.
+3. `NOTIFY conversation:<conversation_id> { type:'interaction_required', interactionId, kind }`.
 4. `LISTEN` for `interaction_resolved` with that `interactionId`.
 
 **Ingress side**, on receiving `interaction_required`:
@@ -568,7 +580,7 @@ The agent needs the user — either a `write`/`destructive` tool call (runtime-i
 
 1. Responding ingress writes `user_interactions.response`, `status='resolved'`, `resolved_via=<ingress>`, `resolved_at=now()` — via conditional UPDATE so only one ingress wins.
 2. UPDATEs `tool_calls.status='running'` and `agent_runs.status='running'`.
-3. `NOTIFY run:<run_id> { type:'interaction_resolved', interactionId }`.
+3. `NOTIFY conversation:<conversation_id> { type:'interaction_resolved', interactionId }`.
 
 **Worker** wakes from LISTEN, reads the response row, continues:
 
@@ -607,7 +619,7 @@ The one accepted residue: if the crash lands *after* a side-effecting tool execu
 
 User clicks "stop" in the UI, types `/cancel` in Discord, or says "stop" to voice.
 
-1. Ingress UPDATEs `agent_runs.status='cancelled'`, NOTIFYs `run:<id> { type:'cancelled' }`.
+1. Ingress UPDATEs `agent_runs.status='cancelled'`, NOTIFYs `conversation:<conversation_id> { type:'cancelled' }`.
 2. Worker, between LLM streaming chunks or before invoking a tool, checks `agent_runs.status`. If `cancelled`, aborts:
    - Cancels any in-flight LLM stream via `AbortController`.
    - Marks any pending interaction `status='cancelled'`.
@@ -620,14 +632,14 @@ Worst case: a tool already executing can't be cancelled cleanly (e.g. a browser 
 
 | Error class | Behavior |
 |-------------|----------|
-| LLM API transient (5xx, 429) | Provider abstraction retries with backoff: 1s, 2s, 4s, 8s. After 4 attempts: fail run with `error='llm_unavailable'`. |
-| LLM API permanent (4xx) | Fail run with the API's error captured in `agent_runs.error`. |
-| Tool error (thrown from `invoke`) | Caught by the loop; tool_result becomes `{ error:'<message>' }`. The agent sees it next turn and can adapt. |
-| Tool timeout | Each tool declares a default timeout (30s browser action, 120s inbox scan, …). Exceeding it returns `{ error:'timeout' }`. |
-| Cost cap | Per-run cap (default $1, configurable). Checked after each LLM call. Exceeded: fail with `error='cost_exceeded'`. |
-| Stuck / abandoned run (worker died or hung) | Startup sweep marks any `running` / `awaiting_*` rows as `failed` on worker boot (§10.5). No dead-letter machinery — a crash means restart, and the owner re-issues. |
+| LLM API transient (5xx, 429) | **Planned, not yet built.** Intended: provider abstraction retries with backoff (1s, 2s, 4s, 8s); after 4 attempts, fail with `error='llm_unavailable'`. Today there is no retry — a provider error propagates and fails the run immediately, captured in `agent_runs.error`. |
+| LLM API permanent (4xx) | Fail run with the API's error captured in `agent_runs.error`. *(Built.)* |
+| Tool error (thrown from `invoke`) | Caught by the loop; tool_result becomes `{ error:'<message>' }`. The agent sees it next turn and can adapt. *(Built.)* |
+| Tool timeout | Each tool declares a default timeout, returning `{ error:'timeout' }` on exceed. Built for the browser tools (30s per command, §8); the general per-tool-timeout framework arrives with the next non-browser tools. |
+| Cost cap | **Planned, not yet built.** Intended: a per-run cap (default $1, configurable), checked after each LLM call, failing with `error='cost_exceeded'`. Today per-call and per-run cost is *computed and recorded* (`llm_calls.cost_usd` → `agent_runs.cost_usd`, §6.5) but **never enforced** — nothing aborts a run for exceeding a budget. The layered run/objective/daily budgets (§7.7) build on this same unbuilt cap. |
+| Stuck / abandoned run (worker died or hung) | Startup sweep marks any `running` / `awaiting_*` rows as `failed` on worker boot (§10.5). No dead-letter machinery — a crash means restart, and the owner re-issues. *(Built.)* |
 
-Pattern across all of these: **fail loudly into structured rows**, never silently. The `llm_calls` table captures LLM-level detail; `agent_runs` / `tool_calls` capture run-level outcomes — all in the one Postgres.
+Pattern across all of these: **fail loudly into structured rows**, never silently. The `llm_calls` table captures LLM-level detail; `agent_runs` / `tool_calls` capture run-level outcomes — all in the one Postgres. (The two rows marked *planned* above are the exceptions still owed: a provider error currently fails loudly but without the retry, and there is no cost ceiling yet.)
 
 ### 10.8 Idempotency
 
@@ -701,26 +713,23 @@ Terminal (absorbing): `resolved`, `timed_out`, `cancelled`.
 
 ## 11. Web Frontend
 
-**Stack**
+**Stack** (as built — `clients/web/package.json`)
 
-- **Vite + React + TypeScript** — fastest dev loop, cleanest config for a non-SSR SPA.
-- **Tailwind + shadcn/ui** — copy-in components, Radix primitives under the hood, owns the design tokens.
-- **`@ai-sdk/react`** (`useChat`) — handles SSE streaming, message state, optimistic updates. ~30 lines of chat code on the frontend.
-- **TanStack Query** — non-chat server state (conversation list, settings, approvals queue).
-- **react-router** — minimal routing if multiple screens are needed.
-- **`vite-plugin-pwa`** — service worker, manifest, installability, Web Push.
+- **Vite + React + TypeScript** — fastest dev loop, cleanest config for a non-SSR SPA. *(Built.)*
+- **Tailwind v4** — owns the design tokens (the warm espresso/brass theme). Components are hand-rolled, not a component library. *Originally planned shadcn/ui + Radix; not adopted* — the surface is small enough that bare Tailwind + a few local components is simpler. Self-hosted Hanken Grotesk via `@fontsource-variable` (no external CDN — keeps the app on-box, per CONCEPT).
+- **`react-router-dom`** — routing between the Chat (`/`), Tools (`/tools`), and Debug (`/debug`) screens. *(Built.)*
+- **Streaming: a hand-rolled `EventSource`**, not `@ai-sdk/react`'s `useChat`. The original plan reached for `@ai-sdk/react` (and TanStack Query for non-chat state); neither is installed. The chat consumes the SSE stream directly via `EventSource` and manages message/streaming state with plain `useState`; non-chat fetches (tools, debug) are plain `fetch` + `useState`. A small enough surface that the libraries didn't earn their weight.
+- **PWA (`vite-plugin-pwa`): planned, not yet installed.** No service worker / manifest / Web Push today; the app is a plain SPA served over HTTPS. Installability + push land when notifications do.
 
-**Screens (v1)**
+**Screens**
 
-- Chat (current conversation).
-- Conversation list / history.
-- Approvals queue (pending tool confirmations).
-- Settings (API keys, integrations, agent persona).
+- **Built:** Chat (a single conversation, opened by id — approvals render *inline* in the chat as a card, not a separate queue); Tools (`/tools`, the per-tool approval settings, §16); Debug (`/debug`, the `llm_calls` observability view, §6.5).
+- **Planned (post-MVP):** a conversation list / history view (there's no list route yet, §9.1), a dedicated approvals queue, and a Settings screen (API keys, integrations, persona).
 
-**PWA implications**
+**PWA implications** *(apply once `vite-plugin-pwa` is added — see Stack)*
 
 - Installable on iOS / Android home screens and desktop.
-- Web Push notifications work (iOS 16.4+) — used for "agent finished" and "approval needed" pings.
+- Web Push notifications work (iOS 16.4+) — intended for "agent finished" and "approval needed" pings.
 - Background sync limited on iOS but useful on Android/desktop.
 - **No voice.** The PWA is chat-only. Voice lives exclusively in the native app (§9.3).
 
@@ -750,32 +759,34 @@ Three layers, in increasing specificity:
 
 ### 13.1 .env layout
 
-```
-# === Identity ===
-TAILSCALE_USER_HEADER=Tailscale-User-Login
-ALLOWED_DISCORD_USER_ID=<owner's Discord ID>
+This is the *target* layout across all ingresses. Only the keys the built processes need are in the zod schema (`packages/shared/src/config.ts`) and `.env.example` today: `WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`. The rest below are **reserved for post-MVP ingresses** and are not validated or read yet — they're documented here so the layout is whole.
 
-# === Data ===
+```
+# === Identity === (reserved; not read today — see §12: the app reads no header)
+TAILSCALE_USER_HEADER=Tailscale-User-Login
+ALLOWED_DISCORD_USER_ID=<owner's Discord ID>   # for the post-MVP Discord ingress
+
+# === Data === (built)
 POSTGRES_URL=postgres://alfred:...@localhost:5432/alfred
 
-# === LLM (Gemini) ===
+# === LLM (Gemini) === (built)
 GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash
 # (provider-scoped: a future OpenAI/Anthropic provider adds OPENAI_MODEL/etc.)
 
-# === Browser bridge (embedded in the worker; §8) ===
+# === Browser bridge (embedded in the worker; §8) === (built)
 # Loopback-only WS port the Chrome extension connects to. No auth token and no MCP port:
 # the bridge binds to 127.0.0.1 and gates on a chrome-extension:// Origin.
 BRIDGE_WS_PORT=7865
 
 # === Ingresses ===
-WEBSERVER_PORT=3000
-DISCORD_BOT_TOKEN=<from Discord developer portal>
+WEBSERVER_PORT=3000                            # built
+DISCORD_BOT_TOKEN=<from Discord developer portal>   # reserved (post-MVP Discord ingress)
 
 # === Observability ===
 # Lightweight, in-Postgres (llm_calls + the /debug page) — no keys needed.
 
-# === Voice (post-MVP) ===
+# === Voice (post-MVP) === (reserved)
 DEEPGRAM_API_KEY=...
 ELEVENLABS_API_KEY=...
 ```
@@ -789,7 +800,7 @@ Each process imports a typed `loadConfig()` from `packages/shared/config.ts` tha
 - Returns a strongly typed config object — no `process.env.X` access elsewhere in the codebase.
 - **Fails fast on startup** if anything required is missing. Better to crash at boot than silently misbehave later.
 
-Each process declares only the subset it needs (the Discord bot doesn't need `DEEPGRAM_API_KEY`). Minimizes blast radius — a compromised process doesn't have access to keys it never asked for.
+*Intended:* each process declares only the subset it needs (the Discord bot doesn't need `DEEPGRAM_API_KEY`), minimizing blast radius — a compromised process can't read keys it never asked for. *Today:* there is a single shared zod schema in `packages/shared/src/config.ts` that all processes validate against; optionality (`POSTGRES_URL`, `GEMINI_API_KEY`) lets a process boot without keys it doesn't use, but the per-process-subset split isn't built yet — the schema comment notes "later steps extend the schema."
 
 ### 13.3 File permissions and storage
 
@@ -830,7 +841,7 @@ alfred/
 │  ├─ shared/               ← TS types shared between services and web client
 │  └─ agent-core/           ← agent loop, provider abstraction, tool interface
 ├─ chrome-extension/        ← MV3 extension (pnpm workspace member; built with esbuild; talks to the worker's embedded bridge)
-├─ ecosystem.config.js      ← pm2 process definitions for services/*
+├─ ecosystem.config.cjs     ← pm2 process definitions for services/*
 ├─ pnpm-workspace.yaml      ← lists services/*, clients/web, packages/*, chrome-extension
 ├─ package.json             ← root scripts (build, dev, lint)
 └─ README.md
@@ -873,7 +884,7 @@ Conceptually it's a peer of the worker's embedded browser bridge, just running i
 pnpm install                                      # workspace setup
 pnpm --filter "./services/*" build                # build all services
 pnpm --filter web dev                             # web client dev server
-pm2 start ecosystem.config.js                     # bring services up
+pm2 start ecosystem.config.cjs                    # bring services up
 pm2 reload all                                    # post-deploy
 
 # iOS side (post-MVP)
