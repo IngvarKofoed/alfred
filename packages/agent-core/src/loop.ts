@@ -9,6 +9,9 @@ export interface ApprovalRequest {
   name: string
   args: unknown
   trustTier: 'read' | 'write' | 'destructive'
+  // Copied from the resolved Tool. The loop carries it through but acts on it nowhere — the
+  // worker's approval gate uses it for group-scoped approval (ARCHITECTURE §16).
+  group?: string
 }
 
 // The owner's decision on a pending approval. `note` is an optional reason, surfaced
@@ -28,6 +31,10 @@ export interface RunOptions {
   maxTurns?: number
   // Consulted only for write/destructive tools before invoke. Absent ⇒ auto-approve.
   requestApproval?: (call: ApprovalRequest) => Promise<ApprovalVerdict>
+  // Whether a given call must pause for owner approval. Absent ⇒ the default gate
+  // (write/destructive gate, read runs free). The worker supplies a settings-aware
+  // predicate so per-tool approval overrides (the tools page, §16) take effect here.
+  requiresApproval?: (call: ApprovalRequest) => boolean
   // Tool-call lifecycle hooks (the worker persists tool_calls rows from these).
   onToolStart?: (call: ApprovalRequest) => void | Promise<void>
   onToolEnd?: (
@@ -72,12 +79,13 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
     for (const tc of toolCalls) {
       const tool = toolsByName.get(tc.name)
       const trustTier = tool?.trustTier ?? 'read'
-      const call: ApprovalRequest = { id: tc.id, name: tc.name, args: tc.args, trustTier }
+      const call: ApprovalRequest = { id: tc.id, name: tc.name, args: tc.args, trustTier, group: tool?.group }
 
       await opts.onToolStart?.(call)
 
-      // Write/destructive tools pause for owner approval before running.
-      if (trustTier !== 'read') {
+      // Pause for owner approval when required. Default: write/destructive gate; the worker
+      // can override per tool (e.g. "never ask for this tool", or "always ask for this read").
+      if (opts.requiresApproval?.(call) ?? trustTier !== 'read') {
         const verdict = opts.requestApproval ? await opts.requestApproval(call) : { approved: true }
         if (!verdict.approved) {
           const result = { error: 'user_rejected', note: verdict.note }

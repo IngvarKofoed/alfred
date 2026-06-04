@@ -8,11 +8,12 @@ import {
   OWNER_USER_ID,
   pgNotify,
   toolCalls,
+  tools as toolsTable,
   userInteractions,
   users,
 } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
-import { and, asc, desc, eq } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import pg from 'pg'
@@ -157,6 +158,49 @@ app.post('/api/interactions/:id', async (c) => {
     JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
   )
   return c.json({ ok: true })
+})
+
+// --- Tools (catalog + per-tool approval settings) ---
+
+// The tool catalog the worker published at boot, plus the owner's approval setting. The
+// client groups by tool_group. require_approval is a tri-state (null = trust-tier default).
+app.get('/api/tools', async (c) => {
+  const rows = await getDb()
+    .select({
+      name: toolsTable.name,
+      toolGroup: toolsTable.toolGroup,
+      trustTier: toolsTable.trustTier,
+      description: toolsTable.description,
+      requireApproval: toolsTable.requireApproval,
+    })
+    .from(toolsTable)
+    .orderBy(asc(toolsTable.toolGroup), asc(toolsTable.name))
+  return c.json({ tools: rows })
+})
+
+// Set the approval requirement for one tool or a whole group (the client sends every name
+// in the group). require_approval is a tri-state: true (force), false (skip), null (default).
+// No trust-tier restriction — destructive is owner-overridable (a deliberate §16 divergence).
+app.patch('/api/tools', async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    names?: unknown
+    requireApproval?: unknown
+  }
+  const names = Array.isArray(body.names)
+    ? body.names.filter((n): n is string => typeof n === 'string')
+    : []
+  if (names.length === 0) return c.json({ error: 'names is required' }, 400)
+  const { requireApproval } = body
+  if (requireApproval !== true && requireApproval !== false && requireApproval !== null) {
+    return c.json({ error: 'requireApproval must be true, false, or null' }, 400)
+  }
+
+  const updated = await getDb()
+    .update(toolsTable)
+    .set({ requireApproval, updatedAt: new Date() })
+    .where(inArray(toolsTable.name, names))
+    .returning({ name: toolsTable.name })
+  return c.json({ updated: updated.map((r) => r.name) })
 })
 
 // --- Debug / observability (read-only) ---

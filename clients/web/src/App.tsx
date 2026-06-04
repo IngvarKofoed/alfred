@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { BrowserRouter, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import Chat from './Chat'
 import Debug from './Debug'
+import Tools from './Tools'
 
 const CONVERSATION_KEY = 'alfred.conversationId'
 
@@ -32,6 +33,7 @@ export default function App() {
           <Routes>
             {/* key remounts Chat on a fresh id, so its state starts clean. */}
             <Route path="/" element={<Chat key={conversationId} conversationId={conversationId} />} />
+            <Route path="/tools" element={<Tools />} />
             <Route path="/debug" element={<Debug />} />
           </Routes>
         </main>
@@ -56,6 +58,14 @@ function Header({ onNew }: { onNew: () => void }) {
           }
         >
           Chat
+        </NavLink>
+        <NavLink
+          to="/tools"
+          className={({ isActive }) =>
+            isActive ? 'text-brass' : 'text-muted transition-colors hover:text-ink'
+          }
+        >
+          Tools
         </NavLink>
         <NavLink
           to="/debug"

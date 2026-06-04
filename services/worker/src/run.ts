@@ -2,30 +2,23 @@ import {
   type ApprovalRequest,
   type ApprovalVerdict,
   computeCostUsd,
-  echoTool,
   GeminiProvider,
   type LlmProvider,
   type Message,
   runAgent,
   TracingProvider,
 } from '@alfred/agent-core'
-import { agentRuns, getDb, llmCalls, messages, toolCalls, userInteractions } from '@alfred/db'
+import { agentRuns, getDb, llmCalls, messages, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
 import { and, asc, eq } from 'drizzle-orm'
 import pg from 'pg'
-import { getBridge } from './browser/bridge.js'
-import { makeBrowserTools } from './browser/tools.js'
+import { buildRunTools } from './catalog.js'
 import { notifyRun } from './events.js'
 import { rowsToMessages } from './messages.js'
-import { makeSetTitleTool } from './tools.js'
 
 // MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
 // lease sits just above it so a job blocked on approval outlives the timeout.
 const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
-
-// The browser toolset is process-static (the bridge is a singleton, the tools carry no
-// per-conversation state), so build it once rather than on every run.
-const BROWSER_TOOLS = makeBrowserTools(getBridge())
 
 // Minimal system prompt for now; full persona assembly (§7.5) is deferred.
 const SYSTEM_PROMPT = 'You are Alfred, a helpful personal assistant. Be concise and direct.'
@@ -87,14 +80,28 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       })
     })
 
-    // Built-in tools for this run: echo (read, runs freely), a context-bound write tool, and
-    // the process-static browser tools (all write-tier → each pauses for approval) backed by
-    // the embedded bridge (the server runs in index.ts).
-    const tools = [echoTool, makeSetTitleTool(run.conversationId), ...BROWSER_TOOLS]
+    // The full toolset for this run (echo + the context-bound title tool + the browser
+    // tools), assembled in one place so the boot catalog publish can't drift from it.
+    const tools = buildRunTools(run.conversationId)
+
+    // The owner's per-tool approval overrides (the tools page, §16), loaded once per run.
+    // require_approval is a tri-state: null/absent ⇒ fall back to the trust-tier default.
+    const overrideRows = await db
+      .select({ name: toolsTable.name, requireApproval: toolsTable.requireApproval })
+      .from(toolsTable)
+    const approvalOverrides = new Map(overrideRows.map((r) => [r.name, r.requireApproval]))
+    const requiresApproval = (call: ApprovalRequest): boolean =>
+      approvalOverrides.get(call.name) ?? call.trustTier !== 'read'
 
     // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval
     // can update the row the loop is talking about.
     const toolCallRowIds = new Map<string, string>()
+
+    // Group-scoped approval (§16): once the owner approves a tool group (e.g. 'browser'),
+    // further calls in that group skip the prompt for the rest of THIS run. Per-run and
+    // in-memory — a crash drops the grant with the run (fail-and-restart, §7.6). Only
+    // successful approvals are remembered; a rejection rejects just that call.
+    const approvedGroups = new Set<string>()
 
     const finalMessages = await runAgent({
       provider,
@@ -114,7 +121,10 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
             toolName: call.name,
             args: call.args,
             trustTier: call.trustTier,
-            status: call.trustTier === 'read' ? 'running' : 'pending',
+            // 'pending' if it will pause for approval, else 'running' (it runs immediately).
+            // Mirrors the same predicate the loop gates on, so an owner-disabled gate (the
+            // tools page) isn't recorded as a misleading 'pending'.
+            status: requiresApproval(call) ? 'pending' : 'running',
             startedAt: new Date(),
           })
           .returning({ id: toolCalls.id })
@@ -133,7 +143,19 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
           })
           .where(eq(toolCalls.id, rowId))
       },
-      requestApproval: (call) => requestApproval(db, run.conversationId, runId, toolCallRowIds, call),
+      requiresApproval,
+      requestApproval: async (call) => {
+        // Group already granted this run → auto-approve without prompting. The tool_calls
+        // row is still written by onToolStart above, so the action stays in the audit log.
+        // Destructive calls are exempt: §16 requires them to always prompt, regardless of
+        // any group grant (a grant earned by a write call must never cover a destructive one).
+        if (call.group && call.trustTier !== 'destructive' && approvedGroups.has(call.group)) {
+          return { approved: true }
+        }
+        const verdict = await requestApproval(db, run.conversationId, runId, toolCallRowIds, call)
+        if (verdict.approved && call.group) approvedGroups.add(call.group)
+        return verdict
+      },
     })
     await notifyChain
 
@@ -222,10 +244,15 @@ async function requestApproval(
       toolCallId,
       kind: 'approval',
       prompt: {
-        summary: 'Run ' + call.name,
+        // Group calls render a task-scoped card: approving covers every action in the
+        // group for the rest of the run, not just the one triggering call (§16).
+        summary: call.group
+          ? `Allow Alfred to use the ${call.group} for this task? Approving covers all ${call.group} actions until this run finishes.`
+          : 'Run ' + call.name,
         tool: call.name,
         args: call.args,
         trust_tier: call.trustTier,
+        scope: call.group ? 'group' : 'call',
       },
       status: 'pending',
     })

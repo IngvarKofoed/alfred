@@ -6,6 +6,10 @@ export interface Tool {
   description: string
   inputSchema: object // JSON Schema, surfaced to the model
   trustTier: 'read' | 'write' | 'destructive'
+  // Optional grouping label (e.g. 'browser'). The loop ignores it; the worker uses it for
+  // group-scoped approval and (later) per-conversation tool exposure (ARCHITECTURE §7.5/§16).
+  // Ungrouped tools are each their own implicit group of one.
+  group?: string
   invoke(args: unknown): Promise<unknown>
 }
 

@@ -105,6 +105,18 @@ user_interactions     -- any moment the run pauses for user input
   index (status) where status = 'pending'
   -- partial index → fast "pending interactions" inbox lookup
 
+tools                                 -- the worker-published tool catalog + owner approval setting
+  name              text pk             -- tool name, e.g. 'navigate'
+  tool_group        text                -- nullable; e.g. 'browser'
+  trust_tier        text                -- 'read' | 'write' | 'destructive' (worker-published)
+  description       text default ''
+  require_approval  boolean             -- nullable tri-state: null = use trust_tier default,
+                                        --   true = force approval, false = skip approval
+  last_seen_at      timestamptz default now()  -- refreshed each boot publish
+  updated_at        timestamptz         -- when the owner last changed require_approval
+  created_at        timestamptz default now()
+  index (tool_group)
+
 memory_facts                          -- placeholder; expanded post-MVP
   id              uuid pk
   user_id         uuid fk → users.id
@@ -120,6 +132,7 @@ memory_facts                          -- placeholder; expanded post-MVP
 
 ## Design notes
 
+- **`tools` is worker-published catalog + owner setting in one row.** The worker upserts the catalog columns (`tool_group`, `trust_tier`, `description`, `last_seen_at`) at boot from its live `Tool` instances — so the catalog can't drift from what actually runs, and runtime-discovered MCP tools (§7.3) publish the same way. `require_approval` is owner-owned (set from the web Tools page) and the boot upsert never touches it. It's a tri-state: `null` ⇒ use the trust-tier default (write/destructive ask, read runs free); `true`/`false` ⇒ explicit override. The worker reads these per run to build its approval predicate (§16). A tool removed from code leaves a stale row (its setting persists harmlessly); rows are not pruned.
 - **`user_interactions` is a generic pause-for-user table** that handles two kinds today (`approval`, `question`) and can absorb new kinds later (clarification, multi-step wizard) without schema churn. Both kinds share the same machinery: create row, surface through ingresses, wait for resolution, resume the run.
 - **Approvals and questions split because the trigger differs**:
   - *Approval* is **runtime-injected**: the worker, about to invoke a `write`/`destructive` tool, creates an approval interaction *before* the tool runs. If rejected, the tool never runs.
@@ -136,7 +149,13 @@ memory_facts                          -- placeholder; expanded post-MVP
 
 ```ts
 // Approval
-prompt:   { summary: string; tool: string; args: object; trust_tier: 'write' | 'destructive' }
+prompt:   { summary: string; tool: string; args: object;
+            trust_tier: 'read' | 'write' | 'destructive'; scope?: 'group' | 'call' }
+            // trust_tier is usually write|destructive, but can be 'read' when the owner
+            // forces approval on a read tool from the Tools page (the `tools` table, §16).
+            // scope='group' ⇒ a task-scoped approval: granting it covers every call in the
+            // tool's group (e.g. 'browser') for the rest of the run, not just this call
+            // (ARCHITECTURE §16). Absent / 'call' ⇒ a single-call approval.
 response: { approved: boolean; note?: string }
 
 // Question (mirrors AskUserQuestion-style structured prompts)

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { runAgent } from './loop.js'
+import { type ApprovalRequest, runAgent } from './loop.js'
 import type { LlmProvider } from './provider.js'
-import { echoTool } from './tool.js'
+import { echoTool, type Tool } from './tool.js'
 import type { Message, StreamEvent } from './types.js'
 
 // A deterministic, offline LlmProvider: each call to stream() replays the next
@@ -42,5 +42,38 @@ describe('runAgent', () => {
       role: 'assistant',
       content: [{ type: 'text', text: 'I echoed: hi' }],
     })
+  })
+
+  it("threads a write tool's group onto the approval request", async () => {
+    // The worker's gate uses ApprovalRequest.group for group-scoped approval (§16); the
+    // loop's only job is to copy it from the resolved Tool onto the request it surfaces.
+    const groupedTool: Tool = {
+      name: 'navigate',
+      description: 'Navigate the browser',
+      inputSchema: { type: 'object' },
+      trustTier: 'write',
+      group: 'browser',
+      async invoke() {
+        return { ok: true }
+      },
+    }
+    const provider = fakeProvider([
+      [{ type: 'tool_call', id: 'c1', name: 'navigate', args: { url: 'https://x' } }],
+      [{ type: 'text', text: 'done' }],
+    ])
+
+    const seen: ApprovalRequest[] = []
+    await runAgent({
+      provider,
+      tools: [groupedTool],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+      requestApproval: async (call) => {
+        seen.push(call)
+        return { approved: true }
+      },
+    })
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ name: 'navigate', trustTier: 'write', group: 'browser' })
   })
 })

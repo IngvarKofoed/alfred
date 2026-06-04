@@ -170,6 +170,7 @@ Topology only (see `DATABASE.md` for columns):
 - `agent_runs` — one per job; carries status, model, and token/cost accounting. A partial unique index enforces **one active run per conversation** (§7.6).
 - `tool_calls` — one per invoked tool; carries `trust_tier` and status.
 - `user_interactions` — the generic pause-for-user table (`approval` / `question`); the record of every owner decision.
+- `tools` — the worker-published tool catalog + the owner's per-tool approval setting (`require_approval`); read per run to gate (§16).
 - `memory_facts` — post-MVP placeholder; `embedding` column unused until pgvector (§6.4).
 
 `agent_runs` + `tool_calls` + `user_interactions` together are the audit log — there is no separate `audit_log` table.
@@ -912,7 +913,8 @@ An agent with browser access to the owner's email, banking, and messaging accoun
 
 - **Tools declare a trust tier**: `read`, `write`, `destructive`. The agent runtime treats each differently.
 - **Read by default**: `write` and `destructive` tools trigger a runtime-injected approval interaction (§6) *before* the tool runs. The owner sees the proposed action with full args, clicks ✅/❌ in the web UI or reacts in Discord, and only then does the worker invoke the tool. Rejection short-circuits with a structured error the agent can read.
-- **Destructive actions** (sending money, mass-delete, "send to all") always require approval, regardless of agent confidence — this is enforced by the tool's declared tier, not by agent judgment.
+- **The trust tier is the *default*, owner-overridable per tool.** The tier (above) decides whether a tool asks by default; the owner can override that per tool from the web **Tools page**, persisted in the `tools` table (`require_approval`, a tri-state — `null` = tier default, `true` = always ask, `false` = never ask). The worker reads these per run to build its approval predicate. The catalog the page lists is published to the `tools` table by the worker at boot from its live tools (so it can't drift, and covers MCP tools too). Within a run, an *enabled* gate still gets the group-scoped approval treatment (first prompt, rest auto-approved).
+- **Destructive actions** (sending money, mass-delete, "send to all") require approval by default. **This is now an owner-overridable default, not a hard invariant** (a deliberate change from the original "always require approval, regardless"): the owner may disable approval even for a `destructive` tool from the Tools page, the owner's box and the owner's risk. The web UI's one guard rail is a confirm prompt before disabling approval on a destructive tool; the worker and API enforce no destructive-specific lock.
 - **Per-integration scoping**: the Gmail tool exposes `read`/`draft`/`label` as `read`-tier and `send` as `write`-tier — same MCP server, different per-tool tiers.
 - **Same machinery, different trigger**: structured questions (agent calls `ask_user`) use the same `user_interactions` table and ingress surfacing as approvals. One UI/Discord/voice flow handles both — easier to make robust, easier to reason about.
 - **Auditable trail**: every tool invocation logged in `tool_calls`; every owner decision logged in `user_interactions` with timestamp and ingress used. Together they are the audit log.

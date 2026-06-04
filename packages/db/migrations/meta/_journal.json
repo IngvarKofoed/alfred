@@ -43,6 +43,13 @@
       "when": 1780511801617,
       "tag": "0005_furry_unus",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1780560623367,
+      "tag": "0006_closed_zaran",
+      "breakpoints": true
     }
   ]
 }

@@ -2,7 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 
 type ContentPart = { type: string; text?: string }
 type ChatMessage = { id?: string; role: string; content: ContentPart[] }
-type ApprovalPrompt = { summary?: string; tool: string; args: unknown; trust_tier?: string }
+type ApprovalPrompt = {
+  summary?: string
+  tool: string
+  args: unknown
+  trust_tier?: string
+  // 'group' ⇒ approving covers every action in the tool group for the rest of the run,
+  // not just the call shown below (ARCHITECTURE §16). Absent / 'call' ⇒ single-call approval.
+  scope?: 'group' | 'call'
+}
 type RunEvent =
   | { type: 'token'; text: string }
   | { type: 'done' }
@@ -136,6 +144,12 @@ export default function Chat({ conversationId }: { conversationId: string }) {
         <div className="px-5 pb-3">
           <div className="mx-auto max-w-xl rounded-2xl border border-brass/40 bg-paper-raised p-4 shadow-lg">
             <p className="text-base font-medium text-ink">{approval.prompt?.summary ?? 'Approve action'}</p>
+            {approval.prompt?.scope === 'group' && (
+              <p className="mt-1 text-sm text-muted">
+                Covers all of this task&apos;s actions — you won&apos;t be asked again until the run
+                finishes. First action shown below.
+              </p>
+            )}
             {approval.prompt?.tool && (
               <p className="mt-1 text-sm text-muted">
                 Tool: <span className="font-mono text-brass">{approval.prompt.tool}</span>

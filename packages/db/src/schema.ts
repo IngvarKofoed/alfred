@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import {
+  boolean,
   index,
   integer,
   jsonb,
@@ -144,6 +145,25 @@ export const toolCalls = pgTable(
     error: text('error'),
   },
   (t) => [index('tool_calls_run_started_idx').on(t.agentRunId, t.startedAt)],
+)
+
+// tools: the worker-published tool catalog + the owner's per-tool approval setting
+// (ARCHITECTURE §16 + the tools-page spec). The worker upserts the catalog columns at boot,
+// derived from its live Tool instances (no drift); require_approval is owner-owned and a
+// tri-state: null = use the trust-tier default, true = force approval, false = skip approval.
+export const tools = pgTable(
+  'tools',
+  {
+    name: text('name').primaryKey(), // tool name, e.g. 'navigate'
+    toolGroup: text('tool_group'), // nullable; e.g. 'browser' ('group' is awkward in SQL)
+    trustTier: text('trust_tier').notNull(), // 'read' | 'write' | 'destructive'
+    description: text('description').notNull().default(''),
+    requireApproval: boolean('require_approval'), // tri-state; null = trust-tier default
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }), // when the owner last changed the setting
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('tools_group_idx').on(t.toolGroup)],
 )
 
 // user_interactions: any moment the run pauses for user input (approval | question).

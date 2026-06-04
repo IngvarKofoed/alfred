@@ -108,6 +108,9 @@ export function makeBrowserTools(bridge: BrowserBridge): Tool[] {
     description: spec.description,
     inputSchema: spec.inputSchema,
     trustTier: 'write',
+    // All browser tools are one unit: a single per-run approval covers the whole task
+    // (ARCHITECTURE §16), instead of prompting per click/type.
+    group: 'browser',
     async invoke(args: unknown): Promise<unknown> {
       const result = await bridge.sendCommand(spec.name, (args ?? {}) as Record<string, unknown>)
       return capResult(result)
