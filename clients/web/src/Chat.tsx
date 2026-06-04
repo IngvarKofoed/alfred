@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
-type ContentPart = { type: string; text?: string }
+type ContentPart = { type: string; text?: string; name?: string; id?: string; args?: unknown }
+type ToolUse = { id: string; name: string; args?: unknown }
 type ChatMessage = { id?: string; role: string; content: ContentPart[] }
 type ApprovalPrompt = {
   summary?: string
@@ -13,13 +14,34 @@ type ApprovalPrompt = {
 }
 type RunEvent =
   | { type: 'token'; text: string }
+  | { type: 'tool_call_start'; id: string; toolName: string; args?: unknown }
+  | { type: 'tool_call_end'; id: string }
   | { type: 'done' }
+  | { type: 'cancelled' }
   | { type: 'error'; message: string }
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
   | { type: 'interaction_resolved'; interactionId: string }
 
 function textOf(content: ContentPart[]): string {
   return content.map((p) => (p.type === 'text' ? (p.text ?? '') : '')).join('')
+}
+
+function toolUsesOf(content: ContentPart[]): ToolUse[] {
+  return content
+    .filter((p) => p.type === 'tool_use' && p.name)
+    .map((p) => ({ id: p.id ?? (p.name as string), name: p.name as string, args: p.args }))
+}
+
+// A compact single-line `key: value, …` rendering of a tool call's args for the chip.
+// CSS truncates the visible width; this just caps the string so the DOM stays small.
+function argSummary(args: unknown): string {
+  if (!args || typeof args !== 'object') return ''
+  const parts = Object.entries(args as Record<string, unknown>).map(([k, v]) => {
+    const val = typeof v === 'string' ? v : JSON.stringify(v)
+    return `${k}: ${val}`
+  })
+  const s = parts.join(', ').replace(/\s+/g, ' ').trim()
+  return s.length > 80 ? s.slice(0, 80) + '…' : s
 }
 
 export default function Chat({ conversationId }: { conversationId: string }) {
@@ -30,6 +52,9 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   const [approval, setApproval] = useState<{ interactionId: string; prompt: ApprovalPrompt } | null>(
     null,
   )
+  // Tools currently running this turn — drives the subtle live tool chip, keyed by
+  // call id. Cleared when history reloads (it then carries the calls durably) or on error.
+  const [activeTools, setActiveTools] = useState<ToolUse[]>([])
   const scrollRef = useRef<HTMLDivElement>(null)
   // Whether to keep pinning to the bottom; false once the user scrolls up to read.
   const stick = useRef(true)
@@ -37,7 +62,13 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   const loadHistory = () =>
     fetch(`/api/conversations/${conversationId}/messages`)
       .then((r) => r.json() as Promise<{ messages: ChatMessage[] }>)
-      .then((d) => setHistory(d.messages ?? []))
+      .then((d) => {
+        // Set history and drop the transient live chips in one render: the reloaded
+        // turns carry the tool chips durably, so there's no gap (cleared too early)
+        // and no overlap (cleared too late, live + history chips both showing).
+        setHistory(d.messages ?? [])
+        setActiveTools([])
+      })
       .catch(() => {})
 
   useEffect(() => {
@@ -47,12 +78,18 @@ export default function Chat({ conversationId }: { conversationId: string }) {
       const ev = JSON.parse(e.data) as RunEvent
       if (ev.type === 'token') {
         setStreaming((s) => s + ev.text)
-      } else if (ev.type === 'done') {
+      } else if (ev.type === 'tool_call_start') {
+        setActiveTools((t) => [...t, { id: ev.id, name: ev.toolName, args: ev.args }])
+      } else if (ev.type === 'tool_call_end') {
+        setActiveTools((t) => t.filter((c) => c.id !== ev.id))
+      } else if (ev.type === 'done' || ev.type === 'cancelled') {
+        // loadHistory clears the live chips once the durable ones arrive.
         setStreaming('')
         setBusy(false)
         void loadHistory()
       } else if (ev.type === 'error') {
         setStreaming('')
+        setActiveTools([])
         setBusy(false)
         setHistory((h) => [...h, { role: 'assistant', content: [{ type: 'text', text: `⚠️ ${ev.message}` }] }])
       } else if (ev.type === 'interaction_required') {
@@ -74,7 +111,7 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   useEffect(() => {
     const el = scrollRef.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [history, streaming, busy, approval])
+  }, [history, streaming, busy, approval, activeTools])
 
   const onScroll = () => {
     const el = scrollRef.current
@@ -118,6 +155,8 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   }
 
   const empty = history.length === 0 && !streaming
+  // Nothing to render yet (no streamed text, no running tool) but the run is live.
+  const showThinking = busy && !streaming && activeTools.length === 0
 
   return (
     <>
@@ -129,14 +168,27 @@ export default function Chat({ conversationId }: { conversationId: string }) {
           </div>
         )}
         <div className="mx-auto flex max-w-xl flex-col gap-5">
-          {history.map((m, i) => (
-            <Bubble key={m.id ?? i} role={m.role} text={textOf(m.content)} />
-          ))}
-          {streaming ? (
-            <Bubble role="assistant" text={streaming} />
-          ) : (
-            busy && <Thinking />
+          {history.map((m, i) =>
+            // Tool-result messages aren't shown in chat — the call is surfaced via the
+            // assistant's tool chip; full results live on /debug.
+            m.role === 'tool' ? null : (
+              <Bubble
+                key={m.id ?? i}
+                role={m.role}
+                text={textOf(m.content)}
+                toolUses={toolUsesOf(m.content)}
+              />
+            ),
           )}
+          {streaming && <Bubble role="assistant" text={streaming} />}
+          {activeTools.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {activeTools.map((t) => (
+                <ToolChip key={t.id} name={t.name} args={t.args} live />
+              ))}
+            </div>
+          )}
+          {showThinking && <Thinking />}
         </div>
       </div>
 
@@ -206,7 +258,15 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   )
 }
 
-function Bubble({ role, text }: { role: string; text: string }) {
+function Bubble({
+  role,
+  text,
+  toolUses = [],
+}: {
+  role: string
+  text: string
+  toolUses?: ToolUse[]
+}) {
   const isUser = role === 'user'
   if (isUser) {
     return (
@@ -217,13 +277,41 @@ function Bubble({ role, text }: { role: string; text: string }) {
       </div>
     )
   }
+  // A turn may be text-only, tool-only, or both — render nothing for an empty turn.
+  if (!text && toolUses.length === 0) return null
   return (
     <div className="flex flex-col gap-1" style={{ animation: 'alfred-rise 0.25s ease-out' }}>
       <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
-      <div className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink">
-        {text}
-      </div>
+      {text && <div className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink">{text}</div>}
+      {toolUses.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 pt-0.5">
+          {toolUses.map((t) => (
+            <ToolChip key={t.id} name={t.name} args={t.args} />
+          ))}
+        </div>
+      )}
     </div>
+  )
+}
+
+// A quiet pill marking a tool the agent used (history) or is using now (live → pulse).
+// Shows the tool name and a single-line, CSS-truncated summary of its args.
+function ToolChip({ name, args, live = false }: { name: string; args?: unknown; live?: boolean }) {
+  const summary = argSummary(args)
+  return (
+    <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-line bg-surface px-2.5 py-1 text-xs text-muted">
+      <span
+        className={`h-1.5 w-1.5 shrink-0 rounded-full bg-brass ${live ? 'animate-pulse' : ''}`}
+        aria-hidden
+      />
+      <span className="shrink-0 font-mono text-ink-dim">{name}</span>
+      {summary && <span className="min-w-0 truncate font-mono text-muted">{summary}</span>}
+      {live && (
+        <span className="shrink-0" aria-hidden>
+          …
+        </span>
+      )}
+    </span>
   )
 }
 

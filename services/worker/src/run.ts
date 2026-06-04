@@ -129,6 +129,21 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
           })
           .returning({ id: toolCalls.id })
         toolCallRowIds.set(call.id, row!.id)
+        // Subtle live signal to the chat (chained after this turn's tokens for ordering).
+        // Carry the args for the chip's summary, but only when small — large args (e.g. an
+        // evaluate_javascript script) could exceed the 8000-byte NOTIFY cap and fail the run;
+        // omit them and the live chip shows just the name (history still summarizes from the
+        // persisted tool_use part).
+        const argsForChip =
+          call.args != null && JSON.stringify(call.args).length <= 1024 ? call.args : undefined
+        notifyChain = notifyChain.then(() =>
+          notifyRun(run.conversationId, {
+            type: 'tool_call_start',
+            id: call.id,
+            toolName: call.name,
+            args: argsForChip,
+          }),
+        )
       },
       onToolEnd: async (call, outcome) => {
         const rowId = toolCallRowIds.get(call.id)
@@ -142,6 +157,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
             finishedAt: new Date(),
           })
           .where(eq(toolCalls.id, rowId))
+        notifyChain = notifyChain.then(() =>
+          notifyRun(run.conversationId, { type: 'tool_call_end', id: call.id }),
+        )
       },
       requiresApproval,
       requestApproval: async (call) => {
