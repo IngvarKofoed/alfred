@@ -7,6 +7,7 @@ const inner: LlmProvider = {
   async *stream(): AsyncIterable<StreamEvent> {
     yield { type: 'text', text: 'hel' }
     yield { type: 'text', text: 'lo' }
+    yield { type: 'tool_call', id: 'c1', name: 'echo', args: { text: 'hi' } }
     yield {
       type: 'usage',
       model: 'gemini-2.5-flash',
@@ -15,6 +16,14 @@ const inner: LlmProvider = {
       finishReason: 'STOP',
     }
   },
+}
+
+const echoTool = {
+  name: 'echo',
+  description: 'Echo the text back.',
+  inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+  trustTier: 'read' as const,
+  invoke: async () => ({}),
 }
 
 describe('TracingProvider', () => {
@@ -26,7 +35,7 @@ describe('TracingProvider', () => {
     const request: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]
 
     const seen: string[] = []
-    for await (const ev of tp.stream(request, [])) {
+    for await (const ev of tp.stream(request, [echoTool])) {
       if (ev.type === 'text') seen.push(ev.text)
     }
 
@@ -42,5 +51,10 @@ describe('TracingProvider', () => {
     expect(traces[0]!.latencyMs).toBeGreaterThanOrEqual(0)
     expect(traces[0]!.request).toBe(request)
     expect(traces[0]!.error).toBeUndefined()
+    // the trace captures the tools offered and the tool calls the model returned
+    expect(traces[0]!.tools).toEqual([
+      { name: 'echo', description: 'Echo the text back.', parameters: echoTool.inputSchema },
+    ])
+    expect(traces[0]!.responseToolCalls).toEqual([{ id: 'c1', name: 'echo', args: { text: 'hi' } }])
   })
 })

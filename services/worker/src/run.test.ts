@@ -158,6 +158,19 @@ describe.skipIf(!process.env.POSTGRES_URL)('worker runJob', () => {
         const [call] = await db.select().from(toolCalls).where(eq(toolCalls.agentRunId, run!.id))
         expect(call!.toolName).toBe('set_conversation_title')
         expect(call!.status).toBe('done')
+
+        // Observability (debug page): the trace captured the tools offered to the model and
+        // the tool call it returned — not just the messages.
+        const traceCalls = await db
+          .select()
+          .from(llmCalls)
+          .where(eq(llmCalls.agentRunId, run!.id))
+          .orderBy(asc(llmCalls.createdAt))
+        const offered = traceCalls[0]!.tools as { name: string }[] | null
+        expect(offered?.some((t) => t.name === 'set_conversation_title')).toBe(true)
+        expect(offered?.some((t) => t.name === 'navigate')).toBe(true) // browser tools are offered too
+        const returned = traceCalls[0]!.responseToolCalls as { name: string }[] | null
+        expect(returned?.some((t) => t.name === 'set_conversation_title')).toBe(true)
       } finally {
         await db.delete(userInteractions).where(eq(userInteractions.agentRunId, run!.id))
         await db.delete(llmCalls).where(eq(llmCalls.agentRunId, run!.id))

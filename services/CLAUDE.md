@@ -2,7 +2,7 @@
 
 Long-running Node/TypeScript backend processes, all supervised by pm2 and pulling shared code from `packages/`. See `docs/ARCHITECTURE.md` §5 (process topology), §9 (ingresses), and §10 (runtime flows) for the broader context.
 
-Contents: `worker/` (agent execution loop), `browser-bridge/` (MCP-over-HTTP+SSE + WebSocket server for the Chrome extension), `webserver/` (Hono — PWA API + SSE), `discord-bot/` (discord.js ingress), `voice/` (voice orchestrator, post-MVP), `triggers/` (scheduler / event-source ingress, post-MVP).
+Contents: `worker/` (agent execution loop; also hosts the **embedded browser bridge** in `worker/src/browser/` — the WebSocket server the Chrome extension connects to, §8 Option C; there is no separate `browser-bridge` process), `webserver/` (Hono — PWA API + SSE), `discord-bot/` (discord.js ingress), `voice/` (voice orchestrator, post-MVP), `triggers/` (scheduler / event-source ingress, post-MVP).
 
 ## Required tools
 

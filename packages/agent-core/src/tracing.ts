@@ -2,10 +2,27 @@ import type { LlmProvider, StreamOptions } from './provider.js'
 import type { Tool } from './tool.js'
 import type { Message, StreamEvent } from './types.js'
 
+// A captured tool the model was offered this call — the function-declaration shape, not
+// the live Tool (no invoke/closure), so it serializes cleanly into the trace.
+export interface TracedTool {
+  name: string
+  description: string
+  parameters: unknown
+}
+
+// A tool the model asked to call in its response this turn.
+export interface TracedToolCall {
+  id: string
+  name: string
+  args: unknown
+}
+
 export interface LlmTrace {
   model: string
   request: Message[]
+  tools: TracedTool[]
   responseText: string
+  responseToolCalls: TracedToolCall[]
   promptTokens?: number
   cachedTokens?: number
   completionTokens?: number
@@ -30,6 +47,7 @@ export class TracingProvider implements LlmProvider {
     const start = Date.now()
     let model = opts?.model ?? 'unknown'
     let responseText = ''
+    const responseToolCalls: TracedToolCall[] = []
     let promptTokens: number | undefined
     let cachedTokens: number | undefined
     let completionTokens: number | undefined
@@ -40,6 +58,8 @@ export class TracingProvider implements LlmProvider {
       for await (const ev of this.inner.stream(messages, tools, opts)) {
         if (ev.type === 'text') {
           responseText += ev.text
+        } else if (ev.type === 'tool_call') {
+          responseToolCalls.push({ id: ev.id, name: ev.name, args: ev.args })
         } else if (ev.type === 'usage') {
           model = ev.model
           promptTokens = ev.promptTokens
@@ -56,7 +76,9 @@ export class TracingProvider implements LlmProvider {
       await this.onTrace({
         model,
         request: messages,
+        tools: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.inputSchema })),
         responseText,
+        responseToolCalls,
         promptTokens,
         cachedTokens,
         completionTokens,

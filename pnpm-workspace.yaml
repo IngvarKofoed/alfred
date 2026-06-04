@@ -2,3 +2,4 @@ packages:
   - 'services/*'
   - 'clients/web'
   - 'packages/*'
+  - 'chrome-extension'

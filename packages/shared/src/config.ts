@@ -38,6 +38,10 @@ const schema = z.object({
   GEMINI_API_KEY: z.string().optional(),
   // Provider-scoped so other providers can add their own (OPENAI_MODEL, etc.).
   GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
+  // Port the embedded browser bridge's WebSocket server listens on (127.0.0.1 only). The
+  // Chrome extension connects here. No auth token / extension-ID needed — the bridge binds
+  // to loopback and gates on a chrome-extension:// Origin (ARCHITECTURE §8).
+  BRIDGE_WS_PORT: z.coerce.number().int().positive().default(7865),
 })
 
 export type Config = z.infer<typeof schema>

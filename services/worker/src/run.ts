@@ -13,6 +13,8 @@ import { agentRuns, getDb, llmCalls, messages, toolCalls, userInteractions } fro
 import { loadConfig } from '@alfred/shared'
 import { and, asc, eq } from 'drizzle-orm'
 import pg from 'pg'
+import { getBridge } from './browser/bridge.js'
+import { makeBrowserTools } from './browser/tools.js'
 import { notifyRun } from './events.js'
 import { rowsToMessages } from './messages.js'
 import { makeSetTitleTool } from './tools.js'
@@ -20,6 +22,10 @@ import { makeSetTitleTool } from './tools.js'
 // MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
 // lease sits just above it so a job blocked on approval outlives the timeout.
 const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
+
+// The browser toolset is process-static (the bridge is a singleton, the tools carry no
+// per-conversation state), so build it once rather than on every run.
+const BROWSER_TOOLS = makeBrowserTools(getBridge())
 
 // Minimal system prompt for now; full persona assembly (§7.5) is deferred.
 const SYSTEM_PROMPT = 'You are Alfred, a helpful personal assistant. Be concise and direct.'
@@ -64,7 +70,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         agentRunId: runId,
         model: trace.model,
         request: trace.request,
+        tools: trace.tools,
         responseText: trace.responseText,
+        responseToolCalls: trace.responseToolCalls,
         promptTokens,
         completionTokens,
         costUsd: computeCostUsd(
@@ -79,8 +87,10 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       })
     })
 
-    // Built-in tools for this run: echo (read, runs freely) + a context-bound write tool.
-    const tools = [echoTool, makeSetTitleTool(run.conversationId)]
+    // Built-in tools for this run: echo (read, runs freely), a context-bound write tool, and
+    // the process-static browser tools (all write-tier → each pauses for approval) backed by
+    // the embedded bridge (the server runs in index.ts).
+    const tools = [echoTool, makeSetTitleTool(run.conversationId), ...BROWSER_TOOLS]
 
     // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval
     // can update the row the loop is talking about.

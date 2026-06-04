@@ -107,7 +107,9 @@ export const llmCalls = pgTable(
       .references(() => agentRuns.id),
     model: text('model').notNull(),
     request: jsonb('request').notNull(), // the Message[] sent to the provider
+    tools: jsonb('tools'), // the function declarations offered to the model this call (name/description/parameters)
     responseText: text('response_text').notNull().default(''),
+    responseToolCalls: jsonb('response_tool_calls'), // the tool_use calls the model returned this call (id/name/args)
     promptTokens: integer('prompt_tokens').notNull().default(0),
     completionTokens: integer('completion_tokens').notNull().default(0),
     costUsd: numeric('cost_usd', { precision: 10, scale: 6 }).notNull().default('0'),

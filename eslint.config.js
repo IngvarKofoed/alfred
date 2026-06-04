@@ -12,4 +12,11 @@ export default tseslint.config(
       globals: { module: 'readonly', require: 'readonly', __dirname: 'readonly', process: 'readonly' },
     },
   },
+  {
+    // Node-run ESM build scripts (e.g. the chrome-extension esbuild build).
+    files: ['**/build.js'],
+    languageOptions: {
+      globals: { process: 'readonly', console: 'readonly' },
+    },
+  },
 )

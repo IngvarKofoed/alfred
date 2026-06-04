@@ -1,8 +1,8 @@
 # Alfred — chrome-extension/
 
-The MV3 browser-automation extension. It runs inside the owner's real Chrome (real logins) and is the transparent helper that lets Alfred drive the browser undetectably — not a user-facing client. See `docs/ARCHITECTURE.md` §8 (browser integration) for context. Conceptually a peer of `services/browser-bridge`, just running in Chrome instead of Node.
+The MV3 browser-automation extension. It runs inside the owner's real Chrome (real logins) and is the transparent helper that lets Alfred drive the browser undetectably — not a user-facing client. See `docs/ARCHITECTURE.md` §8 (browser integration) for context. Conceptually a peer of the worker's **embedded** browser bridge (`services/worker/src/browser/`), just running in Chrome instead of Node — there is no separate bridge process.
 
-Contents: MV3 extension in TypeScript (Vite + `@crxjs/vite-plugin` or similar). Service worker holds the outbound WebSocket to the bridge; content scripts synthesize real DOM events. Shares protocol message types with `services/browser-bridge`.
+Contents: MV3 extension in TypeScript, bundled with **esbuild** (`build.js`; `pnpm --filter @alfred/chrome-extension build` → `dist/background.js`). Service worker (`background.ts`) holds the outbound WebSocket to the worker's bridge; content-script functions (`content.ts`) are injected on demand via `chrome.scripting.executeScript`. The wire-protocol types (`types.ts`) are duplicated from the worker's bridge and kept in sync by hand. Ported from the owner's `chrome-mcp` project; `tsc` is not run in CI (esbuild bundles without type-checking), so the upstream's latent strict-type annotations are tolerated — validate behavior with `verify` in a real Chrome.
 
 ## Required tools
 
@@ -18,6 +18,6 @@ Unit-testable logic uses **Vitest** (not yet pinned in `ARCHITECTURE.md`; pin it
 
 ## Subtree-scoped rules
 
-- **High-sensitivity surface.** This extension carries the bridge auth token (in `chrome.storage.local`) and injects content scripts into authenticated banking/email pages. Treat the auth token and any page-data handling with care; never log secrets or page contents.
-- **Protocol types are shared with `services/browser-bridge`** — change them in one place and keep both sides in sync.
-- **MV3 service-worker suspension is a fact of life** — keep the `chrome.alarms` heartbeat and reconnect-with-backoff logic intact (§8).
+- **High-sensitivity surface.** This extension injects content scripts into authenticated banking/email pages. Treat any page-data handling with care; never log page contents. (There is no bridge auth token — containment is the worker bridge's loopback bind + `chrome-extension://` Origin guard, §8.)
+- **Protocol types are duplicated in the worker's bridge** (`services/worker/src/browser/types.ts`) — change them in both places and keep them in sync.
+- **MV3 service-worker suspension is a fact of life** — keep the keepalive ping and reconnect-with-backoff logic intact (§8).

@@ -63,8 +63,10 @@ llm_calls                               -- one row per LLM provider call (observ
   id                  uuid pk
   agent_run_id        uuid fk → agent_runs.id
   model               text
-  request             jsonb         -- the Message[] sent to the provider
+  request             jsonb         -- the Message[] sent to the provider (incl. the system message)
+  tools               jsonb         -- nullable; function declarations offered this call (name/description/parameters)
   response_text       text
+  response_tool_calls jsonb         -- nullable; tool_use calls the model returned this call (id/name/args)
   prompt_tokens       int default 0
   completion_tokens   int default 0
   cost_usd            numeric(10, 6) default 0   -- tokens × model price map (agent-core/pricing.ts)
@@ -125,7 +127,7 @@ memory_facts                          -- placeholder; expanded post-MVP
 - **`tool_calls.status`** carries `awaiting_user` while an interaction is open. The `tool_calls ← user_interactions` link gives the full context of *why* the run is paused.
 - **`messages.content` as JSONB**, not plain text. Lets a single message carry text, attachments, tool-use blocks, tool-result blocks — matches the structure the LLM API returns and avoids fan-out tables for every variant.
 - **Token + cost accounting on `agent_runs`** (rolled up from `llm_calls`) so cost views don't have to walk per-call rows.
-- **`llm_calls` is the observability trace** — one row per provider call (request, response, tokens, **cost**, latency, errors), rolled up onto `agent_runs` and surfaced on the web `/debug` page. Per-call `cost_usd` is computed at insert from `tokens × model price` (the price map lives in `packages/agent-core/pricing.ts`, not the DB — see ARCHITECTURE §13); the run's `cost_usd` is the sum of its calls'. It's the in-Postgres alternative to Langfuse (ARCHITECTURE §17).
+- **`llm_calls` is the observability trace** — one row per provider call capturing the full exchange: the request `Message[]`, the `tools` (function declarations) offered, the response text **and** any `response_tool_calls` the model returned, plus tokens, **cost**, latency, errors. Rolled up onto `agent_runs` and surfaced on the web `/debug` page (which also joins the run's `tool_calls` to show executed-tool results + approval outcomes). Per-call `cost_usd` is computed at insert from `tokens × model price` (the price map lives in `packages/agent-core/pricing.ts`, not the DB — see ARCHITECTURE §13); the run's `cost_usd` is the sum of its calls'. It's the in-Postgres alternative to Langfuse (ARCHITECTURE §17).
 - **No `audit_log` table** — `agent_runs` + `tool_calls` + `user_interactions` form the audit log. Every action the agent took is a row with args, result, and (if applicable) the owner's response.
 - **No `attachments` table yet** — file references go inline in `messages.content` as `{type: 'attachment', path: '...'}`. Promote to a real table the first time multiple messages need to share a file.
 - **Status columns are governed by explicit state machines** — the legal transitions and cross-entity invariants for `agent_runs`, `tool_calls`, and `user_interactions` are specified in `ARCHITECTURE.md` §10.9, not left implicit in the runtime-flow prose of §10.

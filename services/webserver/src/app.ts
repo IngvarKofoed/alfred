@@ -7,6 +7,7 @@ import {
   messages,
   OWNER_USER_ID,
   pgNotify,
+  toolCalls,
   userInteractions,
   users,
 } from '@alfred/db'
@@ -192,7 +193,13 @@ app.get('/api/debug/runs/:id', async (c) => {
     .from(llmCalls)
     .where(eq(llmCalls.agentRunId, id))
     .orderBy(asc(llmCalls.createdAt))
-  return c.json({ run, calls })
+  // The executed-tool view: name/args/result + trust tier and approval outcome (status).
+  const tools = await db
+    .select()
+    .from(toolCalls)
+    .where(eq(toolCalls.agentRunId, id))
+    .orderBy(asc(toolCalls.startedAt))
+  return c.json({ run, calls, toolCalls: tools })
 })
 
 function isUniqueViolation(err: unknown): boolean {

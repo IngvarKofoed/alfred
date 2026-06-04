@@ -13,11 +13,16 @@ type RunRow = {
   error: string | null
 }
 
+type TracedTool = { name: string; description: string; parameters: unknown }
+type TracedToolCall = { id: string; name: string; args: unknown }
+
 type LlmCall = {
   id: string
   model: string
   request: unknown
+  tools: TracedTool[] | null
   responseText: string
+  responseToolCalls: TracedToolCall[] | null
   promptTokens: number
   completionTokens: number
   costUsd: string | null
@@ -26,7 +31,17 @@ type LlmCall = {
   error: string | null
 }
 
-type RunDetail = { run: RunRow; calls: LlmCall[] }
+type ToolCallRow = {
+  id: string
+  toolName: string
+  args: unknown
+  result: unknown
+  trustTier: string
+  status: string
+  error: string | null
+}
+
+type RunDetail = { run: RunRow; calls: LlmCall[]; toolCalls?: ToolCallRow[] }
 
 export default function Debug() {
   const [runs, setRuns] = useState<RunRow[]>([])
@@ -98,28 +113,90 @@ export default function Debug() {
             Run {detail.run.id.slice(0, 8)} · <span className={statusColor(detail.run.status)}>{detail.run.status}</span>
           </h2>
           {detail.run.error && <p className="text-red-400">{detail.run.error}</p>}
-          {detail.calls.map((call) => (
-            <div key={call.id} className="rounded-md bg-zinc-900 p-3">
-              <div className="text-zinc-400">
-                {call.model} · {call.latencyMs}ms · {call.promptTokens}+{call.completionTokens} tok
-                {' · '}
-                {usd(call.costUsd)}
-                {call.finishReason ? ` · ${call.finishReason}` : ''}
+          {detail.calls.map((call) => {
+            const system = systemTextOf(call.request)
+            const toolCalls = call.responseToolCalls ?? []
+            return (
+              <div key={call.id} className="rounded-md bg-zinc-900 p-3">
+                <div className="text-zinc-400">
+                  {call.model} · {call.latencyMs}ms · {call.promptTokens}+{call.completionTokens} tok
+                  {' · '}
+                  {usd(call.costUsd)}
+                  {call.finishReason ? ` · ${call.finishReason}` : ''}
+                </div>
+                {call.error && <div className="mt-1 text-red-400">{call.error}</div>}
+
+                {system && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-zinc-400">system instruction</summary>
+                    <pre className="mt-1 whitespace-pre-wrap text-xs text-zinc-300">{system}</pre>
+                  </details>
+                )}
+
+                <details className="mt-1">
+                  <summary className="cursor-pointer text-zinc-400">
+                    tools offered{call.tools ? ` (${call.tools.length})` : ''}
+                  </summary>
+                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-xs text-zinc-300">
+                    {(call.tools ?? [])
+                      .map((t) => `${t.name} — ${t.description}\n${JSON.stringify(t.parameters)}`)
+                      .join('\n\n') || '—'}
+                  </pre>
+                </details>
+
+                <details className="mt-1">
+                  <summary className="cursor-pointer text-zinc-400">request (messages)</summary>
+                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-xs text-zinc-300">
+                    {JSON.stringify(call.request, null, 2)}
+                  </pre>
+                </details>
+
+                <details className="mt-1" open={!call.responseText && toolCalls.length > 0}>
+                  <summary className="cursor-pointer text-zinc-400">
+                    response{toolCalls.length ? ` · ${toolCalls.length} tool call${toolCalls.length > 1 ? 's' : ''}` : ''}
+                  </summary>
+                  {call.responseText && (
+                    <pre className="mt-1 whitespace-pre-wrap text-xs text-zinc-300">{call.responseText}</pre>
+                  )}
+                  {toolCalls.map((tc) => (
+                    <pre key={tc.id} className="mt-1 overflow-x-auto whitespace-pre-wrap text-xs text-sky-300">
+                      → {tc.name}({JSON.stringify(tc.args)})
+                    </pre>
+                  ))}
+                  {!call.responseText && toolCalls.length === 0 && (
+                    <pre className="mt-1 text-xs text-zinc-500">(empty)</pre>
+                  )}
+                </details>
               </div>
-              {call.error && <div className="mt-1 text-red-400">{call.error}</div>}
-              <details className="mt-2">
-                <summary className="cursor-pointer text-zinc-400">request</summary>
-                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-xs text-zinc-300">
-                  {JSON.stringify(call.request, null, 2)}
-                </pre>
-              </details>
-              <details className="mt-1">
-                <summary className="cursor-pointer text-zinc-400">response</summary>
-                <pre className="mt-1 whitespace-pre-wrap text-xs text-zinc-300">{call.responseText}</pre>
-              </details>
-            </div>
-          ))}
+            )
+          })}
           {detail.calls.length === 0 && <p className="text-zinc-500">No LLM calls recorded.</p>}
+
+          {(detail.toolCalls ?? []).length > 0 && (
+            <div>
+              <h3 className="mb-2 font-semibold">Tool calls</h3>
+              <div className="space-y-2">
+                {(detail.toolCalls ?? []).map((tc) => (
+                  <div key={tc.id} className="rounded-md bg-zinc-900 p-3 text-xs">
+                    <div className="text-zinc-300">
+                      <span className="text-sky-300">{tc.toolName}</span>
+                      <span className="text-zinc-500"> · {tc.trustTier} · </span>
+                      <span className={toolStatusColor(tc.status)}>{tc.status}</span>
+                    </div>
+                    <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-zinc-400">
+                      args: {JSON.stringify(tc.args)}
+                    </pre>
+                    {tc.result != null && (
+                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-zinc-400">
+                        result: {JSON.stringify(tc.result)}
+                      </pre>
+                    )}
+                    {tc.error && <div className="mt-1 text-red-400">{tc.error}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </section>
       )}
     </div>
@@ -146,4 +223,28 @@ function statusColor(status: string): string {
   if (status === 'failed') return 'text-red-400'
   if (status === 'running' || status === 'pending') return 'text-amber-400'
   return 'text-zinc-400'
+}
+
+function toolStatusColor(status: string): string {
+  if (status === 'done') return 'text-emerald-400'
+  if (status === 'failed' || status === 'rejected') return 'text-red-400'
+  if (status === 'awaiting_user') return 'text-amber-400'
+  return 'text-zinc-400'
+}
+
+// Pull the system-prompt text out of the logged request (the first system-role message).
+// The request is the provider-agnostic Message[]; shape-guard since it's typed unknown.
+function systemTextOf(request: unknown): string {
+  if (!Array.isArray(request)) return ''
+  return request
+    .filter((m): m is { role: string; content: unknown } => !!m && typeof m === 'object' && 'role' in m)
+    .filter((m) => m.role === 'system')
+    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .map((p: unknown) =>
+      p && typeof p === 'object' && 'type' in p && (p as { type: string }).type === 'text'
+        ? ((p as { text?: string }).text ?? '')
+        : '',
+    )
+    .join('\n')
+    .trim()
 }

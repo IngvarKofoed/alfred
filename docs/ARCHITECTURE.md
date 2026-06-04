@@ -50,23 +50,20 @@ External clients
 │ Home server (any OS)                                                  │
 │                                                                       │
 │  Chrome (owner profile + extension)                                   │
-│        │ WebSocket                                                    │
+│        │ WebSocket (ws://127.0.0.1, chrome-extension:// origin)       │
 │        ▼                                                              │
-│  Browser bridge ─────── MCP (HTTP+SSE) ──────────────┐                │
-│                                                       │                │
-│  Postgres                                             │                │
-│  ├─ state (conversations, memory, approvals)          │                │
-│  ├─ job queue (pg-boss)                               │                │
-│  └─ pub/sub (LISTEN / NOTIFY)                         │                │
-│        ▲                                              │                │
-│        │  enqueue / stream                            ▼                │
-│        │                                       Agent worker(s)         │
-│  Ingresses (interchangeable):                  ├─ hand-rolled loop     │
-│  ├─ Hono webserver (PWA chat, SSE)             ├─ Provider abstraction │
-│  ├─ Discord bot                                │   (Gemini, …)         │
-│  ├─ Voice orchestrator (native app, post-MVP)  └─ Tool interface       │
-│  └─ Triggers (cron/inbox/webhook, post-MVP)        ├─ MCP-sourced      │
-│                                                    └─ built-in        │
+│  Postgres                                       Agent worker(s)        │
+│  ├─ state (conversations, memory, approvals)    ├─ hand-rolled loop    │
+│  ├─ job queue (pg-boss)                         ├─ Provider abstraction│
+│  └─ pub/sub (LISTEN / NOTIFY)                   │   (Gemini, …)        │
+│        ▲                                        ├─ Tool interface      │
+│        │  enqueue / stream                      │   ├─ built-in        │
+│        │                                        │   └─ MCP-sourced     │
+│  Ingresses (interchangeable):                   └─ embedded browser    │
+│  ├─ Hono webserver (PWA chat, SSE)                  bridge (WS server) │
+│  ├─ Discord bot                                       ▲                │
+│  ├─ Voice orchestrator (native app, post-MVP)         │ extension      │
+│  └─ Triggers (cron/inbox/webhook, post-MVP)           connects here    │
 └──────────────────────────────────────────────────────────────────────┘
                                                        │
                                                        ▼
@@ -76,7 +73,7 @@ External clients
 
 **Core idea: ingresses are interchangeable.** The agent worker doesn't know or care whether a job came from the browser, Discord, voice, or a trigger. Each ingress translates its channel's protocol into "submit job, stream output back." Adding a new interface later reuses the same pattern.
 
-**Second core idea: tools are interchangeable.** The agent calls tools through a single internal interface (§7). Whether a tool is exposed by an MCP server (browser, Gmail) or implemented as a built-in function (a simple `now()`), the agent doesn't see the difference.
+**Second core idea: tools are interchangeable.** The agent calls tools through a single internal interface (§7). Whether a tool is a built-in function (the browser commands, a simple `now()`) or — later — exposed by an MCP server (Gmail, …), the agent doesn't see the difference.
 
 ---
 
@@ -128,13 +125,12 @@ All processes are native (no Docker). Managed by **pm2** — the same process su
 |---------|----------|------|----------------|
 | `postgres` | — | State, job queue, pub/sub | Auto-start via OS package manager; not under pm2 |
 | `alfred-webserver` | Node/TS | Browser ingress, serves PWA, SSE | Restart on failure |
-| `alfred-worker` | Node/TS | Agent execution loop | Restart on failure |
-| `alfred-browser-bridge` | Node/TS | MCP server + WS server for Chrome extension | Restart on failure |
+| `alfred-worker` | Node/TS | Agent execution loop + **embedded browser bridge** (WS server for the Chrome extension) | Restart on failure |
 | `alfred-discord` | Node/TS | Discord ingress | Restart on failure |
 | `alfred-voice` | Node/TS | Voice orchestrator (native-app surface, post-MVP) | Restart on failure |
 | `alfred-triggers` | Node/TS | Scheduler / event-source ingress (post-MVP) | Restart on failure |
 
-Each is its own pm2-managed process so a crash in one doesn't take the others down. The bridge is intentionally split from the worker so the extension's WebSocket survives worker restarts.
+Each is its own pm2-managed process so a crash in one doesn't take the others down. The browser bridge was originally planned as a separate `alfred-browser-bridge` process (to keep the extension's WebSocket alive across worker restarts); it was instead **embedded in `alfred-worker`** (§8, Option C) — for a single user the extension's own auto-reconnect covers restarts, so the extra process wasn't worth it.
 
 Deploy: `git pull && pnpm install && pnpm build && pm2 reload ecosystem.config.js`.
 
@@ -299,10 +295,10 @@ This means:
 - Adding a tiny utility = add a built-in `Tool`, no extra process.
 - Swapping an MCP-backed tool for a built-in (or vice versa) is invisible to the agent loop.
 
-**MCP transport choices**:
+**MCP transport choices** (when MCP-sourced tools land — none exist yet):
 
-- `browser-bridge` uses **HTTP+SSE** so it can outlive worker restarts (§8).
-- Other MCP servers can use **stdio** (launched as subprocess by the worker) if they don't need to be long-lived. Simpler lifecycle.
+- The browser is *not* MCP-sourced: it's a set of **built-in tools** backed by an embedded WebSocket bridge (§8, Option C). No MCP is in the codebase yet.
+- Future MCP servers can use **stdio** (launched as subprocess by the worker) if short-lived, or **HTTP+SSE** if they need to outlive worker restarts. Simpler lifecycle for stdio.
 
 ### 7.4 Other agent-core concerns
 
@@ -362,7 +358,7 @@ A second run for the same conversation cannot be created while one is active. Th
 
 **Mid-run input (MVP): rejected.** While a conversation has an active run, new user input is refused at the source — web disables send and shows "Alfred is thinking…"; Discord reacts with a "busy" marker and drops the message. Post-MVP: buffer the message and let the running worker fold it into its next turn, or interrupt. Default is reject because it is the only option with zero ambiguity about what the model actually saw.
 
-**The browser is a single physical resource, guarded by an in-process mutex.** There is one Chrome, one owner profile (§8) — so browser control cannot be per-run. A run acquires the browser mutex only around its browser tool-call windows and **releases it whenever the run pauses** for user input (approval or question, §10.2). This keeps a run parked on a 24h approval from blocking another conversation's browser work. On resume the agent re-acquires the mutex and re-orients (re-reads the page) — cheap, and rare in practice for one user. The mutex lives in the worker process, not Postgres: if the worker dies, the lock dies with it, which is exactly the recovery we want.
+**The browser is a single physical resource.** There is one Chrome, one owner profile (§8) — so browser control cannot truly be per-run. The design calls for an in-process mutex: a run acquires it only around its browser tool-call windows and **releases it whenever the run pauses** for user input (approval or question, §10.2), so a run parked on an approval doesn't block another conversation's browser work. **The mutex is not implemented in the MVP bridge (§8, step 5)**: every browser tool is approval-gated, so the owner already serializes browser use in practice, and two conversations driving Chrome at the same instant is not a real single-user scenario. It remains the right thing to add if that assumption ever breaks; the mutex would live in the worker process, not Postgres, so a crash drops the lock with the worker (the recovery we want).
 
 **Crash policy: fail-and-restart.** A crash (OOM, deploy, host reboot) abandons in-flight runs; we do not reconstruct them. The consequences, all accepted:
 
@@ -397,41 +393,40 @@ None of this is built in MVP. The seams — the `human_in_loop` dimension, the o
 
 The agent uses the owner's real Chrome with all real logins. Automation is done via a **Chrome extension**, not Playwright/CDP, because modern bot defenses (Cloudflare, Datadome, banks) reliably detect headless/CDP-attached Chrome.
 
+**Built (step 5) as Option C — the bridge is *embedded in the worker*, not a separate process, and there is no MCP.** The browser commands are ordinary **built-in agent-core tools** (§7.3) whose `invoke()` proxies to the extension over a WebSocket the worker hosts. (The original design — a standalone `alfred-browser-bridge` exposing MCP over HTTP+SSE that the worker consumed as a client — is recorded in §17 as the rejected alternative.) The code was ported from the owner's `chrome-mcp` project.
+
 **Topology**
 
 ```
 Chrome (owner's profile, on the server box)
 └─ Alfred extension (MV3)
-     │
-     │ outbound WebSocket (auth token, localhost)
+     │ outbound WebSocket → ws://127.0.0.1:<BRIDGE_WS_PORT>
+     │   (loopback-only; accepted only if Origin is chrome-extension://…)
      ▼
-Browser bridge (same box)
-   ├─ WebSocket server  ← extension connects here
-   └─ MCP server (HTTP+SSE)  ← agent worker connects here
-        │
-        ▼
-   Agent worker (uses browser bridge as one MCP among many)
+alfred-worker
+   ├─ BrowserBridge (WebSocket server, singleton started at boot)
+   └─ agent loop → built-in browser tools → bridge.sendCommand(cmd, params)
 ```
 
-**Extension**
+**Extension** (`chrome-extension/`, a pnpm workspace member; built with esbuild)
 
-- Service worker (MV3) holds the outbound WebSocket.
-- Content scripts injected into pages do the actual DOM work — events synthesized at the DOM level (`dispatchEvent` with real `MouseEvent`/`KeyboardEvent`), real timing.
-- Reconnects with backoff on connection drop.
-- MV3 service-worker suspension worked around with `chrome.alarms` heartbeats.
+- Service worker (MV3) holds the outbound WebSocket; reconnects with backoff, keepalive ping every 20s to survive MV3 suspension.
+- Content scripts (injected on demand via `chrome.scripting.executeScript`) do the DOM work in the page context.
+- Connects to `127.0.0.1` (not `localhost`, which can resolve to IPv6 `::1` and miss the IPv4 bind).
 
-**Bridge process**
+**Bridge (embedded in the worker)**
 
-- WebSocket server on `127.0.0.1:<port>` — the extension and Chrome run on the same box, so it's a plain localhost connection (no WSL relay, no wildcard bind).
-- Auth: shared token presented by the extension on connect.
-- MCP server side uses **HTTP+SSE transport** (not stdio) so the bridge can outlive any single agent process — extension stays connected through worker restarts.
-- Exposes browser-shaped tools: `navigate`, `click`, `type`, `read_page`, `wait_for_selector`, `screenshot`, etc. Translates each into messages over the WebSocket.
+- `BrowserBridge` (`services/worker/src/browser/`) runs a `ws` WebSocket server bound to `127.0.0.1:<BRIDGE_WS_PORT>` (default 7865). One extension connection at a time; a new connection replaces a stale one.
+- Started once at worker boot, stopped on SIGINT/SIGTERM. It outlives individual runs; the extension reconnects on its own across worker restarts (fail-and-restart, §7.6).
+- Exposes 22 built-in browser tools (`navigate`, `click`, `type_text`, `get_page_text`, `list_tabs`, `evaluate_javascript`, …). Each `invoke()` sends one id-keyed command over the WebSocket and awaits the reply (30s timeout). Large string results are capped at 100k chars to protect context/cost. **Multi-tab model** (kept from chrome-mcp: `list_tabs`/`switch_tab`/`open_tab`/`close_tab`), not a single active-tab.
+- Screenshots are *not* shipped here — they need an image-content path through agent-core (§6.5 attachment storage); deferred to a follow-up "vision" increment.
 
-**Tab model & mutex**: the browser is a single physical resource shared across all runs, so it is serialized by an **in-process mutex** (§7.6), not driven concurrently. The bridge tracks one "active tab" for whichever run currently holds the mutex; because a run releases the mutex when it pauses, the next run starts from a clean handle rather than inheriting stale state. There is no persisted lease — on a crash everything restarts (§7.6), so the mutex simply dies with the worker. Passing tab IDs around per call would be the alternative; a single active-tab is simpler to reason about for a single-agent system.
+**Containment (no auth token, no MCP).** Two cheap guards replace the originally-planned shared `BRIDGE_AUTH_TOKEN`:
 
-**Approval strategy**: the bridge needs its *own* containment, not the per-tool trust tiers of §16 — its primitives (`click`/`type`) are mechanical, so the danger is in the page, not the tool. Containment is profile isolation + sensitive-domain gating + task-scoped approval, designed here at step 5 (§15). The browser bridge is the single highest-risk component in the system (§16).
+1. **Loopback bind** — `host: '127.0.0.1'`, so other devices on the network can't reach it (`ws` binds to all interfaces by default).
+2. **Origin guard** — the WS upgrade is accepted only if `Origin` starts with `chrome-extension://`. A webpage you visit can open a localhost WebSocket but **cannot forge a `chrome-extension://` origin**, which closes the local drive-by where a page impersonates the extension and feeds the agent forged page content. (A non-browser local process could still spoof the header — out of scope on a single-user box where local processes are already trusted. Matching a *specific* extension ID would also block other extensions; not worth the config here.)
 
-**Open question**: build extension + bridge in-house vs. adopt an existing project like Browser MCP. Read their source first; adopt if it fits, otherwise borrow patterns. See §17.
+**Approval strategy (MVP).** Per-tool trust tiers don't really fit the browser — its primitives are mechanical, so the danger is in the page, not the tool (§16). The structural answer (profile isolation, sensitive-domain gating, task-scoped approval) is still deferred. As a stopgap, **every browser tool is `write` tier**, so each action pauses for owner approval through the existing gate (§10.2). Conservative and high-friction by design; a read/write split is an easy later refinement. The browser remains the single highest-risk component in the system (§16).
 
 ---
 
@@ -767,10 +762,10 @@ GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash
 # (provider-scoped: a future OpenAI/Anthropic provider adds OPENAI_MODEL/etc.)
 
-# === Browser bridge ===
-BRIDGE_AUTH_TOKEN=<random 32+ chars, shared with the Chrome extension>
-BRIDGE_WS_PORT=8765
-BRIDGE_MCP_PORT=8766
+# === Browser bridge (embedded in the worker; §8) ===
+# Loopback-only WS port the Chrome extension connects to. No auth token and no MCP port:
+# the bridge binds to 127.0.0.1 and gates on a chrome-extension:// Origin.
+BRIDGE_WS_PORT=7865
 
 # === Ingresses ===
 WEBSERVER_PORT=3000
@@ -822,8 +817,7 @@ Single git repo. **pnpm workspaces** owns the TypeScript stack; non-TS sub-proje
 alfred/
 ├─ services/                ← backend processes (Node/TS, pnpm workspace members)
 │  ├─ webserver/            ← Hono (API + static serving)
-│  ├─ worker/               ← agent worker
-│  ├─ browser-bridge/       ← MCP (HTTP+SSE) + WebSocket server for extension
+│  ├─ worker/               ← agent worker (+ embedded browser bridge: src/browser/)
 │  ├─ discord-bot/          ← Discord ingress
 │  ├─ voice/                ← voice orchestrator (post-MVP)
 │  └─ triggers/             ← scheduler / event-source ingress (post-MVP)
@@ -834,7 +828,7 @@ alfred/
 │  ├─ db/                   ← Drizzle schema + migrations, query helpers
 │  ├─ shared/               ← TS types shared between services and web client
 │  └─ agent-core/           ← agent loop, provider abstraction, tool interface
-├─ chrome-extension/        ← MV3 extension (pnpm workspace member; shares protocol types with browser-bridge)
+├─ chrome-extension/        ← MV3 extension (pnpm workspace member; built with esbuild; talks to the worker's embedded bridge)
 ├─ ecosystem.config.js      ← pm2 process definitions for services/*
 ├─ pnpm-workspace.yaml      ← lists services/*, clients/web, packages/*, chrome-extension
 ├─ package.json             ← root scripts (build, dev, lint)
@@ -866,10 +860,10 @@ iOS uses **Swift + SPM + Xcode** — a completely separate toolchain from pnpm/N
 The Chrome extension is TS but lives at the **repo root**, not under `clients/`. Reasons:
 
 - It's not a "client" in the user-facing sense — the human is using Chrome, the extension is a transparent helper.
-- It shares the most code with `services/browser-bridge/` (protocol message types), so a workspace member it stays — pnpm reaches it, types are shared.
-- It has its own build story (Vite + `@crxjs/vite-plugin` or similar) that's distinct from both services and web client.
+- It shares the wire-protocol types (`WebSocketRequest`/`WebSocketResponse`) with the worker's embedded bridge (`services/worker/src/browser/`). They're duplicated rather than imported (the extension is a browser/esbuild build that can't pull in a Node package) — kept in sync by hand.
+- It has its own build story (esbuild via `build.js`) that's distinct from both services and web client.
 
-Conceptually it's a peer of `services/browser-bridge`, just running in Chrome instead of Node.
+Conceptually it's a peer of the worker's embedded browser bridge, just running in Chrome instead of Node.
 
 ### 14.4 Day-to-day commands
 
@@ -895,8 +889,9 @@ Each step is independently verifiable. The seams (Postgres queue, SSE, MCP) don'
 2. ✅ **Postgres + Drizzle schema.** `users`, `conversations`, `messages`, `agent_runs`, `llm_calls`, plus pg-boss tables (auto-created).
 3. ✅ **Agent core.** Provider abstraction in `packages/agent-core` with a **Gemini** implementation (`@google/genai`). Hand-rolled loop; `Tool` interface + a built-in `echo` tool (built, but not yet wired through the worker — see "current" below).
 4. ✅ **Real model + observability, end to end.** The loop talks to real Gemini, wired into `alfred-worker` (pg-boss) streaming tokens via `NOTIFY` → SSE to the web chat. Observability is **lightweight in-Postgres** — every call traced to `llm_calls`, surfaced on a `/debug` page (not Langfuse; see §17).
-   - → **Current — tools + approval.** Wire tools through the worker with the trust-tier approval flow (§16 / §10.9) — the step that turns Alfred from chat into action.
-5. **Browser bridge + Chrome extension** as the first MCP-sourced tool. End-to-end browser automation through the agent. Built in-house, drawing from the owner's existing `chrome-mcp` project.
+   - ✅ **Tools + approval.** Tools wired through the worker with the trust-tier approval flow (§16 / §10.9) — the step that turns Alfred from chat into action.
+5. ✅ **Browser bridge + Chrome extension.** End-to-end browser automation. Built as **Option C** (§8): the bridge is embedded in `alfred-worker` and the browser commands are built-in tools — **no separate process and no MCP** (a divergence from the original "first MCP-sourced tool" framing). Ported from the owner's `chrome-mcp`; extension lives at `chrome-extension/`. Screenshots/vision deferred to a follow-up.
+   - → **Current — vision.** Add an image content part to agent-core + the Gemini `inlineData` path + attachment storage (§6.5), then ship the screenshot tools.
 6. **Discord bot** as a second ingress. Same conversation shape as the web ingress, separate thread, shared agent memory.
 
 **End of MVP.** Below the line is post-MVP, in rough priority order:
@@ -923,7 +918,7 @@ An agent with browser access to the owner's email, banking, and messaging accoun
 - **Auditable trail**: every tool invocation logged in `tool_calls`; every owner decision logged in `user_interactions` with timestamp and ingress used. Together they are the audit log.
 - **Trust tiers are owner-assigned, never server-declared.** Built-in tools declare their tier in code (§7.3); MCP-sourced tools are config-mapped with a safe default — the system never trusts an MCP server's own claim about how dangerous its tools are. A compromised or careless server cannot self-promote to `read`.
 - **Per-tool tiers gate *semantic* tools, not the browser.** Trust-tier approval works for semantic tools whose name *is* the intent — a future Gmail `send` is `write`, so it pauses for ✅. It is **insufficient for the browser**: its primitives (`click`/`type`) are mechanical, and the danger lives in the *page*, not the tool. Gating `click` as `read` is unsafe (one click can send money); gating it `destructive` means approving every click — approval fatigue, and the card can't show real intent. So the browser is **not** contained by per-click tiers.
-- **The browser's containment is structural**: separate browser profiles (untrusted-reading vs. trusted-action), sensitive-domain gating, and task-scoped approval (one approval for an objective, not per primitive). This is designed at the browser-bridge step (§15 step 5), not retrofitted onto per-tool tiers. See §8.
+- **The browser's containment is structural**: separate browser profiles (untrusted-reading vs. trusted-action), sensitive-domain gating, and task-scoped approval (one approval for an objective, not per primitive). This is the deferred real answer — **not yet built**. As the step-5 (§8) stopgap, every browser tool is `write`-tier so each action pauses for approval (accepting approval fatigue), and the embedded bridge is contained by a loopback bind + a `chrome-extension://` Origin guard rather than the structural measures. See §8.
 
 This is the actual hard problem — the architecture should make it easy to enforce, not the other way around.
 
@@ -935,13 +930,13 @@ This is the actual hard problem — the architecture should make it easy to enfo
 
 - **Agent loop: hand-rolled.** No Vercel AI SDK or other framework wrapping the model client. Direct ownership of streaming, tool-call parsing, and history management.
 - **Tool interface: unified.** MCP-sourced and built-in tools share one interface inside agent-core. See §7.3.
-- **Browser bridge: build in-house.** Drawing inspiration from the owner's existing `chrome-mcp` project.
+- **Browser bridge: build in-house, embedded in the worker, no MCP (Option C).** Ported from the owner's `chrome-mcp` project, but the WebSocket server lives *inside* `alfred-worker` and the browser commands are built-in tools — there is no separate process and no MCP layer. Rejected alternatives: (A) a standalone `alfred-browser-bridge` process exposing MCP over HTTP+SSE with a ~50-line MCP client in the worker (matches the original §8 design and reuses chrome-mcp verbatim, but adds MCP before it earns its keep, and the restart-survival it buys is redundant with the extension's own reconnect for one user); (B) a standalone process speaking plain HTTP instead of MCP (avoids MCP but requires rewriting chrome-mcp's front door — worst of both). Containment is a loopback bind + `chrome-extension://` Origin guard, replacing the originally-planned shared auth token. See §8.
 - **Voice scope: native app only.** No voice on the web PWA or desktop browsers.
 - **Voice provider lean: ElevenLabs or Google.** Final choice deferred to when the voice orchestrator is the active build target.
 - **Native app platform: iOS** (when voice rollout begins). Tech choice (Swift vs. React Native vs. Expo) deferred until then.
 - **Process supervisor: pm2.** Cross-platform default; native supervisors as fallback.
 - **Observability: lightweight, in-Postgres.** Every LLM call is traced to an `llm_calls` table (rolled up onto `agent_runs`) and surfaced on a `/debug` page in the web app. Langfuse was reconsidered and rejected — modern self-host drags in ClickHouse + Redis + Docker (vs. no-Docker/minimal), and the cloud option ships personal prompt/response data off-box (vs. the privacy principle).
-- **Concurrency & crash model: serialize, don't recover.** One active run per conversation (DB constraint); the browser is serialized by an in-process mutex released on pause; crashes fail-and-restart — no durable resume, `retryLimit: 0`, startup sweep marks orphans `failed`. Deliberately simple for single-user-local, and reversible later. See §7.6.
+- **Concurrency & crash model: serialize, don't recover.** One active run per conversation (DB constraint); the browser is a single shared resource (an in-process mutex is specified but not yet implemented — approval-gating serializes it in practice, §7.6); crashes fail-and-restart — no durable resume, `retryLimit: 0`, startup sweep marks orphans `failed`. Deliberately simple for single-user-local, and reversible later. See §7.6.
 - **Autonomous lifecycle seams reserved.** Presence-dependent overflow policy, durable objective scratchpad for cross-run continuity, agent self-scheduling, and layered (run/objective/daily) budget. Defined now, built when triggers ship. See §7.7.
 
 ### Deferred to future work
@@ -962,9 +957,9 @@ Browser / phone (PWA, chat)      Native iOS app (chat + voice, post-MVP)
 ┌─────────────────────────────────────────────────────────────────┐
 │ Home server (Linux / macOS / Windows — all native)              │
 │                                                                  │
-│  Chrome ─ extension ─ ws ─► browser-bridge                       │
-│                                  │                               │
-│  Hono webserver  ──┐             │ MCP (HTTP+SSE)                │
+│  Chrome ─ extension ─ ws (127.0.0.1) ─────────────►┐             │
+│                                                    │             │
+│  Hono webserver  ──┐                    embedded browser bridge  │
 │  Discord bot      ─┼─► Postgres + pg-boss ◄─► agent-worker       │
 │  Voice (post-MVP) ─┤    state · queue · pub/sub    │             │
 │  Triggers (post)  ─┘                               │             │
@@ -988,7 +983,7 @@ Browser / phone (PWA, chat)      Native iOS app (chat + voice, post-MVP)
 - **Hand-rolled agent loop** — no framework dependency.
 - **Postgres is the only stateful infra** — state, job queue (pg-boss), and pub/sub (LISTEN/NOTIFY) all in one.
 - **Cross-platform**: pm2 supervises Node processes natively on Linux / macOS / Windows identically. No Docker, no WSL2.
-- **Browser automation via Chrome extension** (undetectable) → bridge (MCP over HTTP+SSE) → agent.
+- **Browser automation via Chrome extension** (undetectable) → WebSocket → bridge embedded in the worker (built-in tools, no MCP) → agent.
 - **LLM provider abstraction**: Gemini by default, swappable to OpenRouter / direct vendors / local models by config.
 - **Voice is native-iOS-app only** when it lands — cloud STT/TTS, server-side keys, the agent core (Gemini) still the brain.
 - **Observability from day one** — every LLM call traced to `llm_calls` in Postgres, surfaced on a `/debug` page. No Langfuse.

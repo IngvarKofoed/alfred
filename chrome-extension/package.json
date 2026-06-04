@@ -1,0 +1,16 @@
+{
+  "name": "@alfred/chrome-extension",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Alfred MV3 browser-automation extension (connects to the worker's embedded bridge)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.js",
+    "dev": "node build.js --watch"
+  },
+  "devDependencies": {
+    "chrome-types": "^0.1.420",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.3"
+  }
+}
