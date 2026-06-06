@@ -1,4 +1,4 @@
-import type { Tool } from '@alfred/agent-core'
+import { type ImageToolResult, type Tool } from '@alfred/agent-core'
 import type { BrowserBridge } from './bridge.js'
 
 // The chrome-mcp MCP server truncated large results at 100k chars; dropping that layer
@@ -25,6 +25,10 @@ interface Spec {
   name: string
   description: string
   inputSchema: object
+  // Image-producing commands ({ data:<base64>, mimeType } from the extension): their result
+  // is returned as an ImageToolResult (so the model sees the image) and bypasses capResult —
+  // the 100k-char cap is for text/structured results, not image bytes.
+  image?: boolean
 }
 
 // Every browser tool is `write` tier to start (spec decision): each action — including reads —
@@ -98,6 +102,9 @@ const SPECS: Spec[] = [
   },
   { name: 'evaluate_javascript', description: 'Execute JavaScript in the page context and return the result', inputSchema: OBJECT({ expression: STR('JavaScript expression to evaluate in the page context') }, ['expression']) },
   { name: 'get_form_fields', description: 'Get all form fields on the page with their current values, types, and labels', inputSchema: OBJECT() },
+  // Screenshots — image-producing (see Spec.image): the model actually sees the captured pixels.
+  { name: 'screenshot', description: 'Capture a screenshot of the visible area of the current tab', inputSchema: OBJECT(), image: true },
+  { name: 'screenshot_element', description: 'Capture a screenshot of a specific element identified by CSS selector', inputSchema: OBJECT({ selector: STR('CSS selector of the element to capture') }, ['selector']), image: true },
 ]
 
 // Adapt each browser command to the agent-core Tool interface (ARCHITECTURE §7.3): a built-in
@@ -113,6 +120,13 @@ export function makeBrowserTools(bridge: BrowserBridge): Tool[] {
     group: 'browser',
     async invoke(args: unknown): Promise<unknown> {
       const result = await bridge.sendCommand(spec.name, (args ?? {}) as Record<string, unknown>)
+      if (spec.image) {
+        // The extension returns { data:<base64>, mimeType }. Shape it as an ImageToolResult so
+        // the loop forwards the image to the model; never cap it (capResult is for text bytes).
+        const { data, mimeType } = result as { data: string; mimeType: string }
+        const out: ImageToolResult = { image: { mimeType, data }, summary: `${spec.name} captured` }
+        return out
+      }
       return capResult(result)
     },
   }))

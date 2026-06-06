@@ -12,15 +12,21 @@ import {
   userInteractions,
   users,
 } from '@alfred/db'
-import { loadConfig } from '@alfred/shared'
+import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
 import { and, asc, desc, eq, inArray } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
+import { createReadStream } from 'node:fs'
+import { mkdir, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { Readable } from 'node:stream'
 import pg from 'pg'
 
 export const app = new Hono()
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 // 10 MB
 
 app.get('/api/health', (c) => c.json({ ok: true }))
 
@@ -30,9 +36,33 @@ app.post('/api/conversations/:id/messages', async (c) => {
   const conversationId = c.req.param('id')
   if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
 
-  const body = (await c.req.json().catch(() => ({}))) as { text?: string }
+  const body = (await c.req.json().catch(() => ({}))) as {
+    text?: string
+    attachments?: unknown
+  }
   const text = body.text?.trim()
-  if (!text) return c.json({ error: 'text is required' }, 400)
+
+  // Optional image attachments: each { path, mimeType } references a file already written
+  // into this conversation's workspace by POST /files. Stored as reference-form image parts;
+  // the worker bridges them to inline base64 when assembling history (spec Design).
+  const attachments = Array.isArray(body.attachments) ? body.attachments : []
+  const imageParts: { type: 'image'; path: string; mimeType: string }[] = []
+  for (const a of attachments) {
+    if (typeof a !== 'object' || a === null) {
+      return c.json({ error: 'each attachment must be { path, mimeType }' }, 400)
+    }
+    const { path: p, mimeType } = a as { path?: unknown; mimeType?: unknown }
+    if (typeof p !== 'string' || typeof mimeType !== 'string') {
+      return c.json({ error: 'each attachment must be { path, mimeType }' }, 400)
+    }
+    imageParts.push({ type: 'image', path: p, mimeType })
+  }
+
+  // A message needs at least a text body or one attachment (the web client enables Send on
+  // either). Reject only the genuinely empty submission.
+  if (!text && imageParts.length === 0) {
+    return c.json({ error: 'text or an attachment is required' }, 400)
+  }
 
   const db = getDb()
   let runId: string
@@ -48,7 +78,11 @@ app.post('/api/conversations/:id/messages', async (c) => {
         .onConflictDoNothing()
       const [msg] = await tx
         .insert(messages)
-        .values({ conversationId, role: 'user', content: [{ type: 'text', text }] })
+        .values({
+          conversationId,
+          role: 'user',
+          content: [...(text ? [{ type: 'text', text }] : []), ...imageParts],
+        })
         .returning()
       const [run] = await tx
         .insert(agentRuns)
@@ -65,6 +99,69 @@ app.post('/api/conversations/:id/messages', async (c) => {
 
   await enqueueAgentRun(runId)
   return c.json({ runId })
+})
+
+// Upload a single image into the conversation's workspace. Multipart, parsed via Hono's
+// c.req.parseBody() (no extra dep). The mime type must be an accepted image type and the
+// size ≤10 MB; everything else is rejected here. Returns the workspace-relative path so the
+// client can echo it back in the message's `attachments` (spec: Vision input — upload).
+app.post('/api/conversations/:id/files', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+
+  const form = await c.req.parseBody().catch(() => null)
+  const file = form?.['file']
+  if (!(file instanceof File)) return c.json({ error: 'file is required' }, 400)
+
+  // Extension is derived from the validated mime type, never trusted from the client
+  // filename, so the stored file's type is always known.
+  const ext = extForImageMime(file.type)
+  if (!ext) {
+    return c.json({ error: `unsupported type: ${file.type || 'unknown'}` }, 415)
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return c.json({ error: 'file too large (max 10 MB)' }, 413)
+  }
+
+  // Sanitize the client name to a safe stem (drop its extension; we append the canonical one
+  // derived from the validated mime type, so the on-disk type is never client-controlled).
+  const rawStem = (file.name || 'image').replace(/\.[^.]+$/, '')
+  const safeStem =
+    rawStem
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .replace(/^_+/, '')
+      .slice(0, 64) || 'image'
+  const relPath = `upload-${Date.now()}-${safeStem}.${ext}`
+
+  // resolveInWorkspace confines the write under <WORKSPACE_ROOT>/<conversationId>/.
+  const abs = resolveInWorkspace(conversationId, relPath)
+  await mkdir(path.dirname(abs), { recursive: true })
+  await writeFile(abs, Buffer.from(await file.arrayBuffer()))
+
+  return c.json({ path: relPath, mimeType: file.type })
+})
+
+// Serve a file from the conversation's workspace (the UI fetches images here after a run).
+// Confined to the workspace via resolveInWorkspace, so a traversal filename is rejected —
+// unlike the SPA's serveStatic, this never reaches outside the conversation dir.
+app.get('/media/:conversationId/:filename', async (c) => {
+  const conversationId = c.req.param('conversationId')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+  const filename = c.req.param('filename')
+
+  let abs: string
+  try {
+    abs = resolveInWorkspace(conversationId, filename)
+  } catch {
+    return c.json({ error: 'invalid path' }, 400)
+  }
+
+  const info = await stat(abs).catch(() => null)
+  if (!info || !info.isFile()) return c.json({ error: 'not found' }, 404)
+
+  c.header('Content-Type', contentTypeFor(filename))
+  c.header('Content-Length', String(info.size))
+  return c.body(Readable.toWeb(createReadStream(abs)) as ReadableStream)
 })
 
 // Conversation history, so a page refresh restores the thread.
@@ -245,6 +342,13 @@ app.get('/api/debug/runs/:id', async (c) => {
     .orderBy(asc(toolCalls.startedAt))
   return c.json({ run, calls, toolCalls: tools })
 })
+
+// Map a stored filename's extension to a content type. Uploads are written with an
+// extension derived from their (validated) mime type, so this round-trips correctly; an
+// unknown extension falls back to a generic binary type.
+function contentTypeFor(filename: string): string {
+  return imageMimeForExt(path.extname(filename)) ?? 'application/octet-stream'
+}
 
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23505'

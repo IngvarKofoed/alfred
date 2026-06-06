@@ -8,6 +8,10 @@ export type ContentPart =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; result: unknown }
+  // Inline base64 image. agent-core is storage-agnostic — it carries the bytes the model
+  // needs; the worker bridges this <-> an on-disk reference for persistence (the spec's
+  // two-representation design). Used for uploads, screenshots, and generated images.
+  | { type: 'image'; mimeType: string; data: string }
 
 export type Message = { role: Role; content: ContentPart[] }
 

@@ -21,6 +21,13 @@ export interface ModelPrice {
 
 export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-2.5-flash': { inputPerMTok: 0.3, cachedInputPerMTok: 0.03, outputPerMTok: 2.5 },
+  // Image-generation model (the generate_image tool). Gemini bills image OUTPUT per image,
+  // not per text token, so this per-token shape is an imperfect fit — the output tokens
+  // reported for an image generation map to a fixed per-image charge upstream. Modeled here
+  // as a per-token approximation so a generate_image run isn't silently free; the real
+  // accounting (a per-image dimension on computeCostUsd) is deferred (see report).
+  // TODO: confirm rate — placeholder figures, not Google's confirmed list price.
+  'gemini-2.5-flash-image': { inputPerMTok: 0.3, cachedInputPerMTok: 0.03, outputPerMTok: 30.0 },
 }
 
 // Cost in USD for one call. `cachedTokens` is the subset of `promptTokens` served from

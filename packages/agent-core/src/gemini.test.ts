@@ -24,6 +24,32 @@ describe('toGeminiContents — functionResponse must be a Struct', () => {
     expect(Array.isArray(responses[0])).toBe(false)
     expect(responses[1]).toEqual({ ok: true })
   })
+
+  // A tool that returns an image (screenshot, generate_image, read_file on an image) yields a
+  // tool turn carrying BOTH a tool_result and an image part. Gemini rejects a Content that
+  // mixes functionResponse with inlineData, so they must split into two separate Contents:
+  // the functionResponse turn stays pure, the image follows as its own user turn.
+  it('splits a tool turn with an image into separate functionResponse and inlineData Contents', () => {
+    const messages: Message[] = [
+      {
+        role: 'tool',
+        content: [
+          { type: 'tool_result', id: 'a', name: 'screenshot', result: { summary: 'a page' } },
+          { type: 'image', mimeType: 'image/png', data: 'YWJj' },
+        ],
+      },
+    ]
+    const contents = toGeminiContents(messages)
+    expect(contents).toHaveLength(2)
+
+    const fnParts = contents[0]!.parts ?? []
+    expect(fnParts.every((p) => p.functionResponse && !p.inlineData)).toBe(true)
+
+    const imgParts = contents[1]!.parts ?? []
+    expect(imgParts).toHaveLength(1)
+    expect(imgParts[0]!.inlineData).toEqual({ mimeType: 'image/png', data: 'YWJj' })
+    expect(imgParts[0]!.functionResponse).toBeUndefined()
+  })
 })
 
 // Live integration test: hits the real Gemini API. Skipped when GEMINI_API_KEY is

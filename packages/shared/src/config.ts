@@ -42,6 +42,11 @@ const schema = z.object({
   // Chrome extension connects here. No auth token / extension-ID needed — the bridge binds
   // to loopback and gates on a chrome-extension:// Origin (ARCHITECTURE §8).
   BRIDGE_WS_PORT: z.coerce.number().int().positive().default(7865),
+  // Root directory for per-conversation working directories
+  // (<WORKSPACE_ROOT>/<conversation_id>/). Holds uploaded/generated images and files; kept
+  // off Postgres (ARCHITECTURE §6.5). Resolved via resolveInWorkspace, which confines every
+  // path under one conversation's dir.
+  WORKSPACE_ROOT: z.string().default('./data/conversations'),
 })
 
 export type Config = z.infer<typeof schema>

@@ -2,7 +2,9 @@ import {
   type ApprovalRequest,
   type ApprovalVerdict,
   computeCostUsd,
+  type ContentPart,
   GeminiProvider,
+  isImageResult,
   type LlmProvider,
   type Message,
   runAgent,
@@ -14,6 +16,7 @@ import { and, asc, eq } from 'drizzle-orm'
 import pg from 'pg'
 import { buildRunTools } from './catalog.js'
 import { notifyRun } from './events.js'
+import { type ImageRef, writeImageToWorkspace } from './images.js'
 import { rowsToMessages } from './messages.js'
 
 // MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
@@ -49,7 +52,7 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
 
     const history: Message[] = [
       { role: 'system', content: [{ type: 'text', text: SYSTEM_PROMPT }] },
-      ...rowsToMessages(rows),
+      ...(await rowsToMessages(run.conversationId, rows)),
     ]
 
     // Serialize NOTIFYs so tokens reach the client in order (onText is synchronous).
@@ -96,6 +99,12 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval
     // can update the row the loop is talking about.
     const toolCallRowIds = new Map<string, string>()
+
+    // When a tool returns an image, the loop puts the inline base64 on an `image` part of the
+    // tool turn (so the model sees it this turn) but Postgres must stay blob-free. onToolEnd
+    // writes the bytes to the workspace and records base64 -> reference here; the message
+    // persistence below swaps each inline `image` part for its on-disk reference.
+    const imageRefByData = new Map<string, ImageRef>()
 
     // Group-scoped approval (§16): once the owner approves a tool group (e.g. 'browser'),
     // further calls in that group skip the prompt for the rest of THIS run. Per-run and
@@ -148,11 +157,29 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       onToolEnd: async (call, outcome) => {
         const rowId = toolCallRowIds.get(call.id)
         if (!rowId) return
+        // Image results: write the bytes to the workspace and store only the REFERENCE in
+        // tool_calls.result — base64 never lands in Postgres (spec's two-representation
+        // design). The in-memory base64 already flowed to the model this turn via the loop.
+        let persistedResult: unknown = outcome.result ?? null
+        if (isImageResult(outcome.result)) {
+          // The model already saw the image this turn; a workspace-write failure must not
+          // crash an otherwise-healthy run, and base64 must never land in Postgres. On
+          // failure, persist a reference-less marker and leave the map unset (toRef below
+          // then drops the inline part rather than writing bytes to the DB).
+          try {
+            const ref = writeImageToWorkspace(run.conversationId, call.name, outcome.result.image)
+            imageRefByData.set(outcome.result.image.data, ref)
+            persistedResult = { ...ref, summary: outcome.result.summary }
+          } catch (err) {
+            console.error(`[run ${runId}] failed to persist image from ${call.name}:`, err)
+            persistedResult = { error: 'image persistence failed', summary: outcome.result.summary }
+          }
+        }
         await db
           .update(toolCalls)
           .set({
             status: outcome.status,
-            result: outcome.result ?? null,
+            result: persistedResult,
             error: outcome.error ?? null,
             finishedAt: new Date(),
           })
@@ -177,13 +204,25 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     })
     await notifyChain
 
-    // Persist everything the loop appended beyond the input (the assistant turn(s)).
+    // Persist everything the loop appended beyond the input (the assistant turn(s)). Inline
+    // `image` parts (carrying base64) are swapped for their on-disk reference so Postgres
+    // stays blob-free; the bytes were written to the workspace in onToolEnd. The persisted
+    // shape (the reference) deliberately diverges from the in-memory ContentPart.
+    const toRef = (part: ContentPart): ContentPart | ImageRef => {
+      if (part.type !== 'image') return part
+      const ref = imageRefByData.get(part.data)
+      if (ref) return ref
+      // No reference means the workspace write failed (logged in onToolEnd) — never persist
+      // the raw base64 into Postgres. Drop it to a placeholder; the model saw it in-run.
+      console.error(`[run ${runId}] image part has no workspace reference; storing placeholder`)
+      return { type: 'text', text: '[image not persisted]' }
+    }
     for (const m of finalMessages.slice(history.length)) {
       if (m.role === 'assistant' || m.role === 'tool') {
         await db.insert(messages).values({
           conversationId: run.conversationId,
           role: m.role,
-          content: m.content,
+          content: m.content.map(toRef),
         })
       }
     }

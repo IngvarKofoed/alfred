@@ -5,3 +5,4 @@ export { runAgent, type RunOptions, type ApprovalRequest, type ApprovalVerdict }
 export { GeminiProvider } from './providers/gemini.js'
 export { TracingProvider, type LlmTrace } from './tracing.js'
 export { MODEL_PRICING, computeCostUsd, type ModelPrice } from './pricing.js'
+export { type ImageToolResult, isImageResult } from './image-result.js'

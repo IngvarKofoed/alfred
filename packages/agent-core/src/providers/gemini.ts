@@ -86,10 +86,19 @@ export function toGeminiContents(messages: Message[]): Content[] {
     if (m.role === 'system') continue
 
     if (m.role === 'tool') {
-      const parts: Part[] = m.content
-        .filter((p) => p.type === 'tool_result')
-        .map((p) => ({ functionResponse: { name: p.name, response: asRecord(p.result) } }))
-      contents.push({ role: 'user', parts })
+      // functionResponse parts must travel in their own Content — Gemini rejects a Content
+      // that mixes functionResponse with inlineData. Any image a tool returned (e.g. a
+      // screenshot) follows as a SEPARATE user turn so the model still sees it.
+      const fnParts: Part[] = []
+      const imageParts: Part[] = []
+      for (const p of m.content) {
+        if (p.type === 'tool_result')
+          fnParts.push({ functionResponse: { name: p.name, response: asRecord(p.result) } })
+        else if (p.type === 'image')
+          imageParts.push({ inlineData: { mimeType: p.mimeType, data: p.data } })
+      }
+      if (fnParts.length) contents.push({ role: 'user', parts: fnParts })
+      if (imageParts.length) contents.push({ role: 'user', parts: imageParts })
       continue
     }
 
@@ -97,6 +106,7 @@ export function toGeminiContents(messages: Message[]): Content[] {
     for (const p of m.content) {
       if (p.type === 'text') parts.push({ text: p.text })
       else if (p.type === 'tool_use') parts.push({ functionCall: { name: p.name, args: asRecord(p.args) } })
+      else if (p.type === 'image') parts.push({ inlineData: { mimeType: p.mimeType, data: p.data } })
     }
     contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts })
   }

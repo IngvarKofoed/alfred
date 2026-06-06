@@ -1,3 +1,4 @@
+import { isImageResult } from './image-result.js'
 import type { LlmProvider } from './provider.js'
 import type { Tool } from './tool.js'
 import type { ContentPart, Message } from './types.js'
@@ -97,7 +98,21 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
 
       try {
         const result = tool ? await tool.invoke(tc.args) : { error: `unknown tool: ${tc.name}` }
-        resultParts.push({ type: 'tool_result', id: tc.id, name: tc.name, result })
+        if (isImageResult(result)) {
+          // Gemini's functionResponse can't carry an image, so the tool_result holds a text
+          // ack; the actual bytes ride on a sibling `image` part of the same tool turn, so
+          // the model sees the image (the spec's image-feedback path). The worker reads the
+          // original ImageToolResult from onToolEnd to persist the reference, not base64.
+          resultParts.push({
+            type: 'tool_result',
+            id: tc.id,
+            name: tc.name,
+            result: { summary: result.summary ?? 'image' },
+          })
+          resultParts.push({ type: 'image', mimeType: result.image.mimeType, data: result.image.data })
+        } else {
+          resultParts.push({ type: 'tool_result', id: tc.id, name: tc.name, result })
+        }
         await opts.onToolEnd?.({ id: tc.id, name: tc.name }, { status: 'done', result })
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err)

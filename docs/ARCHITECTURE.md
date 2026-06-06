@@ -241,8 +241,8 @@ Open: extraction strategy (LLM-summarized after each run? user-flagged "remember
 | Chrome browser profile | Wherever the OS puts it; backed up separately | Owned by Chrome, not us |
 | LLM request/response + token/latency traces | `llm_calls` table in our Postgres, rolled up onto `agent_runs` | Lightweight in-house observability, surfaced on the `/debug` page. Replaces Langfuse — see §17. |
 
-**Attachment storage — per-conversation workspaces (spec'd, not yet built).** The
-original flat `data/attachments/` keyed-by-path is being superseded by a
+**Attachment storage — per-conversation workspaces (built).** The
+original flat `data/attachments/` keyed-by-path is superseded by a
 **per-conversation working directory**: `data/conversations/<conversation_id>/`,
 the foundation for file-bearing capabilities (images now; code execution /
 scripting later). Files are referenced by a path *relative to that directory*, so
@@ -441,7 +441,7 @@ alfred-worker
 - `BrowserBridge` (`services/worker/src/browser/`) runs a `ws` WebSocket server bound to `127.0.0.1:<BRIDGE_WS_PORT>` (default 7865). One extension connection at a time; a new connection replaces a stale one.
 - Started once at worker boot, stopped on SIGINT/SIGTERM. It outlives individual runs; the extension reconnects on its own across worker restarts (fail-and-restart, §7.6).
 - Exposes 22 built-in browser tools (`navigate`, `click`, `type_text`, `get_page_text`, `list_tabs`, `evaluate_javascript`, …). Each `invoke()` sends one id-keyed command over the WebSocket and awaits the reply (30s timeout). Large string results are capped at 100k chars to protect context/cost. **Multi-tab model** (kept from chrome-mcp: `list_tabs`/`switch_tab`/`open_tab`/`close_tab`), not a single active-tab.
-- Screenshots are *not* shipped here — they need an image-content path through agent-core (§6.5 attachment storage); deferred to a follow-up "vision" increment.
+- Screenshots are now shipped (the "vision" increment): `screenshot` / `screenshot_element` are exposed as image-returning browser tools, flowing through agent-core's `image` content part and the per-conversation workspace (§6.5). They bypass the 100k-char cap (the cap is for text/structured results, not image bytes).
 
 **Containment (no auth token, no MCP).** Two cheap guards replace the originally-planned shared `BRIDGE_AUTH_TOKEN`:
 
@@ -915,8 +915,8 @@ Each step is independently verifiable. The seams (Postgres queue, SSE, MCP) don'
 3. ✅ **Agent core.** Provider abstraction in `packages/agent-core` with a **Gemini** implementation (`@google/genai`). Hand-rolled loop; `Tool` interface + a built-in `echo` tool (built, but not yet wired through the worker — see "current" below).
 4. ✅ **Real model + observability, end to end.** The loop talks to real Gemini, wired into `alfred-worker` (pg-boss) streaming tokens via `NOTIFY` → SSE to the web chat. Observability is **lightweight in-Postgres** — every call traced to `llm_calls`, surfaced on a `/debug` page (not Langfuse; see §17).
    - ✅ **Tools + approval.** Tools wired through the worker with the trust-tier approval flow (§16 / §10.9) — the step that turns Alfred from chat into action.
-5. ✅ **Browser bridge + Chrome extension.** End-to-end browser automation. Built as **Option C** (§8): the bridge is embedded in `alfred-worker` and the browser commands are built-in tools — **no separate process and no MCP** (a divergence from the original "first MCP-sourced tool" framing). Ported from the owner's `chrome-mcp`; extension lives at `chrome-extension/`. Screenshots/vision deferred to a follow-up.
-   - → **Current — vision.** Add an image content part to agent-core + the Gemini `inlineData` path + attachment storage (§6.5), then ship the screenshot tools.
+5. ✅ **Browser bridge + Chrome extension.** End-to-end browser automation. Built as **Option C** (§8): the bridge is embedded in `alfred-worker` and the browser commands are built-in tools — **no separate process and no MCP** (a divergence from the original "first MCP-sourced tool" framing). Ported from the owner's `chrome-mcp`; extension lives at `chrome-extension/`.
+   - ✅ **Vision + image support.** Per-conversation workspaces (`data/conversations/<id>/`, §6.5); an `image` content part through agent-core + the Gemini `inlineData` path; image input via browser screenshots and a web upload endpoint; image generation (`generate_image` → `gemini-2.5-flash-image`); and a minimal workspace-confined file trio (`list_files`/`read_file`/`write_file`). Spec: `docs/specs/2026-06-05-conversation-workspace-and-images.md`.
 6. **Discord bot** as a second ingress. Same conversation shape as the web ingress, separate thread, shared agent memory.
 
 **End of MVP.** Below the line is post-MVP, in rough priority order:

@@ -3,22 +3,28 @@ import { getDb, tools as toolsTable } from '@alfred/db'
 import { sql } from 'drizzle-orm'
 import { getBridge } from './browser/bridge.js'
 import { makeBrowserTools } from './browser/tools.js'
-import { makeSetTitleTool } from './tools.js'
+import { makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
 // state), so build them once at module load rather than per run.
 const BROWSER_TOOLS = makeBrowserTools(getBridge())
 
-// The full toolset for a run. Only set_conversation_title depends on the conversation, so
-// it's the only piece rebuilt per call; echo and the browser tools are shared.
+// The full toolset for a run. The conversation-bound tools (title, file tools) are rebuilt
+// per call; echo, generate_image, and the browser tools carry no per-conversation state.
 export function buildRunTools(conversationId: string): Tool[] {
-  return [echoTool, makeSetTitleTool(conversationId), ...BROWSER_TOOLS]
+  return [
+    echoTool,
+    makeSetTitleTool(conversationId),
+    makeGenerateImageTool(),
+    ...makeFileTools(conversationId),
+    ...BROWSER_TOOLS,
+  ]
 }
 
 // Metadata for every tool the worker can run, derived from the real Tool instances so the
-// published catalog can't drift from what actually runs. set_conversation_title's metadata
-// (name/group/tier/description) is independent of the conversation id it closes over, so a
-// placeholder is fine here.
+// published catalog can't drift from what actually runs. The conversation-bound tools'
+// metadata (name/group/tier/description) is independent of the conversation id they close
+// over, so a placeholder is fine here.
 export function toolCatalog(): Tool[] {
   return buildRunTools('')
 }
