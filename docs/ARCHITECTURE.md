@@ -237,9 +237,22 @@ Open: extraction strategy (LLM-summarized after each run? user-flagged "remember
 | Thing | Where | Why |
 |-------|-------|-----|
 | API keys / secrets (Gemini, Discord, ElevenLabs, …) | `.env` file, OS keychain | DB compromise should not leak credentials |
-| Large attachments (images, PDFs, audio) | Local filesystem under `data/attachments/`, referenced by path | Postgres is bad at large blobs; FS is fine and backs up trivially |
+| Large attachments (images, PDFs, audio) | Local filesystem, referenced by a workspace-relative path | Postgres is bad at large blobs; FS is fine and backs up trivially |
 | Chrome browser profile | Wherever the OS puts it; backed up separately | Owned by Chrome, not us |
 | LLM request/response + token/latency traces | `llm_calls` table in our Postgres, rolled up onto `agent_runs` | Lightweight in-house observability, surfaced on the `/debug` page. Replaces Langfuse — see §17. |
+
+**Attachment storage — per-conversation workspaces (spec'd, not yet built).** The
+original flat `data/attachments/` keyed-by-path is being superseded by a
+**per-conversation working directory**: `data/conversations/<conversation_id>/`,
+the foundation for file-bearing capabilities (images now; code execution /
+scripting later). Files are referenced by a path *relative to that directory*, so
+a conversation's files are a movable, deletable unit. All file access goes through
+a single `resolveInWorkspace(conversationId, relPath)` confinement helper (rejects
+absolute paths / `..` / symlink-outs), centralized so a future shared scope is a
+change to *which root resolves* rather than a rewrite. `messages.content` stores
+the reference (`{ type:'image', path, mimeType }`); the worker bridges that to the
+inline-base64 form the model needs — Postgres and NOTIFY never carry image bytes.
+See `docs/specs/2026-06-05-conversation-workspace-and-images.md`.
 
 ---
 
