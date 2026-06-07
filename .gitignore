@@ -4,3 +4,5 @@ dist/
 *.log
 .DS_Store
 .pnpm-store/
+# Per-conversation workspaces (uploaded/generated images, files) — user content, never committed.
+data/

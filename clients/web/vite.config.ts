@@ -9,6 +9,8 @@ export default defineConfig({
     // without any front proxy. Prod: Hono serves this client's built dist directly.
     proxy: {
       '/api': 'http://127.0.0.1:3000',
+      // Workspace images (<img src="/media/...">) are served by the Hono server too.
+      '/media': 'http://127.0.0.1:3000',
     },
   },
   build: {

@@ -3,24 +3,26 @@ import path from 'node:path'
 import dotenv from 'dotenv'
 import { z } from 'zod'
 
-// Load the repo-root .env regardless of the process's cwd. `dotenv.config()` only looks
-// in cwd, which breaks `pnpm --filter <pkg> dev` (cwd = the package dir). Walk up to the
-// workspace root (where pnpm-workspace.yaml lives) and load its .env. dotenv never
-// overrides already-set env vars, so exported vars still win.
-function loadDotenv(): void {
+// The monorepo root (where pnpm-workspace.yaml lives), or null if not inside the workspace.
+// Used to anchor cwd-independent paths: each process has a different cwd under
+// `pnpm --filter <pkg> dev`, so anything that must be shared across processes (the .env, the
+// conversation workspace root) is resolved against this, not process.cwd().
+function findRepoRoot(): string | null {
   let dir = process.cwd()
   for (;;) {
-    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) {
-      dotenv.config({ path: path.join(dir, '.env') }) // missing file is a harmless no-op
-      return
-    }
+    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) return dir
     const parent = path.dirname(dir)
-    if (parent === dir) {
-      dotenv.config() // not inside the workspace — fall back to cwd
-      return
-    }
+    if (parent === dir) return null
     dir = parent
   }
+}
+
+// Load the repo-root .env regardless of the process's cwd. `dotenv.config()` only looks in
+// cwd, which breaks `pnpm --filter <pkg> dev`. dotenv never overrides already-set env vars,
+// so exported vars still win.
+function loadDotenv(): void {
+  const root = findRepoRoot()
+  dotenv.config(root ? { path: path.join(root, '.env') } : undefined) // missing file is a no-op
 }
 
 loadDotenv()
@@ -60,6 +62,14 @@ export function loadConfig(): Config {
     console.error('Invalid configuration:\n' + parsed.error.toString())
     process.exit(1)
   }
-  cached = parsed.data
+  // Anchor a relative WORKSPACE_ROOT at the repo root, not process.cwd() — otherwise the
+  // worker (cwd services/worker) and webserver (cwd services/webserver) resolve it to
+  // different physical dirs, and an image one writes the other can't serve. An absolute
+  // override is honored as-is.
+  const data = parsed.data
+  if (!path.isAbsolute(data.WORKSPACE_ROOT)) {
+    data.WORKSPACE_ROOT = path.resolve(findRepoRoot() ?? process.cwd(), data.WORKSPACE_ROOT)
+  }
+  cached = data
   return cached
 }
