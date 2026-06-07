@@ -70,6 +70,9 @@ export default function Chat({ conversationId }: { conversationId: string }) {
     interactionId: string
     prompt: ApprovalPrompt
   } | null>(null)
+  // "Don't ask again" — when approving, also persist require_approval=false (same store the
+  // Tools page writes) so this decision survives future runs and restarts. Reset per card.
+  const [remember, setRemember] = useState(false)
   // Tools currently running this turn — drives the subtle live tool chip, keyed by
   // call id. Cleared when history reloads (it then carries the calls durably) or on error.
   const [activeTools, setActiveTools] = useState<ToolUse[]>([])
@@ -131,7 +134,10 @@ export default function Chat({ conversationId }: { conversationId: string }) {
         const interactionId = ev.interactionId
         fetch(`/api/interactions/${interactionId}`)
           .then((r) => r.json() as Promise<{ interaction: { prompt: ApprovalPrompt } }>)
-          .then((d) => setApproval({ interactionId, prompt: d.interaction.prompt }))
+          .then((d) => {
+            setApproval({ interactionId, prompt: d.interaction.prompt })
+            setRemember(false)
+          })
           .catch(() => {})
       } else if (ev.type === 'interaction_resolved') {
         setApproval(null)
@@ -214,12 +220,21 @@ export default function Chat({ conversationId }: { conversationId: string }) {
 
   const resolveApproval = async (approved: boolean) => {
     if (!approval) return
-    const { interactionId } = approval
+    const { interactionId, prompt } = approval
+    // Mirror the Tools page's guard before persisting "never ask" on a destructive tool.
+    if (approved && remember && prompt?.trust_tier === 'destructive') {
+      const ok = window.confirm(
+        `Stop asking for approval on "${prompt.tool}"? It can take destructive actions, and Alfred will run it without checking from now on.`,
+      )
+      if (!ok) return
+    }
+    const rememberChoice = approved && remember
     setApproval(null)
+    setRemember(false)
     await fetch(`/api/interactions/${interactionId}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ approved }),
+      body: JSON.stringify({ approved, remember: rememberChoice }),
     }).catch(() => {})
   }
 
@@ -330,6 +345,17 @@ export default function Chat({ conversationId }: { conversationId: string }) {
             <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-paper p-3 font-mono text-xs text-ink-dim">
               {JSON.stringify(approval.prompt?.args ?? {}, null, 2)}
             </pre>
+            <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm text-ink-dim">
+              <input
+                type="checkbox"
+                checked={remember}
+                onChange={(e) => setRemember(e.target.checked)}
+                className="h-4 w-4 accent-brass"
+              />
+              {approval.prompt?.scope === 'group'
+                ? "Don't ask again for these actions (remembered until you change it on the Tools page)"
+                : `Don't ask again for ${approval.prompt?.tool ?? 'this tool'} (remembered until you change it on the Tools page)`}
+            </label>
             <div className="mt-4 flex gap-2">
               <button
                 type="button"

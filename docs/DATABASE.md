@@ -157,6 +157,11 @@ prompt:   { summary: string; tool: string; args: object;
             // tool's group (e.g. 'browser') for the rest of the run, not just this call
             // (ARCHITECTURE §16). Absent / 'call' ⇒ a single-call approval.
 response: { approved: boolean; note?: string }
+            // The resolving ingress (web) may also accept a `remember` flag on the POST body
+            // (not stored on `response`): when approving, it persists the decision into
+            // tools.require_approval=false — the same store the Tools page writes — so the
+            // grant survives future runs/restarts. scope='group' remembers the whole group
+            // (§16). Not part of the persisted response shape; it's a side effect at resolve.
 
 // Question (mirrors AskUserQuestion-style structured prompts)
 prompt:   {

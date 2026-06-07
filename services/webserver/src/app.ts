@@ -13,7 +13,7 @@ import {
   users,
 } from '@alfred/db'
 import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
-import { and, asc, desc, eq, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, type SQL } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
@@ -229,8 +229,12 @@ app.post('/api/interactions/:id', async (c) => {
   const id = c.req.param('id')
   if (!UUID_RE.test(id)) return c.json({ error: 'invalid interaction id' }, 400)
 
-  const body = (await c.req.json().catch(() => ({}))) as { approved?: boolean; note?: string }
-  const { approved, note } = body
+  const body = (await c.req.json().catch(() => ({}))) as {
+    approved?: boolean
+    note?: string
+    remember?: boolean
+  }
+  const { approved, note, remember } = body
   if (typeof approved !== 'boolean') return c.json({ error: 'approved is required' }, 400)
 
   const db = getDb()
@@ -254,8 +258,40 @@ app.post('/api/interactions/:id', async (c) => {
     `conversation:${run!.conversationId}`,
     JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
   )
+
+  // "Don't ask again": persist the decision into the same tools.require_approval store the
+  // Tools page writes (§16), so it survives across runs and restarts. Deliberately AFTER the
+  // resolve + NOTIFY above and best-effort (try/catch) — this is a convenience, and a failure
+  // here must never block waking the parked worker. Only on approve (no "always reject" tier,
+  // mirroring the Tools page). A group-scoped card covers the whole tool group; a call-scoped
+  // one just the one tool.
+  if (approved && remember) {
+    const prompt = row.prompt as { tool?: string; scope?: 'group' | 'call' } | null
+    const toolName = prompt?.tool
+    if (toolName) {
+      try {
+        const [tool] = await db
+          .select({ group: toolsTable.toolGroup })
+          .from(toolsTable)
+          .where(eq(toolsTable.name, toolName))
+        const where =
+          prompt?.scope === 'group' && tool?.group
+            ? eq(toolsTable.toolGroup, tool.group)
+            : eq(toolsTable.name, toolName)
+        await setToolsApproval(db, where, false)
+      } catch (err) {
+        console.error(`[interactions] failed to persist "don't ask again" for ${toolName}:`, err)
+      }
+    }
+  }
   return c.json({ ok: true })
 })
+
+// Single writer for the owner's per-tool approval setting (tools.require_approval), shared by
+// the Tools page (PATCH) and the chat "don't ask again" resolve path so the two can't drift.
+function setToolsApproval(db: ReturnType<typeof getDb>, where: SQL, requireApproval: boolean | null) {
+  return db.update(toolsTable).set({ requireApproval, updatedAt: new Date() }).where(where)
+}
 
 // --- Tools (catalog + per-tool approval settings) ---
 
@@ -292,11 +328,11 @@ app.patch('/api/tools', async (c) => {
     return c.json({ error: 'requireApproval must be true, false, or null' }, 400)
   }
 
-  const updated = await getDb()
-    .update(toolsTable)
-    .set({ requireApproval, updatedAt: new Date() })
-    .where(inArray(toolsTable.name, names))
-    .returning({ name: toolsTable.name })
+  const updated = await setToolsApproval(
+    getDb(),
+    inArray(toolsTable.name, names),
+    requireApproval,
+  ).returning({ name: toolsTable.name })
   return c.json({ updated: updated.map((r) => r.name) })
 })
 

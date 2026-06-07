@@ -1,8 +1,8 @@
 import { loadConfig } from '@alfred/shared'
-import { eq } from 'drizzle-orm'
+import { and, eq, inArray } from 'drizzle-orm'
 import PgBoss from 'pg-boss'
 import { getDb } from './client.js'
-import { agentRuns } from './schema.js'
+import { agentRuns, toolCalls, userInteractions } from './schema.js'
 
 // pg-boss lives here because it's Postgres infra sharing POSTGRES_URL. Consumers use
 // the typed helpers below and never touch PgBoss directly — the dependency stays internal.
@@ -47,12 +47,34 @@ export async function workAgentRuns(handler: (runId: string) => Promise<void>): 
   })
 }
 
-// Startup sweep: any run still 'running' has no live worker (we don't resume), so fail it.
+// Startup sweep: any non-terminal run (pending/running/awaiting_approval) has no live worker
+// — we don't resume (ARCHITECTURE §7.6/§10.5) — so fail it and cascade per §10.9 invariant 4:
+// every non-terminal tool_call → failed, every still-pending interaction → cancelled. Without
+// the awaiting_approval case, a restart while an approval is open would leave a zombie run that
+// the one-active-run-per-conversation index never lets the conversation move past.
 export async function sweepOrphanedRuns(): Promise<number> {
-  const rows = await getDb()
-    .update(agentRuns)
-    .set({ status: 'failed', error: 'orphaned (worker restart)', finishedAt: new Date() })
-    .where(eq(agentRuns.status, 'running'))
-    .returning({ id: agentRuns.id })
-  return rows.length
+  const now = new Date()
+  return getDb().transaction(async (tx) => {
+    const rows = await tx
+      .update(agentRuns)
+      .set({ status: 'failed', error: 'orphaned (worker restart)', finishedAt: now })
+      .where(inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']))
+      .returning({ id: agentRuns.id })
+    if (rows.length === 0) return 0
+    const runIds = rows.map((r) => r.id)
+    await tx
+      .update(toolCalls)
+      .set({ status: 'failed', error: 'orphaned (worker restart)', finishedAt: now })
+      .where(
+        and(
+          inArray(toolCalls.agentRunId, runIds),
+          inArray(toolCalls.status, ['pending', 'awaiting_user', 'running']),
+        ),
+      )
+    await tx
+      .update(userInteractions)
+      .set({ status: 'cancelled', resolvedAt: now })
+      .where(and(inArray(userInteractions.agentRunId, runIds), eq(userInteractions.status, 'pending')))
+    return rows.length
+  })
 }
