@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { runAgent } from './loop.js'
-import { GeminiProvider, toGeminiContents } from './providers/gemini.js'
+import { GeminiProvider, toGeminiContents, translateGeminiError } from './providers/gemini.js'
 import { echoTool } from './tool.js'
 import type { Message } from './types.js'
 
@@ -49,6 +49,28 @@ describe('toGeminiContents — functionResponse must be a Struct', () => {
     expect(imgParts).toHaveLength(1)
     expect(imgParts[0]!.inlineData).toEqual({ mimeType: 'image/png', data: 'YWJj' })
     expect(imgParts[0]!.functionResponse).toBeUndefined()
+  })
+})
+
+// A network failure (no internet) surfaces from Node's fetch as a bare `TypeError: fetch
+// failed`, which is useless when it reaches the owner via agent_runs.error. translateGeminiError
+// turns the recognized offline cases into an actionable message; real API errors pass through.
+describe('translateGeminiError', () => {
+  it('rewrites a bare "fetch failed" into a connectivity message', () => {
+    const out = translateGeminiError(new TypeError('fetch failed'))
+    expect((out as Error).message).toMatch(/Couldn't reach the Gemini API/)
+  })
+
+  it('includes the underlying code when the cause carries one', () => {
+    const err = new TypeError('fetch failed')
+    ;(err as { cause?: unknown }).cause = { code: 'ENOTFOUND' }
+    const out = translateGeminiError(err)
+    expect((out as Error).message).toContain('ENOTFOUND')
+  })
+
+  it('passes a genuine API error through untouched', () => {
+    const apiErr = new Error('got status: 429 Too Many Requests')
+    expect(translateGeminiError(apiErr)).toBe(apiErr)
   })
 })
 

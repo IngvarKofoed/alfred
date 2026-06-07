@@ -30,44 +30,85 @@ export class GeminiProvider implements LlmProvider {
     const systemInstruction = systemText(messages)
     const functionDeclarations = tools.map(toFunctionDeclaration)
 
-    const response = await this.ai.models.generateContentStream({
-      model,
-      contents: toGeminiContents(messages),
-      config: {
-        ...(systemInstruction ? { systemInstruction } : {}),
-        ...(functionDeclarations.length ? { tools: [{ functionDeclarations }] } : {}),
-      },
-    })
+    try {
+      const response = await this.ai.models.generateContentStream({
+        model,
+        contents: toGeminiContents(messages),
+        config: {
+          ...(systemInstruction ? { systemInstruction } : {}),
+          ...(functionDeclarations.length ? { tools: [{ functionDeclarations }] } : {}),
+        },
+      })
 
-    // Gemini function calls carry no stable id; synthesize one per call for our model.
-    let callIndex = 0
-    let promptTokens: number | undefined
-    let cachedTokens: number | undefined
-    let completionTokens: number | undefined
-    let finishReason: string | undefined
-    for await (const chunk of response) {
-      const text = chunk.text
-      if (text) yield { type: 'text', text }
-      for (const call of chunk.functionCalls ?? []) {
-        yield {
-          type: 'tool_call',
-          id: call.id ?? `${call.name}-${callIndex++}`,
-          name: call.name ?? '',
-          args: call.args ?? {},
+      // Gemini function calls carry no stable id; synthesize one per call for our model.
+      let callIndex = 0
+      let promptTokens: number | undefined
+      let cachedTokens: number | undefined
+      let completionTokens: number | undefined
+      let finishReason: string | undefined
+      for await (const chunk of response) {
+        const text = chunk.text
+        if (text) yield { type: 'text', text }
+        for (const call of chunk.functionCalls ?? []) {
+          yield {
+            type: 'tool_call',
+            id: call.id ?? `${call.name}-${callIndex++}`,
+            name: call.name ?? '',
+            args: call.args ?? {},
+          }
         }
+        if (chunk.usageMetadata) {
+          promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens
+          // promptTokenCount is the TOTAL input incl. cached; this is the cached subset.
+          cachedTokens = chunk.usageMetadata.cachedContentTokenCount ?? cachedTokens
+          completionTokens = chunk.usageMetadata.candidatesTokenCount ?? completionTokens
+        }
+        const fr = chunk.candidates?.[0]?.finishReason
+        if (fr) finishReason = String(fr)
       }
-      if (chunk.usageMetadata) {
-        promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens
-        // promptTokenCount is the TOTAL input incl. cached; this is the cached subset.
-        cachedTokens = chunk.usageMetadata.cachedContentTokenCount ?? cachedTokens
-        completionTokens = chunk.usageMetadata.candidatesTokenCount ?? completionTokens
-      }
-      const fr = chunk.candidates?.[0]?.finishReason
-      if (fr) finishReason = String(fr)
-    }
 
-    yield { type: 'usage', model, promptTokens, cachedTokens, completionTokens, finishReason }
+      yield { type: 'usage', model, promptTokens, cachedTokens, completionTokens, finishReason }
+    } catch (err) {
+      throw translateGeminiError(err)
+    }
   }
+}
+
+// Node's fetch throws `TypeError: fetch failed` with the real cause nested in `err.cause`
+// (a DNS/connection error carrying a `.code`). The bare "fetch failed" that otherwise
+// reaches the owner via agent_runs.error / the NOTIFY error event is useless — translate
+// the common offline/unreachable cases into something actionable. Anything we don't
+// recognize is rethrown untouched so genuine API errors (4xx/5xx) keep their own message.
+export function translateGeminiError(err: unknown): unknown {
+  if (!(err instanceof Error)) return err
+  const cause = (err as { cause?: unknown }).cause
+  const code =
+    cause && typeof cause === 'object' && 'code' in cause ? String((cause as { code: unknown }).code) : undefined
+
+  // The network-layer failure modes of Node's undici fetch.
+  const offlineCodes = new Set([
+    'ENOTFOUND', // DNS lookup failed — no internet, or DNS down
+    'EAI_AGAIN', // DNS temporary failure — usually no internet
+    'ECONNREFUSED', // connection refused
+    'ECONNRESET', // connection dropped mid-flight
+    'ETIMEDOUT', // connection timed out
+    'EHOSTUNREACH', // no route to host
+    'ENETUNREACH', // network unreachable
+    'UND_ERR_CONNECT_TIMEOUT', // undici connect timeout
+  ])
+
+  // When the cause carries a code, trust it (rewrite only recognized offline codes) — so a
+  // `fetch failed` with an unrecognized code (e.g. a TLS CERT_HAS_EXPIRED) is NOT mislabeled
+  // as a connectivity problem. Fall back to the bare-message match only when there's no code.
+  const isOffline = code ? offlineCodes.has(code) : err.message === 'fetch failed'
+  if (isOffline) {
+    const detail = code ? ` (${code})` : ''
+    return new Error(
+      `Couldn't reach the Gemini API — check your internet connection and try again${detail}.`,
+      { cause: err },
+    )
+  }
+  return err
 }
 
 function systemText(messages: Message[]): string | undefined {
