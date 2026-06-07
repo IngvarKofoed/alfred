@@ -12,6 +12,10 @@ Before doing any work in this repo, **always read all** of these:
 
 When your work touches the database or schema, also read **@docs/DATABASE.md** — the authoritative column-level data model (split out of ARCHITECTURE so this set stays readable at session start).
 
+When your work touches the worker, the agent loop, the interaction/approval flow, or run state, also read **@docs/RUNTIME.md** — the run-lifecycle reference (runtime flows §10, state machines & invariants §10.9, concurrency/crash model §7.6, autonomous-run seams §7.7, and the security/blast-radius model §16), likewise split out of ARCHITECTURE for session-start readability.
+
+When your work touches a post-MVP ingress (Discord, voice, or autonomous triggers), also read **@docs/INGRESSES.md** — the detail for ARCHITECTURE §9.2–9.4, split out for the same reason (§9.1, the built web ingress, stays in ARCHITECTURE).
+
 `CONCEPT.md` and `ARCHITECTURE.md` are the source of truth for *what* we're building, what we've built, and *how* it's structured. If something in the code contradicts them, either the code or the doc is wrong — flag it rather than guessing.
 
 ## Changelog discipline
