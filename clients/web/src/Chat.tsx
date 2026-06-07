@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 type ContentPart = {
   type: string
@@ -33,6 +33,15 @@ type RunEvent =
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
   | { type: 'interaction_resolved'; interactionId: string }
 
+// One ordered segment per thing the in-flight run has produced, in the order things actually
+// happened: a 'text' segment grows as tokens stream; a 'tool' segment is a chip that accumulates
+// (never removed) and stops pulsing when its tool_call_end arrives. This preserves real
+// interleaving (text → tool → more text) in a single live Alfred block, and is replaced wholesale
+// by durable history on the done/cancelled handoff (loadHistory clears it in the same render).
+type LiveSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; id: string; name: string; args?: unknown; done: boolean }
+
 function textOf(content: ContentPart[]): string {
   return content.map((p) => (p.type === 'text' ? (p.text ?? '') : '')).join('')
 }
@@ -63,7 +72,6 @@ function argSummary(args: unknown): string {
 
 export default function Chat({ conversationId }: { conversationId: string }) {
   const [history, setHistory] = useState<ChatMessage[]>([])
-  const [streaming, setStreaming] = useState('')
   const [busy, setBusy] = useState(false)
   const [input, setInput] = useState('')
   const [approval, setApproval] = useState<{
@@ -73,9 +81,10 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   // "Don't ask again" — when approving, also persist require_approval=false (same store the
   // Tools page writes) so this decision survives future runs and restarts. Reset per card.
   const [remember, setRemember] = useState(false)
-  // Tools currently running this turn — drives the subtle live tool chip, keyed by
-  // call id. Cleared when history reloads (it then carries the calls durably) or on error.
-  const [activeTools, setActiveTools] = useState<ToolUse[]>([])
+  // The in-flight run's live output as one ordered block (streamed text + accumulating tool
+  // chips, in real order). Cleared when history reloads (it then carries the turn durably) or
+  // on error. See LiveSegment.
+  const [liveSegments, setLiveSegments] = useState<LiveSegment[]>([])
   // Images uploaded for the message being composed; cleared once sent.
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [uploading, setUploading] = useState(false)
@@ -98,13 +107,15 @@ export default function Chat({ conversationId }: { conversationId: string }) {
     fetch(`/api/conversations/${conversationId}/messages`)
       .then((r) => r.json() as Promise<{ messages: ChatMessage[] }>)
       .then((d) => {
-        // Set history and drop the transient live chips in one render: the reloaded
-        // turns carry the tool chips durably, so there's no gap (cleared too early)
-        // and no overlap (cleared too late, live + history chips both showing).
+        // Set history and drop the transient live segments in one render: the reloaded
+        // turns carry the streamed text + tool chips durably, so there's no gap (cleared too
+        // early) and no overlap (cleared too late, live + history both showing).
         setHistory(d.messages ?? [])
-        setActiveTools([])
+        setLiveSegments([])
       })
-      .catch(() => {})
+      // A failed reload after a run must still drop the live block (which is now kept
+      // mounted until liveSegments clears), else it lingers visibly with no durable turn.
+      .catch(() => setLiveSegments([]))
 
   useEffect(() => {
     void loadHistory()
@@ -112,19 +123,31 @@ export default function Chat({ conversationId }: { conversationId: string }) {
     es.onmessage = (e) => {
       const ev = JSON.parse(e.data) as RunEvent
       if (ev.type === 'token') {
-        setStreaming((s) => s + ev.text)
+        // Extend the trailing text segment, or open a new one if the last segment is a tool —
+        // so text arriving after a tool starts a fresh segment below that chip (real order).
+        setLiveSegments((segs) => {
+          const last = segs[segs.length - 1]
+          if (last && last.kind === 'text') {
+            return [...segs.slice(0, -1), { ...last, text: last.text + ev.text }]
+          }
+          return [...segs, { kind: 'text', text: ev.text }]
+        })
       } else if (ev.type === 'tool_call_start') {
-        setActiveTools((t) => [...t, { id: ev.id, name: ev.toolName, args: ev.args }])
+        setLiveSegments((segs) => [
+          ...segs,
+          { kind: 'tool', id: ev.id, name: ev.toolName, args: ev.args, done: false },
+        ])
       } else if (ev.type === 'tool_call_end') {
-        setActiveTools((t) => t.filter((c) => c.id !== ev.id))
+        // Mark the matching chip done (it stays — just stops pulsing). Unknown id → no-op.
+        setLiveSegments((segs) =>
+          segs.map((s) => (s.kind === 'tool' && s.id === ev.id ? { ...s, done: true } : s)),
+        )
       } else if (ev.type === 'done' || ev.type === 'cancelled') {
-        // loadHistory clears the live chips once the durable ones arrive.
-        setStreaming('')
+        // loadHistory clears the live segments once the durable turns arrive (one render).
         setBusy(false)
         void loadHistory()
       } else if (ev.type === 'error') {
-        setStreaming('')
-        setActiveTools([])
+        setLiveSegments([])
         setBusy(false)
         setHistory((h) => [
           ...h,
@@ -146,13 +169,15 @@ export default function Chat({ conversationId }: { conversationId: string }) {
     return () => es.close()
   }, [conversationId])
 
-  // Keep the latest turn in view as messages arrive and tokens stream in.
-  // Instant (not smooth) so it reliably tracks fast token updates; only pins
-  // when the user is already at the bottom, so scrolling up to read isn't fought.
-  useEffect(() => {
+  // Keep the latest turn in view as messages arrive and tokens stream in. Instant (not smooth)
+  // so it reliably tracks fast token updates; only pins when the user is already at the bottom,
+  // so scrolling up to read isn't fought. Shared with ChatImage.onSettled (below) so an image
+  // that grows the content after layout re-pins too — stick is a ref, so it always reads live.
+  const pinToBottom = useCallback(() => {
     const el = scrollRef.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [history, streaming, busy, approval, activeTools, pending])
+  }, [])
+  useEffect(pinToBottom, [history, liveSegments, busy, approval, pending, pinToBottom])
 
   const onScroll = () => {
     const el = scrollRef.current
@@ -238,9 +263,7 @@ export default function Chat({ conversationId }: { conversationId: string }) {
     }).catch(() => {})
   }
 
-  const empty = history.length === 0 && !streaming
-  // Nothing to render yet (no streamed text, no running tool) but the run is live.
-  const showThinking = busy && !streaming && activeTools.length === 0
+  const empty = history.length === 0 && liveSegments.length === 0
 
   // The "Alfred" label appears only on the first assistant bubble in a contiguous
   // run of Alfred output, so a sequence of tool-call + text turns isn't labeled
@@ -308,20 +331,53 @@ export default function Chat({ conversationId }: { conversationId: string }) {
                 toolUses={toolUsesOf(m.content)}
                 showName={showName(i)}
                 onOpenImage={setLightbox}
+                onImageSettled={pinToBottom}
               />
             ),
           )}
-          {streaming && (
-            <Bubble role="assistant" conversationId={conversationId} text={streaming} />
-          )}
-          {activeTools.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">
-              {activeTools.map((t) => (
-                <ToolChip key={t.id} name={t.name} args={t.args} live />
-              ))}
+          {/* One cohesive live Alfred block while the run is working: a single ALFRED header,
+              then the ordered segments (streamed text + accumulating tool chips, finished chips
+              just stop pulsing), then the 3 dots always last. Stays mounted until loadHistory
+              clears liveSegments in one render (done/cancelled) — gating on busy alone would
+              blank the block during the async reload, so the durable bubbles swap in with no gap.
+              The dots are gated on busy so they stop the instant the run ends. */}
+          {(busy || liveSegments.length > 0) && (
+            <div className="flex flex-col gap-1" style={{ animation: 'alfred-rise 0.25s ease-out' }}>
+              <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">
+                Alfred
+              </span>
+              {liveSegments.map((seg, i) =>
+                seg.kind === 'text' ? (
+                  seg.text && (
+                    <div
+                      key={`t${i}`}
+                      className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink"
+                    >
+                      {seg.text}
+                    </div>
+                  )
+                ) : (
+                  <div key={seg.id} className="flex flex-wrap gap-1.5 pt-0.5">
+                    <ToolChip name={seg.name} args={seg.args} live={!seg.done} />
+                  </div>
+                ),
+              )}
+              {/* Dots are always the last element while the run is still working; they stop
+                  the moment busy clears (done/cancelled), while the content above stays put
+                  until loadHistory swaps in the durable bubbles. */}
+              {busy && (
+                <div className="flex gap-1 py-1">
+                  {[0, 1, 2].map((i) => (
+                    <span
+                      key={i}
+                      className="h-1.5 w-1.5 rounded-full bg-brass"
+                      style={{ animation: `alfred-blink 1.2s ease-in-out ${i * 0.18}s infinite` }}
+                    />
+                  ))}
+                </div>
+              )}
             </div>
           )}
-          {showThinking && <Thinking />}
         </div>
       </div>
 
@@ -468,6 +524,7 @@ function Bubble({
   toolUses = [],
   showName = true,
   onOpenImage,
+  onImageSettled,
 }: {
   role: string
   conversationId: string
@@ -476,6 +533,7 @@ function Bubble({
   toolUses?: ToolUse[]
   showName?: boolean
   onOpenImage?: (src: string) => void
+  onImageSettled?: () => void
 }) {
   const isUser = role === 'user'
   if (isUser) {
@@ -488,6 +546,7 @@ function Bubble({
               conversationId={conversationId}
               path={img.path}
               onOpen={onOpenImage}
+              onSettled={onImageSettled}
             />
           ))}
           {text && (
@@ -517,6 +576,7 @@ function Bubble({
               conversationId={conversationId}
               path={img.path}
               onOpen={onOpenImage}
+              onSettled={onImageSettled}
             />
           ))}
         </div>
@@ -538,10 +598,14 @@ function ChatImage({
   conversationId,
   path,
   onOpen,
+  onSettled,
 }: {
   conversationId: string
   path: string
   onOpen?: (src: string) => void
+  // Fired once the image has laid out (load or error) so a late-growing image can re-pin
+  // the scroll to the bottom (the handler itself honors the stick guard — no yank if scrolled up).
+  onSettled?: () => void
 }) {
   const src = `/media/${conversationId}/${path}`
   return (
@@ -549,6 +613,8 @@ function ChatImage({
       src={src}
       alt="attachment"
       loading="lazy"
+      onLoad={onSettled}
+      onError={onSettled}
       onClick={onOpen ? () => onOpen(src) : undefined}
       className={`max-h-72 max-w-full rounded-xl border border-line object-contain${
         onOpen ? ' cursor-zoom-in transition-opacity hover:opacity-90' : ''
@@ -575,22 +641,5 @@ function ToolChip({ name, args, live = false }: { name: string; args?: unknown; 
         </span>
       )}
     </span>
-  )
-}
-
-function Thinking() {
-  return (
-    <div className="flex flex-col gap-1">
-      <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
-      <div className="flex gap-1 py-1">
-        {[0, 1, 2].map((i) => (
-          <span
-            key={i}
-            className="h-1.5 w-1.5 rounded-full bg-brass"
-            style={{ animation: `alfred-blink 1.2s ease-in-out ${i * 0.18}s infinite` }}
-          />
-        ))}
-      </div>
-    </div>
   )
 }
