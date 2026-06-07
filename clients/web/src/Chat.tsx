@@ -77,6 +77,16 @@ export default function Chat({ conversationId }: { conversationId: string }) {
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Full-size image overlay: holds the /media src of the clicked image, or null when closed.
+  const [lightbox, setLightbox] = useState<string | null>(null)
+  useEffect(() => {
+    if (!lightbox) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightbox(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox])
   const scrollRef = useRef<HTMLDivElement>(null)
   // Whether to keep pinning to the bottom; false once the user scrolls up to read.
   const stick = useRef(true)
@@ -237,6 +247,29 @@ export default function Chat({ conversationId }: { conversationId: string }) {
 
   return (
     <>
+      {lightbox && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"
+          style={{ animation: 'alfred-rise 0.15s ease-out' }}
+          onClick={() => setLightbox(null)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <img
+            src={lightbox}
+            alt="attachment full size"
+            className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
+          />
+          <button
+            type="button"
+            onClick={() => setLightbox(null)}
+            aria-label="Close"
+            className="absolute right-5 top-5 rounded-full bg-surface/90 px-3 py-1.5 text-sm text-ink transition-colors hover:bg-surface"
+          >
+            ✕ Esc
+          </button>
+        </div>
+      )}
       <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-5 py-6">
         {empty && (
           <div className="flex h-full flex-col items-center justify-center text-center">
@@ -259,6 +292,7 @@ export default function Chat({ conversationId }: { conversationId: string }) {
                 images={imagesOf(m.content)}
                 toolUses={toolUsesOf(m.content)}
                 showName={showName(i)}
+                onOpenImage={setLightbox}
               />
             ),
           )}
@@ -407,6 +441,7 @@ function Bubble({
   images = [],
   toolUses = [],
   showName = true,
+  onOpenImage,
 }: {
   role: string
   conversationId: string
@@ -414,6 +449,7 @@ function Bubble({
   images?: ImagePart[]
   toolUses?: ToolUse[]
   showName?: boolean
+  onOpenImage?: (src: string) => void
 }) {
   const isUser = role === 'user'
   if (isUser) {
@@ -421,7 +457,12 @@ function Bubble({
       <div className="flex justify-end" style={{ animation: 'alfred-rise 0.25s ease-out' }}>
         <div className="flex max-w-[85%] flex-col items-end gap-2">
           {images.map((img) => (
-            <ChatImage key={img.path} conversationId={conversationId} path={img.path} />
+            <ChatImage
+              key={img.path}
+              conversationId={conversationId}
+              path={img.path}
+              onOpen={onOpenImage}
+            />
           ))}
           {text && (
             <div className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-surface px-4 py-2.5 text-ink">
@@ -445,7 +486,12 @@ function Bubble({
       {images.length > 0 && (
         <div className="flex flex-wrap gap-2 pt-0.5">
           {images.map((img) => (
-            <ChatImage key={img.path} conversationId={conversationId} path={img.path} />
+            <ChatImage
+              key={img.path}
+              conversationId={conversationId}
+              path={img.path}
+              onOpen={onOpenImage}
+            />
           ))}
         </div>
       )}
@@ -460,14 +506,27 @@ function Bubble({
   )
 }
 
-// An image served from the conversation workspace via the webserver's /media route.
-function ChatImage({ conversationId, path }: { conversationId: string; path: string }) {
+// An image served from the conversation workspace via the webserver's /media route. Click to
+// open it full-size in the lightbox (onOpen lifted to Chat so the overlay covers the viewport).
+function ChatImage({
+  conversationId,
+  path,
+  onOpen,
+}: {
+  conversationId: string
+  path: string
+  onOpen?: (src: string) => void
+}) {
+  const src = `/media/${conversationId}/${path}`
   return (
     <img
-      src={`/media/${conversationId}/${path}`}
+      src={src}
       alt="attachment"
       loading="lazy"
-      className="max-h-72 max-w-full rounded-xl border border-line object-contain"
+      onClick={onOpen ? () => onOpen(src) : undefined}
+      className={`max-h-72 max-w-full rounded-xl border border-line object-contain${
+        onOpen ? ' cursor-zoom-in transition-opacity hover:opacity-90' : ''
+      }`}
     />
   )
 }
