@@ -26,4 +26,16 @@ describe('computeCostUsd', () => {
   it('is 0 when there are no tokens', () => {
     expect(computeCostUsd('gemini-2.5-flash', 0, 0)).toBe(0)
   })
+
+  it('prices a flat-per-image model as images × perImageOutput, ignoring completion tokens', () => {
+    // imagen-4.0-generate-001: $0.04/image, zero token rates. 2 images → 0.08; the (bogus)
+    // completion tokens don't bill since perImageOutput is set.
+    expect(computeCostUsd('imagen-4.0-generate-001', 0, 9999, 0, 2)).toBeCloseTo(0.08, 10)
+  })
+
+  it('keeps a gemini-native image model token-based (images arg ignored when perImageOutput unset)', () => {
+    // gemini-2.5-flash-image: $0.30/1M in, $30.0/1M out. 100 in → 0.00003, 1290 out →
+    // 0.0387; total 0.03873. The images=1 arg must not change this (token formula).
+    expect(computeCostUsd('gemini-2.5-flash-image', 100, 1290, 0, 1)).toBeCloseTo(0.03873, 10)
+  })
 })

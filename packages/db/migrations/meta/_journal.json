@@ -50,6 +50,13 @@
       "when": 1780560623367,
       "tag": "0006_closed_zaran",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1780859484353,
+      "tag": "0007_cynical_robin_chapel",
+      "breakpoints": true
     }
   ]
 }

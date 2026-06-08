@@ -19,6 +19,7 @@ type TracedToolCall = { id: string; name: string; args: unknown }
 type LlmCall = {
   id: string
   model: string
+  toolCallId: string | null
   request: unknown
   tools: TracedTool[] | null
   responseText: string
@@ -175,6 +176,8 @@ export default function Debug() {
                 </p>
               )}
 
+              {detail && detail.calls.length > 0 && <CostBreakdown detail={detail} />}
+
               {detail?.calls.map((call) => {
                 const system = systemTextOf(call.request)
                 const toolCalls = call.responseToolCalls ?? []
@@ -211,7 +214,7 @@ export default function Debug() {
 
                     <details className="mt-1">
                       <summary className="cursor-pointer select-none text-muted hover:text-ink">
-                        request (messages)
+                        request ({call.toolCallId == null ? 'messages' : 'tool call'})
                       </summary>
                       <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-md bg-paper p-2 text-xs text-ink-dim">
                         {JSON.stringify(call.request, null, 2)}
@@ -278,6 +281,58 @@ export default function Debug() {
           </>
         )}
       </section>
+    </div>
+  )
+}
+
+// Per-tool cost breakdown, derived client-side from the already-fetched calls + toolCalls.
+// Loop calls (tool_call_id == null) are the conversation; the rest are grouped by the
+// tool_call that spawned them (labelled from the matching toolCalls row's name). Only
+// buckets that actually cost something are shown.
+function CostBreakdown({ detail }: { detail: RunDetail }) {
+  const calls = detail.calls
+  const loopCalls = calls.filter((c) => c.toolCallId == null)
+  const loopCost = loopCalls.reduce((sum, c) => sum + Number(c.costUsd ?? 0), 0)
+
+  const nameById = new Map((detail.toolCalls ?? []).map((tc) => [tc.id, tc.toolName]))
+  const byTool = new Map<string, { label: string; cost: number; count: number }>()
+  for (const c of calls) {
+    if (c.toolCallId == null) continue
+    const bucket = byTool.get(c.toolCallId) ?? {
+      label: nameById.get(c.toolCallId) ?? c.toolCallId,
+      cost: 0,
+      count: 0,
+    }
+    bucket.cost += Number(c.costUsd ?? 0)
+    bucket.count += 1
+    byTool.set(c.toolCallId, bucket)
+  }
+  const toolBuckets = [...byTool.values()].filter((b) => b.cost > 0)
+
+  return (
+    <div className="rounded-lg border border-line bg-paper-raised p-3 text-xs">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="font-semibold uppercase tracking-[0.18em] text-brass">Cost</span>
+        <span className="tabular-nums text-ink">{usd(detail.run.costUsd)}</span>
+      </div>
+      <div className="space-y-1 text-muted">
+        <div className="flex items-center justify-between gap-2">
+          <span>
+            Conversation (LLM loop)
+            <span className="text-ink-dim"> · {loopCalls.length} call{loopCalls.length === 1 ? '' : 's'}</span>
+          </span>
+          <span className="tabular-nums text-ink-dim">{usd(String(loopCost))}</span>
+        </div>
+        {toolBuckets.map((b, i) => (
+          <div key={i} className="flex items-center justify-between gap-2">
+            <span className="truncate">
+              <span className="font-mono text-brass">{b.label}</span>
+              <span className="text-ink-dim"> · {b.count} call{b.count === 1 ? '' : 's'}</span>
+            </span>
+            <span className="tabular-nums text-ink-dim">{usd(String(b.cost))}</span>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

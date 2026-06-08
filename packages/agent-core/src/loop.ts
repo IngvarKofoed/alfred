@@ -1,6 +1,6 @@
 import { isImageResult } from './image-result.js'
 import type { LlmProvider } from './provider.js'
-import type { Tool } from './tool.js'
+import type { Tool, ToolLlmCall } from './tool.js'
 import type { ContentPart, Message } from './types.js'
 
 // The payload the loop hands to the approval gate and lifecycle hooks for a single
@@ -36,6 +36,9 @@ export interface RunOptions {
   // (write/destructive gate, read runs free). The worker supplies a settings-aware
   // predicate so per-tool approval overrides (the tools page, §16) take effect here.
   requiresApproval?: (call: ApprovalRequest) => boolean
+  // An AI call a tool made of its own (e.g. generate_image). The worker persists each as an
+  // llm_calls row linked to the originating tool_call so its cost is attributed (§6.5).
+  onToolLlmCall?: (callId: string, call: ToolLlmCall) => void | Promise<void>
   // Tool-call lifecycle hooks (the worker persists tool_calls rows from these).
   onToolStart?: (call: ApprovalRequest) => void | Promise<void>
   onToolEnd?: (
@@ -97,7 +100,9 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
       }
 
       try {
-        const result = tool ? await tool.invoke(tc.args) : { error: `unknown tool: ${tc.name}` }
+        const result = tool
+          ? await tool.invoke(tc.args, { recordLlmCall: (call) => opts.onToolLlmCall?.(tc.id, call) })
+          : { error: `unknown tool: ${tc.name}` }
         if (isImageResult(result)) {
           // Gemini's functionResponse can't carry an image, so the tool_result holds a text
           // ack; the actual bytes ride on a sibling `image` part of the same tool turn, so

@@ -106,6 +106,7 @@ export const llmCalls = pgTable(
     agentRunId: uuid('agent_run_id')
       .notNull()
       .references(() => agentRuns.id),
+    toolCallId: uuid('tool_call_id').references(() => toolCalls.id), // set ⇒ call made by this tool outside the loop; null ⇒ an agent-loop call
     model: text('model').notNull(),
     request: jsonb('request').notNull(), // the Message[] sent to the provider
     tools: jsonb('tools'), // the function declarations offered to the model this call (name/description/parameters)

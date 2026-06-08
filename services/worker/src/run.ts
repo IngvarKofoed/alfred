@@ -24,7 +24,10 @@ import { rowsToMessages } from './messages.js'
 const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
 
 // Minimal system prompt for now; full persona assembly (§7.5) is deferred.
-const SYSTEM_PROMPT = 'You are Alfred, a helpful personal assistant. Be concise and direct.'
+const SYSTEM_PROMPT =
+  'You are Alfred, a helpful personal assistant. Be concise and direct. ' +
+  'Images you create with generate_image are shown to the user automatically; ' +
+  "don't thank the user for them or describe them back unless asked."
 
 export interface RunDeps {
   provider?: LlmProvider
@@ -188,6 +191,35 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
           notifyRun(run.conversationId, { type: 'tool_call_end', id: call.id }),
         )
       },
+      // An AI call a tool made outside the loop (e.g. generate_image). Persist it as an
+      // llm_calls row linked to the originating tool_call so its cost is attributed (§6.5);
+      // the summaries never carry image base64.
+      onToolLlmCall: async (callId, call) => {
+        const promptTokens = call.promptTokens ?? 0
+        const completionTokens = call.completionTokens ?? 0
+        await db.insert(llmCalls).values({
+          agentRunId: runId,
+          toolCallId: toolCallRowIds.get(callId) ?? null,
+          model: call.model,
+          // A small summary, never image base64.
+          request: { tool: true, summary: call.requestSummary ?? null },
+          tools: null,
+          responseText: call.responseSummary ?? '',
+          responseToolCalls: null,
+          promptTokens,
+          completionTokens,
+          costUsd: computeCostUsd(
+            call.model,
+            promptTokens,
+            completionTokens,
+            call.cachedTokens ?? 0,
+            call.images ?? 0,
+          ).toFixed(6),
+          finishReason: call.finishReason ?? null,
+          latencyMs: call.latencyMs ?? 0,
+          error: null,
+        })
+      },
       requiresApproval,
       requestApproval: async (call) => {
         // Group already granted this run → auto-approve without prompting. The tool_calls
@@ -261,14 +293,20 @@ async function rollupUsage(db: ReturnType<typeof getDb>, runId: string) {
       completionTokens: llmCalls.completionTokens,
       costUsd: llmCalls.costUsd,
       model: llmCalls.model,
+      toolCallId: llmCalls.toolCallId,
     })
     .from(llmCalls)
     .where(eq(llmCalls.agentRunId, runId))
+  // The run's model reflects the AGENT LOOP only (tool_call_id IS NULL) — an image-tool call
+  // has its own llm_calls row and must not mislabel the run as the image model. Fall back to
+  // the last call of any kind only if there are no loop calls.
+  const loopModel = calls.filter((row) => row.toolCallId === null).at(-1)?.model
   return {
+    // SUMS span ALL calls (image cost still counts toward the run); only the model is filtered.
     promptTokens: calls.reduce((sum, row) => sum + row.promptTokens, 0),
     completionTokens: calls.reduce((sum, row) => sum + row.completionTokens, 0),
     costUsd: calls.reduce((sum, row) => sum + Number(row.costUsd), 0).toFixed(6),
-    model: calls.at(-1)?.model ?? null,
+    model: loopModel ?? calls.at(-1)?.model ?? null,
   }
 }
 

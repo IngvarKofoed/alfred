@@ -1,10 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { type ImageToolResult, type Tool } from '@alfred/agent-core'
+import { type ImageToolResult, type Tool, type ToolContext } from '@alfred/agent-core'
 import { conversations, getDb } from '@alfred/db'
-import { imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
-import { GoogleGenAI } from '@google/genai'
+import { imageMimeForExt, resolveInWorkspace } from '@alfred/shared'
 import { eq } from 'drizzle-orm'
+import { DEFAULT_IMAGE_MODEL, imageModelChoices, resolveImageProvider } from './images-registry.js'
 
 // A context-bound built-in tool (ARCHITECTURE §7.3): it acts on a specific
 // conversation, captured in a closure so Tool.invoke(args) stays context-free.
@@ -30,46 +30,69 @@ export function makeSetTitleTool(conversationId: string): Tool {
   }
 }
 
-// The Gemini image-generation model the generate_image tool calls. Pricing for it lives in
-// agent-core/pricing.ts (MODEL_PRICING['gemini-2.5-flash-image']).
-const IMAGE_MODEL = 'gemini-2.5-flash-image'
+// The image-model choices, read once from the registry (so they can't drift from what's
+// wired). Both the `model` enum (ids) and its description — one line per id, since JSON-schema
+// enum has no per-value docs — derive from this single list.
+const IMAGE_MODEL_CHOICES = imageModelChoices()
+const IMAGE_MODEL_IDS = IMAGE_MODEL_CHOICES.map((m) => m.id)
+const MODEL_ENUM_DESCRIPTION =
+  `Image model to use (default ${DEFAULT_IMAGE_MODEL}). ` +
+  IMAGE_MODEL_CHOICES.map((m) => `${m.id}: ${m.description}`).join('; ')
 
-// generate_image: produce an image from a text prompt via Gemini, returning an ImageToolResult
-// the worker persists (bytes -> workspace, reference -> tool_calls.result) and the model sees
-// (image-feedback path, so "now make it bluer" works). write-tier ⇒ approval-gated by default.
+// generate_image: produce an image from a text prompt, returning an ImageToolResult the worker
+// persists (bytes -> workspace, reference -> tool_calls.result) and the model sees (image-feedback
+// path, so "now make it bluer" works). The model is chosen per call via the `model` arg, resolved
+// through the image registry (Gemini-native or Imagen). write-tier ⇒ approval-gated by default.
 export function makeGenerateImageTool(): Tool {
   return {
     name: 'generate_image',
     description: 'Generate an image from a text prompt. The image is shown in the chat and you can see it too.',
     inputSchema: {
       type: 'object',
-      properties: { prompt: { type: 'string', description: 'Description of the image to generate' } },
+      properties: {
+        prompt: { type: 'string', description: 'Description of the image to generate' },
+        model: { type: 'string', enum: IMAGE_MODEL_IDS, description: MODEL_ENUM_DESCRIPTION },
+      },
       required: ['prompt'],
     },
     trustTier: 'write',
-    async invoke(args: unknown): Promise<unknown> {
-      const prompt = String((args as { prompt?: unknown } | null)?.prompt ?? '')
+    async invoke(args: unknown, ctx?: ToolContext): Promise<unknown> {
+      const { prompt: rawPrompt, model: rawModel } = (args ?? {}) as { prompt?: unknown; model?: unknown }
+      const prompt = String(rawPrompt ?? '')
       if (!prompt) throw new Error('generate_image requires a non-empty prompt')
+      const model = typeof rawModel === 'string' && rawModel ? rawModel : DEFAULT_IMAGE_MODEL
 
-      // Reuse the GeminiProvider's client construction (see providers/gemini.ts): same env key.
-      const apiKey = loadConfig().GEMINI_API_KEY
-      if (!apiKey) throw new Error('GEMINI_API_KEY is not set — required for generate_image')
-      const ai = new GoogleGenAI({ apiKey })
-
-      const response = await ai.models.generateContent({
-        model: IMAGE_MODEL,
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      })
-
-      // The image rides on a candidate part's inlineData ({ mimeType, data:<base64> }).
-      const parts = response.candidates?.[0]?.content?.parts ?? []
-      const inline = parts.find((p) => p.inlineData?.data)?.inlineData
-      if (!inline?.data) throw new Error('generate_image: the model returned no image')
+      const provider = resolveImageProvider(model)
+      const startedAt = Date.now()
+      const generated = await provider.generate(prompt)
+      const latencyMs = Date.now() - startedAt
 
       const out: ImageToolResult = {
-        image: { mimeType: inline.mimeType ?? 'image/png', data: inline.data },
-        summary: `generated image for: ${prompt}`,
+        // The summary is what the model sees as the tool result (the image bytes ride on a
+        // sibling part it can also see). Frame it so the model knows it created the image and
+        // the user can already view it — otherwise it tends to "thank you for providing the
+        // image" as if the user supplied it.
+        image: { mimeType: generated.mimeType, data: generated.data },
+        summary: `Generated the image for "${prompt}" and displayed it to the user. They can see it now.`,
       }
+
+      // Attribute this out-of-loop AI call to its tool_call so the cost reaches llm_calls /
+      // agent_runs (never $0). usage.images drives cost for flat-per-image models (Imagen);
+      // tokens drive it for Gemini-native. Summaries only — never the image base64.
+      const usage = generated.usage
+      await ctx?.recordLlmCall({
+        model: usage?.model ?? model,
+        images: usage?.images,
+        promptTokens: usage?.promptTokens,
+        completionTokens: usage?.completionTokens,
+        cachedTokens: usage?.cachedTokens,
+        // Record the prompt so the /debug llm_calls row is self-contained (it's otherwise
+        // only recoverable from tool_calls.args). Never the image base64.
+        requestSummary: prompt,
+        responseSummary: 'generated image',
+        latencyMs,
+      })
+
       return out
     },
   }

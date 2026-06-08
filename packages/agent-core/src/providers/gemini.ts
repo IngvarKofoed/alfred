@@ -47,14 +47,23 @@ export class GeminiProvider implements LlmProvider {
       let completionTokens: number | undefined
       let finishReason: string | undefined
       for await (const chunk of response) {
-        const text = chunk.text
-        if (text) yield { type: 'text', text }
-        for (const call of chunk.functionCalls ?? []) {
-          yield {
-            type: 'tool_call',
-            id: call.id ?? `${call.name}-${callIndex++}`,
-            name: call.name ?? '',
-            args: call.args ?? {},
+        // Read the parts array directly rather than the chunk.text / chunk.functionCalls
+        // getters: the .text getter warns ("non-text parts functionCall in the response…")
+        // whenever a chunk carries both text and a function call, which is routine. Walking
+        // parts ourselves yields the same text+calls without the spurious warning. Skip
+        // `thought` parts, matching the .text getter.
+        for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
+          if (typeof part.text === 'string' && part.text && !part.thought) {
+            yield { type: 'text', text: part.text }
+          }
+          const call = part.functionCall
+          if (call) {
+            yield {
+              type: 'tool_call',
+              id: call.id ?? `${call.name}-${callIndex++}`,
+              name: call.name ?? '',
+              args: call.args ?? {},
+            }
           }
         }
         if (chunk.usageMetadata) {
