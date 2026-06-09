@@ -13,7 +13,7 @@ import {
   users,
 } from '@alfred/db'
 import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
-import { and, asc, desc, eq, inArray, type SQL } from 'drizzle-orm'
+import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
@@ -357,6 +357,94 @@ app.get('/api/debug/runs', async (c) => {
     .orderBy(desc(agentRuns.id)) // uuidv7 ids are time-ordered → newest first
     .limit(limit)
   return c.json({ runs })
+})
+
+// Conversation-grouped run list for the /debug ledger. Returns recent conversations
+// (ranked by their newest run) with their runs embedded as lightweight rows for the
+// sparkline/timeline — the heavy per-run detail (llm_calls bodies, tool args/results)
+// stays behind /api/debug/runs/:id, fetched lazily when a run is expanded.
+//
+// Per-conversation aggregates (run count, token + cost totals) are computed by a grouped
+// query over ALL of a conversation's runs, NOT derived from the embedded display rows —
+// so the headline numbers stay accurate even when a conversation has more runs than the
+// display cap shows.
+const DISPLAY_RUNS_PER_CONVERSATION = 30
+app.get('/api/debug/conversations', async (c) => {
+  const limit = Math.min(Number(c.req.query('limit')) || 50, 200)
+  const db = getDb()
+
+  // Recent conversations ranked by their newest run, with full (uncapped) aggregates.
+  // uuidv7 ids are time-ordered and their text form sorts the same way, so max(id::text)
+  // is the newest run (Postgres has no max() aggregate for the uuid type itself).
+  const agg = await db
+    .select({
+      conversationId: agentRuns.conversationId,
+      runCount: count(),
+      promptTokens: sum(agentRuns.promptTokens),
+      completionTokens: sum(agentRuns.completionTokens),
+      costUsd: sum(agentRuns.costUsd),
+    })
+    .from(agentRuns)
+    .groupBy(agentRuns.conversationId)
+    .orderBy(sql`max(${agentRuns.id}::text) desc`)
+    .limit(limit)
+
+  const order = agg.map((a) => a.conversationId)
+  if (order.length === 0) return c.json({ conversations: [] })
+
+  // Display runs for those conversations (newest first, capped per conversation). The
+  // overall fetch is bounded; the per-conversation cap is enforced while grouping.
+  const runs = await db
+    .select({
+      id: agentRuns.id,
+      conversationId: agentRuns.conversationId,
+      status: agentRuns.status,
+      model: agentRuns.model,
+      startedAt: agentRuns.startedAt,
+      finishedAt: agentRuns.finishedAt,
+      promptTokens: agentRuns.promptTokens,
+      completionTokens: agentRuns.completionTokens,
+      costUsd: agentRuns.costUsd,
+      error: agentRuns.error,
+    })
+    .from(agentRuns)
+    .where(inArray(agentRuns.conversationId, order))
+    .orderBy(desc(agentRuns.id))
+    .limit(order.length * DISPLAY_RUNS_PER_CONVERSATION)
+
+  const byConversation = new Map<string, typeof runs>()
+  for (const r of runs) {
+    const bucket = byConversation.get(r.conversationId) ?? []
+    if (bucket.length < DISPLAY_RUNS_PER_CONVERSATION) bucket.push(r)
+    byConversation.set(r.conversationId, bucket)
+  }
+
+  const convRows = await db
+    .select({
+      id: conversations.id,
+      title: conversations.title,
+      ingress: conversations.ingress,
+      lastActiveAt: conversations.lastActiveAt,
+    })
+    .from(conversations)
+    .where(inArray(conversations.id, order))
+  const meta = new Map(convRows.map((cv) => [cv.id, cv]))
+
+  const result = agg.map((a) => {
+    const cv = meta.get(a.conversationId)
+    return {
+      id: a.conversationId,
+      title: cv?.title ?? null,
+      ingress: cv?.ingress ?? null,
+      lastActiveAt: cv?.lastActiveAt ?? null,
+      runCount: a.runCount,
+      promptTokens: Number(a.promptTokens ?? 0),
+      completionTokens: Number(a.completionTokens ?? 0),
+      costUsd: a.costUsd ?? '0',
+      runs: byConversation.get(a.conversationId) ?? [],
+    }
+  })
+  return c.json({ conversations: result })
 })
 
 app.get('/api/debug/runs/:id', async (c) => {
