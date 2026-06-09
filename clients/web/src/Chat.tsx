@@ -70,7 +70,13 @@ function argSummary(args: unknown): string {
   return s.length > 80 ? s.slice(0, 80) + '…' : s
 }
 
-export default function Chat({ conversationId }: { conversationId: string }) {
+export default function Chat({
+  conversationId,
+  onTitleChange,
+}: {
+  conversationId: string
+  onTitleChange: (title: string) => void
+}) {
   const [history, setHistory] = useState<ChatMessage[]>([])
   const [busy, setBusy] = useState(false)
   const [input, setInput] = useState('')
@@ -213,8 +219,31 @@ export default function Chat({ conversationId }: { conversationId: string }) {
     }
   }
 
+  // Append a transient, local-only system line (e.g. command feedback). Never persisted —
+  // gone on reload, matching how ⚠️ errors are pushed locally today.
+  const pushSystemNote = (text: string) =>
+    setHistory((h) => [...h, { role: 'system', content: [{ type: 'text', text }] }])
+
   const send = async () => {
     const text = input.trim()
+    // A leading-/ line is a command: forward the raw line to the central command endpoint,
+    // render the feedback as a transient system note, and never create a message or run.
+    if (text.startsWith('/')) {
+      setInput('')
+      const res = await fetch(`/api/conversations/${conversationId}/commands`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ input: text }),
+      })
+      const r = (await res.json().catch(() => ({}))) as {
+        note?: string
+        error?: string
+        conversation?: { title: string }
+      }
+      if (r.conversation?.title) onTitleChange(r.conversation.title)
+      pushSystemNote(r.note ?? r.error ?? 'Command failed')
+      return
+    }
     const attachments = pending
     if ((!text && attachments.length === 0) || busy) return
     setInput('')
@@ -317,7 +346,17 @@ export default function Chat({ conversationId }: { conversationId: string }) {
         )}
         <div className="mx-auto flex max-w-xl flex-col gap-5">
           {history.map((m, i) =>
-            // Tool-result messages are shown only when they carry an image (a screenshot /
+            // A transient command note (local-only, never persisted) — a quiet, centered
+            // system line, not an Alfred bubble (it isn't Alfred talking).
+            m.role === 'system' ? (
+              <p
+                key={m.id ?? i}
+                className="whitespace-pre-wrap text-center text-xs text-muted"
+                style={{ animation: 'alfred-rise 0.25s ease-out' }}
+              >
+                {textOf(m.content)}
+              </p>
+            ) : // Tool-result messages are shown only when they carry an image (a screenshot /
             // generated image, rendered as a thumbnail); a text-only tool result is still
             // suppressed — its call is surfaced via the assistant's tool chip (full results
             // live on /debug).

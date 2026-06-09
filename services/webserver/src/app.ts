@@ -1,20 +1,20 @@
 import {
   agentRuns,
   conversations,
+  ensureConversation,
   enqueueAgentRun,
   getDb,
   llmCalls,
   messages,
-  OWNER_USER_ID,
   pgNotify,
   toolCalls,
   tools as toolsTable,
   userInteractions,
-  users,
 } from '@alfred/db'
 import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
 import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
 import { Hono } from 'hono'
+import { executeCommand } from './commands.js'
 import { streamSSE } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
@@ -68,14 +68,7 @@ app.post('/api/conversations/:id/messages', async (c) => {
   let runId: string
   try {
     runId = await db.transaction(async (tx) => {
-      await tx
-        .insert(users)
-        .values({ id: OWNER_USER_ID, displayName: 'Owner' })
-        .onConflictDoNothing()
-      await tx
-        .insert(conversations)
-        .values({ id: conversationId, userId: OWNER_USER_ID, ingress: 'web', channelKey: conversationId })
-        .onConflictDoNothing()
+      await ensureConversation(tx, conversationId)
       const [msg] = await tx
         .insert(messages)
         .values({
@@ -99,6 +92,23 @@ app.post('/api/conversations/:id/messages', async (c) => {
 
   await enqueueAgentRun(runId)
   return c.json({ runId })
+})
+
+// Run a slash command (spec 2026-06-09-chat-commands). The client forwards a raw '/'-prefixed
+// line; the backend registry parses + executes it (no message row, no agent run). Command-level
+// outcomes (unknown command, usage error) come back as 200 with { error } for the client to
+// render as an inline note; only malformed requests (bad id, missing input) are 4xx.
+app.post('/api/conversations/:id/commands', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+
+  const body = (await c.req.json().catch(() => ({}))) as { input?: unknown }
+  if (typeof body.input !== 'string' || body.input.trim() === '') {
+    return c.json({ error: 'input is required' }, 400)
+  }
+
+  const result = await executeCommand(body.input, { conversationId, db: getDb() })
+  return c.json(result)
 })
 
 // Upload a single image into the conversation's workspace. Multipart, parsed via Hono's
@@ -162,6 +172,19 @@ app.get('/media/:conversationId/:filename', async (c) => {
   c.header('Content-Type', contentTypeFor(filename))
   c.header('Content-Length', String(info.size))
   return c.body(Readable.toWeb(createReadStream(abs)) as ReadableStream)
+})
+
+// Conversation metadata (the title), for the chat header. A never-created conversation is fine
+// — return a null title rather than 404.
+app.get('/api/conversations/:id', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+  const [row] = await getDb()
+    .select({ id: conversations.id, title: conversations.title })
+    .from(conversations)
+    .where(eq(conversations.id, conversationId))
+  if (!row) return c.json({ id: conversationId, title: null })
+  return c.json(row)
 })
 
 // Conversation history, so a page refresh restores the thread.
