@@ -14,6 +14,8 @@ type ImagePart = { path: string; mimeType: string }
 // An image uploaded but not yet sent — kept in local state and POSTed with the next message.
 type PendingAttachment = { path: string; mimeType: string }
 type ChatMessage = { id?: string; role: string; content: ContentPart[] }
+// A slash command from GET /api/commands — used to render the autocomplete suggestions.
+type CommandInfo = { name: string; aliases: string[]; description: string; usage: string }
 type ApprovalPrompt = {
   summary?: string
   tool: string
@@ -95,6 +97,15 @@ export default function Chat({
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Slash-command autocomplete: the catalog (fetched once) and the highlighted row. Whether the
+  // menu shows is derived from the input being a bare `/command` token (see cmdMatches below) —
+  // cmdDismissed is the one piece of explicit state, set when the user dismisses (Esc / blur /
+  // accept) and cleared on the next keystroke, so there's no second "is this a command" regex
+  // to drift from cmdMatch.
+  const [commands, setCommands] = useState<CommandInfo[]>([])
+  const [cmdDismissed, setCmdDismissed] = useState(false)
+  const [cmdIndex, setCmdIndex] = useState(0)
+  const messageInputRef = useRef<HTMLInputElement>(null)
   // Full-size image overlay: holds the /media src of the clicked image, or null when closed.
   const [lightbox, setLightbox] = useState<string | null>(null)
   useEffect(() => {
@@ -105,6 +116,20 @@ export default function Chat({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [lightbox])
+  // Fetch the slash-command catalog once for autocomplete (static, conversation-independent).
+  useEffect(() => {
+    let ignore = false
+    fetch('/api/commands')
+      .then((r) => r.json() as Promise<{ commands: CommandInfo[] }>)
+      .then((d) => {
+        if (!ignore) setCommands(d.commands ?? [])
+      })
+      .catch(() => {})
+    return () => {
+      ignore = true
+    }
+  }, [])
+
   const scrollRef = useRef<HTMLDivElement>(null)
   // Whether to keep pinning to the bottom; false once the user scrolls up to read.
   const stick = useRef(true)
@@ -290,6 +315,50 @@ export default function Chat({
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ approved, remember: rememberChoice }),
     }).catch(() => {})
+  }
+
+  // --- Slash-command autocomplete (derived from the live input) ---
+  // The leading `/command` token, or null when the input isn't a bare command (no `/`, or a
+  // space has been typed → now composing args). An empty token (input === '/') matches all.
+  const cmdMatch = input.match(/^\/(\S*)$/)
+  const cmdToken = cmdMatch ? (cmdMatch[1] ?? '').toLowerCase() : null
+  const cmdMatches =
+    cmdToken === null
+      ? []
+      : commands.filter(
+          (c) => c.name.startsWith(cmdToken) || c.aliases.some((a) => a.startsWith(cmdToken)),
+        )
+  const showCommands = !cmdDismissed && !busy && cmdMatches.length > 0
+  const activeCmd = Math.min(cmdIndex, cmdMatches.length - 1)
+
+  // Replace the input with the chosen command, leaving a trailing space when it takes args
+  // (its usage shows a `<placeholder>`) so the caret lands ready to type them; close the menu.
+  const acceptCommand = (cmd: CommandInfo) => {
+    setInput(`/${cmd.name}${cmd.usage.includes('<') ? ' ' : ''}`)
+    setCmdDismissed(true)
+    setCmdIndex(0)
+    messageInputRef.current?.focus()
+  }
+
+  const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!showCommands) return // no menu → let Enter submit and Tab move focus normally
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setCmdIndex((i) => (Math.min(i, cmdMatches.length - 1) + 1) % cmdMatches.length)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setCmdIndex(
+        (i) => (Math.min(i, cmdMatches.length - 1) - 1 + cmdMatches.length) % cmdMatches.length,
+      )
+    } else if (e.key === 'Enter') {
+      e.preventDefault() // accept the highlighted command rather than submitting the form
+      acceptCommand(cmdMatches[activeCmd]!)
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      setCmdDismissed(true)
+    }
+    // Tab is intentionally NOT intercepted: it falls through to normal focus movement so a
+    // keyboard user can always tab out of the composer (the resulting blur closes the menu).
   }
 
   const empty = history.length === 0 && liveSegments.length === 0
@@ -478,7 +547,43 @@ export default function Chat({
           void send()
         }}
       >
-        <div className="mx-auto flex max-w-xl flex-col gap-2">
+        <div className="relative mx-auto flex max-w-xl flex-col gap-2">
+          {/* Slash-command autocomplete: floats above the composer (bottom-full) so it grows
+              upward without shifting the input. The ul's mousedown is prevented so pressing a
+              suggestion doesn't blur the input, and each row selects on mousedown (below) rather
+              than click — so the action fires before any blur, closing the desktop+touch race. */}
+          {showCommands && (
+            <ul
+              id="command-suggestions"
+              role="listbox"
+              onMouseDown={(e) => e.preventDefault()}
+              className="absolute bottom-full left-0 right-0 z-20 mb-2 overflow-hidden rounded-2xl border border-line bg-paper-raised py-1 shadow-lg"
+              style={{ animation: 'alfred-rise 0.12s ease-out' }}
+            >
+              {cmdMatches.map((cmd, i) => (
+                <li
+                  key={cmd.name}
+                  role="option"
+                  aria-selected={i === activeCmd}
+                  onMouseEnter={() => setCmdIndex(i)}
+                  onMouseDown={() => acceptCommand(cmd)}
+                  className={`flex cursor-pointer items-baseline gap-2 px-4 py-2 ${
+                    i === activeCmd ? 'bg-surface' : ''
+                  }`}
+                >
+                  <span className="font-mono text-sm text-brass">{cmd.usage}</span>
+                  {cmd.aliases.length > 0 && (
+                    <span className="font-mono text-xs text-muted">
+                      /{cmd.aliases.join(', /')}
+                    </span>
+                  )}
+                  <span className="ml-auto truncate pl-3 text-xs text-muted">
+                    {cmd.description}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
           {(pending.length > 0 || uploading) && (
             <div className="flex flex-wrap gap-2 px-1">
               {pending.map((a) => (
@@ -535,11 +640,25 @@ export default function Chat({
               </svg>
             </button>
             <input
+              ref={messageInputRef}
               className="flex-1 bg-transparent px-1 py-2 text-ink outline-none placeholder:text-muted"
               placeholder={busy ? 'Alfred is attending to this…' : 'Message Alfred…'}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value)
+                // Un-dismiss so the menu can show again (it only actually shows when the value is
+                // a bare `/command` token — see cmdMatches), and reset the highlight to the top so
+                // filtering always starts from the first match.
+                setCmdDismissed(false)
+                setCmdIndex(0)
+              }}
+              onKeyDown={onInputKeyDown}
+              onBlur={() => setCmdDismissed(true)}
               disabled={busy}
+              autoComplete="off"
+              role="combobox"
+              aria-expanded={showCommands}
+              aria-controls="command-suggestions"
             />
             <button
               type="submit"

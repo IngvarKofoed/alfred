@@ -49,6 +49,21 @@ const help: Command = {
 // The single source of truth: the registry /help derives from and executeCommand dispatches on.
 export const COMMANDS: Command[] = [rename, help]
 
+// Public metadata for the command catalog (served at GET /api/commands so the web client can
+// render autocomplete suggestions). Derived from the same registry, so the suggestions can
+// never drift from what executeCommand actually dispatches. The `run` fn is intentionally
+// dropped — clients only need to display and complete commands, not execute them locally.
+export type CommandInfo = { name: string; aliases: string[]; description: string; usage: string }
+
+export function listCommands(): CommandInfo[] {
+  return COMMANDS.map((c) => ({
+    name: c.name,
+    aliases: c.aliases ?? [],
+    description: c.description,
+    usage: c.usage ?? `/${c.name}`,
+  }))
+}
+
 export async function executeCommand(input: string, ctx: CommandContext): Promise<CommandResult> {
   // Strip the leading '/', take the first whitespace-delimited token as the (lowercased)
   // command name, and treat the remainder (with its leading separator trimmed) as the args.

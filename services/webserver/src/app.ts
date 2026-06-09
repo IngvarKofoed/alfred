@@ -14,7 +14,7 @@ import {
 import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
 import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
 import { Hono } from 'hono'
-import { executeCommand } from './commands.js'
+import { executeCommand, listCommands } from './commands.js'
 import { streamSSE } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
@@ -110,6 +110,11 @@ app.post('/api/conversations/:id/commands', async (c) => {
   const result = await executeCommand(body.input, { conversationId, db: getDb() })
   return c.json(result)
 })
+
+// The slash-command catalog (name/aliases/description/usage) for the web client's autocomplete.
+// Static and conversation-independent — derived from the backend command registry so the
+// suggestions match what POST /commands will actually dispatch.
+app.get('/api/commands', (c) => c.json({ commands: listCommands() }))
 
 // Upload a single image into the conversation's workspace. Multipart, parsed via Hono's
 // c.req.parseBody() (no extra dep). The mime type must be an accepted image type and the
