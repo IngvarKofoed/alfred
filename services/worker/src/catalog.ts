@@ -3,20 +3,22 @@ import { getDb, tools as toolsTable } from '@alfred/db'
 import { sql } from 'drizzle-orm'
 import { getBridge } from './browser/bridge.js'
 import { makeBrowserTools } from './browser/tools.js'
+import { makePythonTools } from './python/tools.js'
 import { makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
 // state), so build them once at module load rather than per run.
 const BROWSER_TOOLS = makeBrowserTools(getBridge())
 
-// The full toolset for a run. The conversation-bound tools (title, file tools) are rebuilt
-// per call; echo, generate_image, and the browser tools carry no per-conversation state.
+// The full toolset for a run. The conversation-bound tools (title, file, python tools) are
+// rebuilt per call; echo, generate_image, and the browser tools carry no per-conversation state.
 export function buildRunTools(conversationId: string): Tool[] {
   return [
     echoTool,
     makeSetTitleTool(conversationId),
     makeGenerateImageTool(),
     ...makeFileTools(conversationId),
+    ...makePythonTools(conversationId),
     ...BROWSER_TOOLS,
   ]
 }

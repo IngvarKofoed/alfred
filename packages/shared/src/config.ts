@@ -49,6 +49,14 @@ const schema = z.object({
   // off Postgres (ARCHITECTURE §6.5). Resolved via resolveInWorkspace, which confines every
   // path under one conversation's dir.
   WORKSPACE_ROOT: z.string().default('./data/conversations'),
+  // Interpreter used to create the shared venv for the worker's Python tools (run_python /
+  // pip_install). Per-OS default: the python.org installer registers `python` on Windows,
+  // while POSIX systems conventionally ship `python3`.
+  PYTHON_BIN: z.string().default(process.platform === 'win32' ? 'python' : 'python3'),
+  // The shared venv backing run_python/pip_install (one venv across conversations, created
+  // lazily on first use). Like WORKSPACE_ROOT, a relative value is anchored at the repo
+  // root, not process.cwd().
+  PYTHON_VENV_DIR: z.string().default('./data/python-venv'),
   // Auto-deploy updater (services/updater) — only that process reads these. DEPLOY_ENABLED is
   // parsed explicitly (not z.coerce.boolean(), which coerces the string "false" to true).
   DEPLOY_ENABLED: z.string().default('false').transform((v) => v.toLowerCase() === 'true'),
@@ -68,13 +76,16 @@ export function loadConfig(): Config {
     console.error('Invalid configuration:\n' + parsed.error.toString())
     process.exit(1)
   }
-  // Anchor a relative WORKSPACE_ROOT at the repo root, not process.cwd() — otherwise the
-  // worker (cwd services/worker) and webserver (cwd services/webserver) resolve it to
-  // different physical dirs, and an image one writes the other can't serve. An absolute
-  // override is honored as-is.
+  // Anchor relative cross-process paths (WORKSPACE_ROOT, PYTHON_VENV_DIR) at the repo root,
+  // not process.cwd() — otherwise the worker (cwd services/worker) and webserver (cwd
+  // services/webserver) resolve them to different physical dirs, and an image one writes the
+  // other can't serve. An absolute override is honored as-is.
   const data = parsed.data
   if (!path.isAbsolute(data.WORKSPACE_ROOT)) {
     data.WORKSPACE_ROOT = path.resolve(findRepoRoot() ?? process.cwd(), data.WORKSPACE_ROOT)
+  }
+  if (!path.isAbsolute(data.PYTHON_VENV_DIR)) {
+    data.PYTHON_VENV_DIR = path.resolve(findRepoRoot() ?? process.cwd(), data.PYTHON_VENV_DIR)
   }
   cached = data
   return cached

@@ -136,7 +136,7 @@ The `memory_facts` table exists from day one with an unused `embedding` column �
 | Chrome browser profile | Where the OS puts it; backed up separately | Owned by Chrome, not us |
 | LLM request/response + traces | `llm_calls` table, rolled up onto `agent_runs` | In-house observability on `/debug`; replaces Langfuse (§17) |
 
-**Attachment storage — per-conversation workspaces (built).** The flat `data/attachments/` is superseded by a **per-conversation working directory** `data/conversations/<conversation_id>/` — the foundation for file-bearing capabilities (images now; code execution later). Files are referenced by a path *relative to that directory* (a movable, deletable unit), and all access goes through one `resolveInWorkspace(conversationId, relPath)` confinement helper (rejects absolute/`..`/symlink-outs), centralized so a future shared scope is a root swap, not a rewrite. `messages.content` stores the reference (`{ type:'image', path, mimeType }`); the worker bridges it to the inline-base64 the model needs — Postgres/NOTIFY never carry image bytes. Spec: `docs/specs/2026-06-05-conversation-workspace-and-images.md`.
+**Attachment storage — per-conversation workspaces (built).** The flat `data/attachments/` is superseded by a **per-conversation working directory** `data/conversations/<conversation_id>/` — the foundation for file-bearing capabilities (images and Python execution now, §7.3). Files are referenced by a path *relative to that directory* (a movable, deletable unit), and all access goes through one `resolveInWorkspace(conversationId, relPath)` confinement helper (rejects absolute/`..`/symlink-outs), centralized so a future shared scope is a root swap, not a rewrite. `messages.content` stores the reference (`{ type:'image', path, mimeType }`); the worker bridges it to the inline-base64 the model needs — Postgres/NOTIFY never carry image bytes. Spec: `docs/specs/2026-06-05-conversation-workspace-and-images.md`.
 
 ---
 
@@ -190,7 +190,7 @@ interface Tool {
 Tools come from two sources, both adapted to this interface:
 
 - **MCP-sourced tools** — the agent core opens MCP client connections (stdio for short-lived subprocess servers, HTTP+SSE for long-running ones) at startup and converts each `tools/list` into `Tool`s whose `invoke` proxies via `tools/call`. The loop never sees MCP. *None exist yet* — the browser is **not** MCP-sourced (it's built-in tools over the embedded bridge, §8).
-- **Built-in tools** — `Tool` directly inside `agent-core` or the worker: trivial utilities (`echo`, `set_conversation_title`), the browser tools (§8), and the image/file tools — `generate_image` plus a workspace-confined `list_files`/`read_file`/`write_file` trio (§6.5). *Planned, not yet built:* **`ask_user`**, whose `invoke()` *would* create a `user_interactions` row of kind `question`, pause the run, and resume on response (the agent would call it like any tool; §6.1 has the shape). The DB column allows `kind='question'`, but nothing references `ask_user` today — the `question` pause path is reserved, not wired (§6.2).
+- **Built-in tools** — `Tool` directly inside `agent-core` or the worker: trivial utilities (`echo`, `set_conversation_title`), the browser tools (§8), the image/file tools — `generate_image` plus a workspace-confined `list_files`/`read_file`/`write_file` trio (§6.5) — and the Python tools — `run_python`/`pip_install` over a shared lazily-created venv, cwd = the conversation workspace, group `python` (spec `docs/specs/2026-06-10-python-execution-sandbox.md`). *Planned, not yet built:* **`ask_user`**, whose `invoke()` *would* create a `user_interactions` row of kind `question`, pause the run, and resume on response (the agent would call it like any tool; §6.1 has the shape). The DB column allows `kind='question'`, but nothing references `ask_user` today — the `question` pause path is reserved, not wired (§6.2).
 
 So: a rich integration = spin up an MCP server (auto-discovered); a tiny utility = a built-in `Tool`; swapping one for the other is invisible to the loop.
 
@@ -310,7 +310,7 @@ No conversation-*list* route yet — the client opens a single conversation by i
 
 ## 13. Configuration & Secrets
 
-**Moved to `docs/DEPLOYMENT.md`** (§13, incl. §13.1–§13.4). In brief: three layers (code defaults → `.env` zod-validated at boot → post-MVP DB runtime config). Secrets live in `.env` at the repo root (mode `0600`, gitignored), never in the DB; the built keys are `WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT` (§13.1).
+**Moved to `docs/DEPLOYMENT.md`** (§13, incl. §13.1–§13.4). In brief: three layers (code defaults → `.env` zod-validated at boot → post-MVP DB runtime config). Secrets live in `.env` at the repo root (mode `0600`, gitignored), never in the DB; the built keys are `WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR` (§13.1).
 
 ---
 

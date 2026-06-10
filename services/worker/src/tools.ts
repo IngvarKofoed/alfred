@@ -4,6 +4,7 @@ import { type ImageToolResult, type Tool, type ToolContext } from '@alfred/agent
 import { conversations, getDb } from '@alfred/db'
 import { imageMimeForExt, resolveInWorkspace } from '@alfred/shared'
 import { eq } from 'drizzle-orm'
+import { capResult } from './cap.js'
 import { DEFAULT_IMAGE_MODEL, imageModelChoices, resolveImageProvider } from './images-registry.js'
 
 // A context-bound built-in tool (ARCHITECTURE §7.3): it acts on a specific
@@ -137,7 +138,9 @@ export function makeFileTools(conversationId: string): Tool[] {
           const out: ImageToolResult = { image: { mimeType, data }, summary: relPath }
           return out
         }
-        return { path: relPath, content: fs.readFileSync(abs, 'utf8') }
+        // Same 100k cap as the browser/python tools — run_python can now write arbitrarily
+        // large files, and an uncapped read would flood the model context.
+        return { path: relPath, content: capResult(fs.readFileSync(abs, 'utf8')) }
       },
     },
     {

@@ -27,7 +27,9 @@ const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
 const SYSTEM_PROMPT =
   'You are Alfred, a helpful personal assistant. Be concise and direct. ' +
   'Images you create with generate_image are shown to the user automatically; ' +
-  "don't thank the user for them or describe them back unless asked."
+  "don't thank the user for them or describe them back unless asked. " +
+  "You can run Python in this conversation's working directory with run_python (the same directory " +
+  'the file tools use) and install packages with pip_install.'
 
 export interface RunDeps {
   provider?: LlmProvider
@@ -342,7 +344,7 @@ async function requestApproval(
         // Group calls render a task-scoped card: approving covers every action in the
         // group for the rest of the run, not just the one triggering call (§16).
         summary: call.group
-          ? `Allow Alfred to use the ${call.group} for this task? Approving covers all ${call.group} actions until this run finishes.`
+          ? `Allow Alfred to use its ${call.group} tools for this task? Approving covers all ${call.group} actions until this run finishes.`
           : 'Run ' + call.name,
         tool: call.name,
         args: call.args,
