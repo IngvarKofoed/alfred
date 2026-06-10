@@ -16,6 +16,8 @@ When your work touches the worker, the agent loop, the interaction/approval flow
 
 When your work touches a post-MVP ingress (Discord, voice, or autonomous triggers), also read **@docs/INGRESSES.md** — the detail for ARCHITECTURE §9.2–9.4, split out for the same reason (§9.1, the built web ingress, stays in ARCHITECTURE).
 
+When your work touches deployment, hosting, process supervision, configuration/secrets, or the repo layout, also read **@docs/DEPLOYMENT.md** — the operational reference for ARCHITECTURE §3 (home server), §4 (deployment & OS), §5 (process topology), §13 (configuration & secrets), and §14 (project structure), split out for the same reason.
+
 `CONCEPT.md` and `ARCHITECTURE.md` are the source of truth for *what* we're building, what we've built, and *how* it's structured. If something in the code contradicts them, either the code or the doc is wrong — flag it rather than guessing.
 
 ## Changelog discipline

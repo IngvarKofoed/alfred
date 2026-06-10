@@ -1,6 +1,6 @@
 # Alfred — clients/ios/
 
-The native iOS app (post-MVP): the only voice surface — chat + hands-free voice with on-device wake word. See `docs/ARCHITECTURE.md` §9.3 (voice pipeline) and §14.2 (polyglot handling) for context.
+The native iOS app (post-MVP): the only voice surface — chat + hands-free voice with on-device wake word. See `docs/INGRESSES.md` §9.3 (voice pipeline) and `docs/DEPLOYMENT.md` §14.2 (polyglot handling) for context.
 
 Contents: Swift + SPM, opened via `Alfred.xcworkspace`. **Not** a pnpm workspace member — its toolchain is entirely separate from the Node/TS stack; `pnpm install` from the root ignores it.
 

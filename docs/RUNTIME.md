@@ -84,7 +84,7 @@ Ingress                  Worker                       LLM provider
 
 ### 10.2 Interaction protocol
 
-The agent needs the user — either a `write`/`destructive` tool call (runtime-injected approval) or an explicit `ask_user` invocation (agent-initiated question). The mechanics are identical past the trigger.
+The agent needs the user — either a `write`/`destructive` tool call (runtime-injected approval) or an explicit `ask_user` invocation (agent-initiated question). The mechanics are identical past the trigger. *Built today: only the approval trigger.* The `ask_user`/question path is reserved, not wired (§7.3), so the question-specific steps below (and the `ask_user` tool_result resume) describe the intended shape, not current behaviour.
 
 **Worker side**, on hitting a paused state:
 
@@ -120,7 +120,7 @@ NOTIFY broadcasts to all subscribers, so a question raised during a Discord conv
 
 ### 10.4 Timeouts
 
-Interactions don't block forever. MVP default: **24h** for both approvals and questions. Configurable per-tool via the Tool interface. The timer is in-process; if the worker crashes the timer is lost — but so is the run (swept to `failed` on restart, §10.5), so there is nothing to leak.
+Interactions don't block forever. **MVP default: 1h** for the approval pause — a single `APPROVAL_TIMEOUT_MS` constant in `services/worker/src/run.ts`, deliberately shortened from the originally-planned 24h (the pg-boss job expiration sits just above it at 4500s so a parked worker outlives the timeout, §6.3). Per-tool configurability and a distinct question timeout are *intended, not yet built* — it's one constant today, and the `ask_user` question path isn't wired (§7.3). The timer is in-process; if the worker crashes the timer is lost — but so is the run (swept to `failed` on restart, §10.5), so there is nothing to leak.
 
 The worker registers a `setTimeout` alongside the LISTEN. On fire:
 
@@ -139,6 +139,8 @@ A worker dies (OOM, deploy, host reboot). This system does **not** reconstruct i
 The one accepted residue: if the crash lands *after* a side-effecting tool executed but *before* its result was recorded, a manual re-issue could repeat the action. The owner knows the restart happened, and `write`/`destructive` actions are approval-gated (§16) regardless — acceptable for a single-user system.
 
 ### 10.6 User-initiated cancellation
+
+> **Planned, not yet built.** There is no cancel route on the webserver, the worker never re-checks `agent_runs.status` mid-run, and `runAgent` is invoked without an `AbortSignal` (`run.ts`). The `cancelled` `RunEvent` (§6.2) and the `cancelled` state-machine transitions (§10.9) are reserved for this flow, but nothing emits them today (the web client only handles a `cancelled` event defensively). The design below is the intended shape.
 
 User clicks "stop" in the UI, types `/cancel` in Discord, or says "stop" to voice.
 
@@ -170,7 +172,7 @@ With fail-and-restart (§7.6, §10.5) there is no mid-run resume, so the elabora
 
 ### 10.9 State machines & invariants
 
-The three status columns (§6.1) are the correctness core of the system; every flow in §10.1–§10.8 is a transition between these states. Stating the legal transitions in one place — rather than scattering them across prose — is what catches the failure-path bugs (cancel-during-pause, timeout racing a response, restart cascade). All status writes go through a single transition guard in the worker that rejects illegal transitions; each illegal transition and each invariant below becomes a test (deferred to the worker build, §15 step 3).
+The three status columns (§6.1) are the correctness core of the system; every flow in §10.1–§10.8 is a transition between these states. Stating the legal transitions in one place — rather than scattering them across prose — is what catches the failure-path bugs (cancel-during-pause, timeout racing a response, restart cascade). *Intended, not yet built:* a single transition guard in the worker that all status writes route through, rejecting illegal transitions, with each illegal transition and invariant below as a test. **Today there is no guard** — `run.ts` and `boss.ts` write `status` directly (the writes are believed legal, but nothing enforces it). The tables below are therefore the *specification* the code is expected to honour, and the target for that guard when it lands (§15 step 3). *(Note: `services/CLAUDE.md` still instructs writes to "go through the single transition guard" — aspirational until the guard exists.)*
 
 **`agent_runs.status`**
 
@@ -245,7 +247,7 @@ An agent with browser access to the owner's email, banking, and messaging accoun
 - **The trust tier is the *default*, owner-overridable per tool.** The tier (above) decides whether a tool asks by default; the owner can override that per tool from the web **Tools page**, persisted in the `tools` table (`require_approval`, a tri-state — `null` = tier default, `true` = always ask, `false` = never ask). The worker reads these per run to build its approval predicate. The catalog the page lists is published to the `tools` table by the worker at boot from its live tools (so it can't drift, and covers MCP tools too). Within a run, an *enabled* gate still gets the group-scoped approval treatment (first prompt, rest auto-approved).
 - **Destructive actions** (sending money, mass-delete, "send to all") require approval by default. **This is now an owner-overridable default, not a hard invariant** (a deliberate change from the original "always require approval, regardless"): the owner may disable approval even for a `destructive` tool from the Tools page, the owner's box and the owner's risk. The web UI's one guard rail is a confirm prompt before disabling approval on a destructive tool; the worker and API enforce no destructive-specific lock.
 - **Per-integration scoping**: the Gmail tool exposes `read`/`draft`/`label` as `read`-tier and `send` as `write`-tier — same MCP server, different per-tool tiers.
-- **Same machinery, different trigger**: structured questions (agent calls `ask_user`) use the same `user_interactions` table and ingress surfacing as approvals. One UI/Discord/voice flow handles both — easier to make robust, easier to reason about.
+- **Same machinery, different trigger** *(approvals built; questions planned)*: structured questions (agent calls `ask_user`) are *designed* to reuse the same `user_interactions` table and ingress surfacing as approvals — one flow for both. Only the approval trigger is wired today; `ask_user` is not yet built (§7.3).
 - **Auditable trail**: every tool invocation logged in `tool_calls`; every owner decision logged in `user_interactions` with timestamp and ingress used. Together they are the audit log.
 - **Trust tiers are owner-assigned, never server-declared.** Built-in tools declare their tier in code (§7.3); MCP-sourced tools are config-mapped with a safe default — the system never trusts an MCP server's own claim about how dangerous its tools are. A compromised or careless server cannot self-promote to `read`.
 - **Per-tool tiers gate *semantic* tools, not the browser.** Trust-tier approval works for semantic tools whose name *is* the intent — a future Gmail `send` is `write`, so it pauses for ✅. It is **insufficient for the browser**: its primitives (`click`/`type`) are mechanical, and the danger lives in the *page*, not the tool. Gating `click` as `read` is unsafe (one click can send money); gating it `destructive` means approving every click — approval fatigue, and the card can't show real intent. So the browser is **not** contained by per-click tiers.

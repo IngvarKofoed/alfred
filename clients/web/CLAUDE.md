@@ -2,7 +2,7 @@
 
 The chat PWA: a single-page, chat-only web client behind Tailscale auth. See `docs/ARCHITECTURE.md` §11 (web frontend) and §9.1 (webserver API/SSE) for context. No voice here — voice lives only in the native app (§9.3).
 
-Contents: Vite + React + TypeScript SPA. Tailwind + shadcn/ui, `@ai-sdk/react` (`useChat`) for SSE streaming, TanStack Query for non-chat server state, react-router, `vite-plugin-pwa`.
+Contents: Vite + React + TypeScript SPA. Tailwind v4 with hand-rolled components (shadcn/Radix *not adopted* — too small to earn it); SSE streaming via a hand-rolled `EventSource` (no `@ai-sdk/react`); chat state in plain `useState`, non-chat fetches via plain `fetch` (no TanStack Query); `react-router-dom`; self-hosted Hanken Grotesk (no CDN). PWA (`vite-plugin-pwa`) is planned but **not yet installed** — a plain HTTPS SPA today (§11).
 
 ## Required tools
 
