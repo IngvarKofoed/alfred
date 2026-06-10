@@ -10,6 +10,11 @@ export interface Tool {
   // group-scoped approval and (later) per-conversation tool exposure (ARCHITECTURE §7.5/§16).
   // Ungrouped tools are each their own implicit group of one.
   group?: string
+  // True if the tool pauses mid-invoke for owner input (e.g. ask_user raises a question and
+  // blocks). The loop ignores it; the worker uses it to record the tool_calls row as 'pending'
+  // so it can legally transition pending → awaiting_user → done (§10.9), rather than the
+  // read-tier "starts running" shortcut. Generic so a second pausing tool needs no name check.
+  pausesForInput?: boolean
   // `ctx` is optional and backward-compatible: tools that make AI calls of their own (e.g.
   // generate_image) use ctx.recordLlmCall to attribute that cost; plain tools ignore it.
   invoke(args: unknown, ctx?: ToolContext): Promise<unknown>
@@ -34,6 +39,9 @@ export interface ToolLlmCall {
 // persists each as an llm_calls row linked to the originating tool_call (ARCHITECTURE §6.5).
 export interface ToolContext {
   recordLlmCall(call: ToolLlmCall): void | Promise<void>
+  // The agent-core call id of this invocation; a tool uses it to correlate to its own
+  // tool_calls row (e.g. ask_user flips that row to awaiting_user while it pauses).
+  callId?: string
 }
 
 // The single built-in tool for the skeleton: enough to exercise a full tool-call

@@ -13,6 +13,9 @@ export interface ApprovalRequest {
   // Copied from the resolved Tool. The loop carries it through but acts on it nowhere — the
   // worker's approval gate uses it for group-scoped approval (ARCHITECTURE §16).
   group?: string
+  // Copied from the resolved Tool; the loop carries it through but acts on it nowhere — the
+  // worker uses it to record a pausing tool's row as 'pending' (§10.9, e.g. ask_user).
+  pausesForInput?: boolean
 }
 
 // The owner's decision on a pending approval. `note` is an optional reason, surfaced
@@ -83,7 +86,14 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
     for (const tc of toolCalls) {
       const tool = toolsByName.get(tc.name)
       const trustTier = tool?.trustTier ?? 'read'
-      const call: ApprovalRequest = { id: tc.id, name: tc.name, args: tc.args, trustTier, group: tool?.group }
+      const call: ApprovalRequest = {
+        id: tc.id,
+        name: tc.name,
+        args: tc.args,
+        trustTier,
+        group: tool?.group,
+        pausesForInput: tool?.pausesForInput,
+      }
 
       await opts.onToolStart?.(call)
 
@@ -101,7 +111,7 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
 
       try {
         const result = tool
-          ? await tool.invoke(tc.args, { recordLlmCall: (call) => opts.onToolLlmCall?.(tc.id, call) })
+          ? await tool.invoke(tc.args, { callId: tc.id, recordLlmCall: (call) => opts.onToolLlmCall?.(tc.id, call) })
           : { error: `unknown tool: ${tc.name}` }
         if (isImageResult(result)) {
           // Gemini's functionResponse can't carry an image, so the tool_result holds a text

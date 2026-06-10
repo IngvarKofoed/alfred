@@ -4,19 +4,27 @@ import { sql } from 'drizzle-orm'
 import { getBridge } from './browser/bridge.js'
 import { makeBrowserTools } from './browser/tools.js'
 import { makePythonTools } from './python/tools.js'
-import { makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
+import { makeAskUserTool, makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
 // state), so build them once at module load rather than per run.
 const BROWSER_TOOLS = makeBrowserTools(getBridge())
 
-// The full toolset for a run. The conversation-bound tools (title, file, python tools) are
+// ask_user's pause is run-bound (it closes over db + run + toolCallRowIds). toolCatalog()
+// only reads metadata, so it passes no pause — this stub stands in and is never invoked.
+const askUserPauseStub = () => Promise.reject(new Error('ask_user pause not bound'))
+
+// The full toolset for a run. The conversation-bound tools (title, file, python, ask_user) are
 // rebuilt per call; echo, generate_image, and the browser tools carry no per-conversation state.
-export function buildRunTools(conversationId: string): Tool[] {
+export function buildRunTools(
+  conversationId: string,
+  askUserPause?: (callId: string, prompt: unknown) => Promise<unknown>,
+): Tool[] {
   return [
     echoTool,
     makeSetTitleTool(conversationId),
     makeGenerateImageTool(),
+    makeAskUserTool(askUserPause ?? askUserPauseStub),
     ...makeFileTools(conversationId),
     ...makePythonTools(conversationId),
     ...BROWSER_TOOLS,

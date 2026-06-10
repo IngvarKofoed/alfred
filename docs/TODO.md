@@ -1,6 +1,13 @@
 - [x] Auto update harnes
 - [x] Debug page should be per conversation — reworked into a Conversation → Run → LLM-call/tool ledger (rail with run-status sparkline + token/cost totals, lazy-loaded per-run detail). (CHANGELOG 49)
-- [ ] Agent generated code running in the context of the tools.
+- [ ] Agent generated code running in the context of the tools. — capability authoring: let Alfred write reusable scripts/skills (over the Python sandbox + workspace) that call other tools and can be re-invoked by name; the seed of self-extension.
+- [ ] Discord bot (build-order step 6) — second ingress over the same conversations/runs, proving "one Alfred, many surfaces, shared memory"; reactions as the approval UI.
+- [x] Wire up `ask_user` / the question pause path — built-in tool creating a `kind='question'` interaction, reusing the existing approval machinery (§7.3/§10.2). Lets Alfred ask the owner structured questions mid-run. (CHANGELOG 59; question-card "Other" free-text fix CHANGELOG 60)
+- [ ] Conversation list / history view in the web client — no list route yet (§9.1); the client opens a single conversation by id with no way to browse past ones.
+- [ ] LLM retry/backoff (§10.7) — provider-level exponential backoff (1/2/4/8s, 4 attempts → `llm_unavailable`); today a transient 429/5xx kills the run immediately.
+- [ ] User-initiated cancellation (§10.6) — cancel route + `AbortSignal` into `runAgent` + mid-run status check; the `cancelled` event/transitions are reserved but nothing emits them.
+- [ ] Backup strategy (§17) — scheduled `pg_dump` + Chrome profile + `.env` + workspaces off-box (tailnet NAS or encrypted bucket), reusing the updater's process pattern. Before anything irreplaceable lands.
+- [ ] Morning-briefing trigger — first autonomous trigger (§9.4) end-to-end as a single vertical slice (cron → enqueue a `human_in_loop=false` run → read inbox → push a summary), exercising the §7.7 autonomous seams on one concrete job.
 - [x] Python execution sandbox — run_python + pip_install over a shared lazily-created venv, cwd = the conversation workspace, approval-gated as group 'python'. (CHANGELOG 57)
 - [x] Persist approval accross restarts — "Don't ask again" on the approval card persists into tools.require_approval (same store as the Tools page); + sweep bugfix for zombie awaiting_approval runs. (CHANGELOG 43)
 - [x] Tool usage is hidden while its happening in web app, I think we should show this

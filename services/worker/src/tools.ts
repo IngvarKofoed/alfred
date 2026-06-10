@@ -31,6 +31,87 @@ export function makeSetTitleTool(conversationId: string): Tool {
   }
 }
 
+// ask_user: the agent asks the owner a structured question mid-run and blocks on the answer
+// (§7.3, §10.2). `pause` is the run-bound function from run.ts that raises a question
+// interaction and waits for the resolution; this tool just validates + shapes the prompt and
+// returns whatever pause gives back. read-tier — asking is not side-effecting, so it must not
+// itself trigger an approval card before the question.
+export function makeAskUserTool(pause: (callId: string, prompt: unknown) => Promise<unknown>): Tool {
+  return {
+    name: 'ask_user',
+    description:
+      'Ask the user a structured question and wait for their answer. Use when you need a ' +
+      'decision or missing information to proceed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question to ask the user.' },
+        options: {
+          type: 'array',
+          description: 'Optional answer choices for the user to pick from.',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'The choice text.' },
+              description: { type: 'string', description: 'Optional clarifying detail.' },
+            },
+            required: ['label'],
+          },
+        },
+        multi_select: { type: 'boolean', description: 'Allow selecting more than one option (default false).' },
+        allow_freeform: {
+          type: 'boolean',
+          description: 'Allow a free-text answer (default true); pass false to constrain to options.',
+        },
+      },
+      required: ['question'],
+    },
+    trustTier: 'read',
+    // Pauses mid-invoke to wait for the owner's answer, so the worker records its tool_calls
+    // row as 'pending' (pending → awaiting_user → done, §10.9), not the read-tier shortcut.
+    pausesForInput: true,
+    async invoke(args: unknown, ctx?: ToolContext): Promise<unknown> {
+      const {
+        question: rawQuestion,
+        options: rawOptions,
+        multi_select,
+        allow_freeform,
+      } = (args ?? {}) as {
+        question?: unknown
+        options?: unknown
+        multi_select?: unknown
+        allow_freeform?: unknown
+      }
+      const question = String(rawQuestion ?? '')
+      if (!question) throw new Error('ask_user requires a non-empty question')
+
+      let options: { label: string; description?: string }[] | undefined
+      if (rawOptions != null) {
+        if (!Array.isArray(rawOptions)) throw new Error('ask_user options must be an array')
+        options = rawOptions.map((o) => {
+          const { label, description } = (o ?? {}) as { label?: unknown; description?: unknown }
+          const labelStr = String(label ?? '')
+          if (!labelStr) throw new Error('ask_user options each require a non-empty label')
+          return description != null ? { label: labelStr, description: String(description) } : { label: labelStr }
+        })
+      }
+
+      // The DATABASE.md question prompt shape.
+      const prompt = {
+        question,
+        options,
+        multi_select: multi_select === true,
+        allow_freeform: allow_freeform !== false,
+      }
+      // callId is always supplied by the loop (ToolContext.callId = the call id); assert it
+      // rather than defaulting, so the tool_calls row is reliably linked for the awaiting_user
+      // flip (invariant 2, §10.9) instead of silently passing an unmatchable empty id.
+      if (!ctx?.callId) throw new Error('ask_user requires ctx.callId from the agent loop')
+      return await pause(ctx.callId, prompt)
+    },
+  }
+}
+
 // The image-model choices, read once from the registry (so they can't drift from what's
 // wired). Both the `model` enum (ids) and its description — one line per id, since JSON-schema
 // enum has no per-value docs — derive from this single list.

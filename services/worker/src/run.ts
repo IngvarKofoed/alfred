@@ -88,9 +88,31 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       })
     })
 
+    // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval /
+    // ask_user can update the row the loop is talking about. Built before the toolset so
+    // ask_user's pause can resolve its own row from the call id (invariant 2, §10.9).
+    const toolCallRowIds = new Map<string, string>()
+
+    // ask_user's run-bound pause (§7.3, §10.2): the agent calls ask_user, which calls this to
+    // raise a question interaction and block until the owner answers (or it times out). Maps
+    // the resolved user_interactions.response to the tool result the model sees.
+    const askUserPause = async (callId: string, prompt: unknown): Promise<unknown> => {
+      const response = (await awaitInteraction(db, {
+        conversationId: run.conversationId,
+        runId,
+        toolCallId: toolCallRowIds.get(callId) ?? null,
+        kind: 'question',
+        prompt,
+      })) as { selected_labels?: string[]; freeform_text?: string } | null
+      // null/timeout ⇒ an error-shaped result so the model sees the question went unanswered
+      // rather than mistaking it for an empty selection.
+      if (!response) return { error: 'no_answer', note: 'question timed out' }
+      return { selected_labels: response.selected_labels ?? [], freeform_text: response.freeform_text }
+    }
+
     // The full toolset for this run (echo + the context-bound title tool + the browser
     // tools), assembled in one place so the boot catalog publish can't drift from it.
-    const tools = buildRunTools(run.conversationId)
+    const tools = buildRunTools(run.conversationId, askUserPause)
 
     // The owner's per-tool approval overrides (the tools page, §16), loaded once per run.
     // require_approval is a tri-state: null/absent ⇒ fall back to the trust-tier default.
@@ -100,10 +122,6 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     const approvalOverrides = new Map(overrideRows.map((r) => [r.name, r.requireApproval]))
     const requiresApproval = (call: ApprovalRequest): boolean =>
       approvalOverrides.get(call.name) ?? call.trustTier !== 'read'
-
-    // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval
-    // can update the row the loop is talking about.
-    const toolCallRowIds = new Map<string, string>()
 
     // When a tool returns an image, the loop puts the inline base64 on an `image` part of the
     // tool turn (so the model sees it this turn) but Postgres must stay blob-free. onToolEnd
@@ -137,8 +155,11 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
             trustTier: call.trustTier,
             // 'pending' if it will pause for approval, else 'running' (it runs immediately).
             // Mirrors the same predicate the loop gates on, so an owner-disabled gate (the
-            // tools page) isn't recorded as a misleading 'pending'.
-            status: requiresApproval(call) ? 'pending' : 'running',
+            // tools page) isn't recorded as a misleading 'pending'. A pausesForInput tool
+            // (e.g. ask_user) also starts 'pending': it pauses on its own (question, §10.2),
+            // so it walks the §10.9-sanctioned pending -> awaiting_user -> done path even
+            // though it's read-tier.
+            status: requiresApproval(call) || call.pausesForInput ? 'pending' : 'running',
             startedAt: new Date(),
           })
           .returning({ id: toolCalls.id })
@@ -312,18 +333,22 @@ async function rollupUsage(db: ReturnType<typeof getDb>, runId: string) {
   }
 }
 
-// The approval gate (§10.2–§10.4, §16). For a write/destructive call: persist the
-// interaction, surface it over NOTIFY, and BLOCK on a dedicated LISTEN until the owner
-// resolves it (or a 1h timeout flips it to timed_out). No durable resume — a crash
-// sweeps the run to failed on startup (§7.6).
-async function requestApproval(
+// The generic pause-for-user mechanism (§10.2–§10.4): persist a user_interactions row of the
+// given kind/prompt, surface it over NOTIFY, and BLOCK on a dedicated LISTEN until the owner
+// resolves it (or a 1h timeout flips it to timed_out). Returns the resolved row's `response`
+// (raw — null on timeout). No durable resume — a crash sweeps the run to failed on startup
+// (§7.6). Both the approval gate and ask_user's question pause are thin callers of this.
+async function awaitInteraction(
   db: ReturnType<typeof getDb>,
-  conversationId: string,
-  runId: string,
-  toolCallRowIds: Map<string, string>,
-  call: ApprovalRequest,
-): Promise<ApprovalVerdict> {
-  const toolCallId = toolCallRowIds.get(call.id) ?? null
+  args: {
+    conversationId: string
+    runId: string
+    toolCallId: string | null
+    kind: 'approval' | 'question'
+    prompt: unknown
+  },
+): Promise<unknown> {
+  const { conversationId, runId, toolCallId, kind, prompt } = args
 
   // (a) the tool_call is now waiting on the user.
   if (toolCallId) {
@@ -333,39 +358,29 @@ async function requestApproval(
       .where(eq(toolCalls.id, toolCallId))
   }
 
-  // (b) record the pending interaction (the approval card the client renders).
+  // (b) record the pending interaction (the card the client renders).
   const [interaction] = await db
     .insert(userInteractions)
     .values({
       agentRunId: runId,
       toolCallId,
-      kind: 'approval',
-      prompt: {
-        // Group calls render a task-scoped card: approving covers every action in the
-        // group for the rest of the run, not just the one triggering call (§16).
-        summary: call.group
-          ? `Allow Alfred to use its ${call.group} tools for this task? Approving covers all ${call.group} actions until this run finishes.`
-          : 'Run ' + call.name,
-        tool: call.name,
-        args: call.args,
-        trust_tier: call.trustTier,
-        scope: call.group ? 'group' : 'call',
-      },
+      kind,
+      prompt,
       status: 'pending',
     })
     .returning({ id: userInteractions.id })
   const interactionId = interaction!.id
 
-  // (c) the run is parked awaiting approval; (d) tell the client.
+  // (c) the run is parked awaiting input; (d) tell the client.
   await db
     .update(agentRuns)
     .set({ status: 'awaiting_approval' })
     .where(eq(agentRuns.id, runId))
-  await notifyRun(conversationId, { type: 'interaction_required', interactionId, kind: 'approval' })
+  await notifyRun(conversationId, { type: 'interaction_required', interactionId, kind })
 
   // (e) block until resolved on a dedicated LISTEN connection.
   const { POSTGRES_URL } = loadConfig()
-  if (!POSTGRES_URL) throw new Error('POSTGRES_URL is not set — required to await approval')
+  if (!POSTGRES_URL) throw new Error('POSTGRES_URL is not set — required to await interaction')
   const client = new pg.Client({ connectionString: POSTGRES_URL })
   await client.connect()
 
@@ -414,17 +429,46 @@ async function requestApproval(
     await client.end().catch(() => {})
   }
 
-  // (f) read the verdict, resume the run, return it.
+  // (f) read the response, resume the run, return it (null on timeout).
   const [resolved] = await db
     .select({ response: userInteractions.response })
     .from(userInteractions)
     .where(eq(userInteractions.id, interactionId))
-  const response = resolved?.response as { approved?: boolean; note?: string } | null
-  const verdict: ApprovalVerdict = response?.approved
-    ? { approved: true, note: response.note }
-    : { approved: false, note: response?.note }
 
   await db.update(agentRuns).set({ status: 'running' }).where(eq(agentRuns.id, runId))
 
-  return verdict
+  return resolved?.response ?? null
+}
+
+// The approval gate (§10.2–§10.4, §16). A thin caller of awaitInteraction: build the approval
+// prompt (group vs call summary + scope), pause with kind='approval', map the resolved
+// response to an ApprovalVerdict (null/absent ⇒ not approved).
+async function requestApproval(
+  db: ReturnType<typeof getDb>,
+  conversationId: string,
+  runId: string,
+  toolCallRowIds: Map<string, string>,
+  call: ApprovalRequest,
+): Promise<ApprovalVerdict> {
+  const prompt = {
+    // Group calls render a task-scoped card: approving covers every action in the
+    // group for the rest of the run, not just the one triggering call (§16).
+    summary: call.group
+      ? `Allow Alfred to use its ${call.group} tools for this task? Approving covers all ${call.group} actions until this run finishes.`
+      : 'Run ' + call.name,
+    tool: call.name,
+    args: call.args,
+    trust_tier: call.trustTier,
+    scope: call.group ? 'group' : 'call',
+  }
+  const response = (await awaitInteraction(db, {
+    conversationId,
+    runId,
+    toolCallId: toolCallRowIds.get(call.id) ?? null,
+    kind: 'approval',
+    prompt,
+  })) as { approved?: boolean; note?: string } | null
+  return response?.approved
+    ? { approved: true, note: response.note }
+    : { approved: false, note: response?.note }
 }

@@ -13,7 +13,7 @@ import {
 } from '@alfred/db'
 import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
 import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { executeCommand, listCommands } from './commands.js'
 import { streamSSE } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
@@ -252,11 +252,33 @@ app.get('/api/interactions/:id', async (c) => {
 })
 
 // Resolve an interaction (first-writer-wins): the conditional UPDATE only matches a
-// still-pending row, so a second resolver (or a timeout) loses -> 409.
+// still-pending row, so a second resolver (or a timeout) loses -> 409. The body shape
+// depends on the interaction's kind — an approval verdict { approved, note } or a question
+// answer { selected_labels, freeform_text } — so we read the row's kind first. This pre-read
+// is REQUIRED, not foldable into the UPDATE's RETURNING: the validation and the response we
+// write both depend on kind, so kind must be known before the write. It's non-authoritative
+// (the conditional UPDATE in writeResolution still guards the race) and also yields the
+// approval prompt for the remember side effect, so it costs one round-trip, not two.
 app.post('/api/interactions/:id', async (c) => {
   const id = c.req.param('id')
   if (!UUID_RE.test(id)) return c.json({ error: 'invalid interaction id' }, 400)
 
+  const db = getDb()
+  const [existing] = await db
+    .select({ kind: userInteractions.kind, prompt: userInteractions.prompt })
+    .from(userInteractions)
+    .where(eq(userInteractions.id, id))
+  if (!existing) return c.json({ error: 'not found' }, 404)
+
+  if (existing.kind === 'question') {
+    return resolveQuestion(c, db, id)
+  }
+  return resolveApproval(c, db, id, existing.prompt)
+})
+
+// Approval resolve (the runtime-injected gate): require an { approved } boolean, write the
+// verdict, then the best-effort "don't ask again" side effect.
+async function resolveApproval(c: Context, db: ReturnType<typeof getDb>, id: string, prompt: unknown) {
   const body = (await c.req.json().catch(() => ({}))) as {
     approved?: boolean
     note?: string
@@ -265,27 +287,9 @@ app.post('/api/interactions/:id', async (c) => {
   const { approved, note, remember } = body
   if (typeof approved !== 'boolean') return c.json({ error: 'approved is required' }, 400)
 
-  const db = getDb()
-  const [row] = await db
-    .update(userInteractions)
-    .set({
-      response: { approved, note },
-      status: 'resolved',
-      resolvedVia: 'web',
-      resolvedAt: new Date(),
-    })
-    .where(and(eq(userInteractions.id, id), eq(userInteractions.status, 'pending')))
-    .returning()
-  if (!row) return c.json({ error: 'already resolved' }, 409)
-
-  const [run] = await db
-    .select({ conversationId: agentRuns.conversationId })
-    .from(agentRuns)
-    .where(eq(agentRuns.id, row.agentRunId))
-  await pgNotify(
-    `conversation:${run!.conversationId}`,
-    JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
-  )
+  if (!(await writeResolution(db, id, { approved, note }))) {
+    return c.json({ error: 'already resolved' }, 409)
+  }
 
   // "Don't ask again": persist the decision into the same tools.require_approval store the
   // Tools page writes (§16), so it survives across runs and restarts. Deliberately AFTER the
@@ -294,8 +298,8 @@ app.post('/api/interactions/:id', async (c) => {
   // mirroring the Tools page). A group-scoped card covers the whole tool group; a call-scoped
   // one just the one tool.
   if (approved && remember) {
-    const prompt = row.prompt as { tool?: string; scope?: 'group' | 'call' } | null
-    const toolName = prompt?.tool
+    const p = prompt as { tool?: string; scope?: 'group' | 'call' } | null
+    const toolName = p?.tool
     if (toolName) {
       try {
         const [tool] = await db
@@ -303,7 +307,7 @@ app.post('/api/interactions/:id', async (c) => {
           .from(toolsTable)
           .where(eq(toolsTable.name, toolName))
         const where =
-          prompt?.scope === 'group' && tool?.group
+          p?.scope === 'group' && tool?.group
             ? eq(toolsTable.toolGroup, tool.group)
             : eq(toolsTable.name, toolName)
         await setToolsApproval(db, where, false)
@@ -313,7 +317,56 @@ app.post('/api/interactions/:id', async (c) => {
     }
   }
   return c.json({ ok: true })
-})
+}
+
+// Question resolve (the agent-initiated ask_user answer): require at least one of a non-empty
+// selected_labels array or a non-empty freeform_text, write the structured answer, then the
+// same conditional UPDATE + NOTIFY. No "don't ask again" — questions aren't a tool to silence.
+async function resolveQuestion(c: Context, db: ReturnType<typeof getDb>, id: string) {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    selected_labels?: unknown
+    freeform_text?: unknown
+  }
+  const selectedLabels = Array.isArray(body.selected_labels)
+    ? body.selected_labels.filter((l): l is string => typeof l === 'string')
+    : []
+  const freeformText = typeof body.freeform_text === 'string' ? body.freeform_text : undefined
+  if (selectedLabels.length === 0 && !freeformText?.trim()) {
+    return c.json({ error: 'selected_labels or freeform_text is required' }, 400)
+  }
+
+  if (!(await writeResolution(db, id, { selected_labels: selectedLabels, freeform_text: freeformText }))) {
+    return c.json({ error: 'already resolved' }, 409)
+  }
+  return c.json({ ok: true })
+}
+
+// First-writer-wins resolve, shared by both kinds: claim the still-pending row (the conditional
+// UPDATE is the race guard — a second resolver or the timeout sweeper loses), write the
+// kind-specific response, and NOTIFY the conversation so the parked worker wakes and every
+// ingress tears down its prompt UI (§10.3). Returns false (caller → 409) if the row was
+// already resolved/timed_out.
+async function writeResolution(
+  db: ReturnType<typeof getDb>,
+  id: string,
+  response: unknown,
+): Promise<boolean> {
+  const [row] = await db
+    .update(userInteractions)
+    .set({ response, status: 'resolved', resolvedVia: 'web', resolvedAt: new Date() })
+    .where(and(eq(userInteractions.id, id), eq(userInteractions.status, 'pending')))
+    .returning({ agentRunId: userInteractions.agentRunId })
+  if (!row) return false
+  const [run] = await db
+    .select({ conversationId: agentRuns.conversationId })
+    .from(agentRuns)
+    .where(eq(agentRuns.id, row.agentRunId))
+  await pgNotify(
+    `conversation:${run!.conversationId}`,
+    JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
+  )
+  return true
+}
 
 // Single writer for the owner's per-tool approval setting (tools.require_approval), shared by
 // the Tools page (PATCH) and the chat "don't ask again" resolve path so the two can't drift.

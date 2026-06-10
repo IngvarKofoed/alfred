@@ -25,6 +25,14 @@ type ApprovalPrompt = {
   // not just the call shown below (ARCHITECTURE §16). Absent / 'call' ⇒ single-call approval.
   scope?: 'group' | 'call'
 }
+// An agent-initiated question (ask_user, §7.3) — the structured shape from DATABASE.md.
+// options omitted ⇒ free-form question; allow_freeform defaults to true.
+type QuestionPrompt = {
+  question: string
+  options?: { label: string; description?: string }[]
+  multi_select?: boolean
+  allow_freeform?: boolean
+}
 type RunEvent =
   | { type: 'token'; text: string }
   | { type: 'tool_call_start'; id: string; toolName: string; args?: unknown }
@@ -32,7 +40,7 @@ type RunEvent =
   | { type: 'done' }
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
-  | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
+  | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
 
 // One ordered segment per thing the in-flight run has produced, in the order things actually
@@ -89,6 +97,18 @@ export default function Chat({
   // "Don't ask again" — when approving, also persist require_approval=false (same store the
   // Tools page writes) so this decision survives future runs and restarts. Reset per card.
   const [remember, setRemember] = useState(false)
+  // An agent-initiated question (ask_user, §7.3) — sibling to the approval card. The form
+  // state (selected option labels + free-form text) is reset whenever a new question opens.
+  const [question, setQuestion] = useState<{
+    interactionId: string
+    prompt: QuestionPrompt
+  } | null>(null)
+  const [qSelected, setQSelected] = useState<string[]>([])
+  const [qFreeform, setQFreeform] = useState('')
+  // When the question offers options AND free text, the free-text box is its own choice
+  // ("Other"). qOther tracks whether it's selected — mutually exclusive with the options in
+  // single-select, so an answer is never both a picked option and stray free text.
+  const [qOther, setQOther] = useState(false)
   // The in-flight run's live output as one ordered block (streamed text + accumulating tool
   // chips, in real order). Cleared when history reloads (it then carries the turn durably) or
   // on error. See LiveSegment.
@@ -185,16 +205,29 @@ export default function Chat({
           { role: 'assistant', content: [{ type: 'text', text: `⚠️ ${ev.message}` }] },
         ])
       } else if (ev.type === 'interaction_required') {
-        const interactionId = ev.interactionId
+        // Same fetch for both kinds (the row carries the prompt); branch only on what state
+        // the resolved prompt populates — approval card vs question card.
+        const { interactionId, kind } = ev
         fetch(`/api/interactions/${interactionId}`)
-          .then((r) => r.json() as Promise<{ interaction: { prompt: ApprovalPrompt } }>)
+          .then((r) => r.json() as Promise<{ interaction: { prompt: QuestionPrompt | ApprovalPrompt } }>)
           .then((d) => {
-            setApproval({ interactionId, prompt: d.interaction.prompt })
-            setRemember(false)
+            if (kind === 'question') {
+              setQuestion({ interactionId, prompt: d.interaction.prompt as QuestionPrompt })
+              setQSelected([])
+              setQFreeform('')
+              setQOther(false)
+            } else {
+              setApproval({ interactionId, prompt: d.interaction.prompt as ApprovalPrompt })
+              setRemember(false)
+            }
           })
           .catch(() => {})
       } else if (ev.type === 'interaction_resolved') {
         setApproval(null)
+        setQuestion(null)
+        setQSelected([])
+        setQFreeform('')
+        setQOther(false)
       }
     }
     return () => es.close()
@@ -208,7 +241,7 @@ export default function Chat({
     const el = scrollRef.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
   }, [])
-  useEffect(pinToBottom, [history, liveSegments, busy, approval, pending, pinToBottom])
+  useEffect(pinToBottom, [history, liveSegments, busy, approval, question, pending, pinToBottom])
 
   const onScroll = () => {
     const el = scrollRef.current
@@ -314,6 +347,47 @@ export default function Chat({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ approved, remember: rememberChoice }),
+    }).catch(() => {})
+  }
+
+  // Pick a listed option. Single-select replaces the selection and clears the "Other" choice
+  // (they're mutually exclusive); multi-select adds/removes and leaves "Other" alone.
+  const toggleQOption = (label: string, multi: boolean) => {
+    setQSelected((s) =>
+      multi ? (s.includes(label) ? s.filter((l) => l !== label) : [...s, label]) : [label],
+    )
+    if (!multi) setQOther(false)
+  }
+
+  // The "Other" checkbox/radio: single-select makes it exclusive (clears any picked option);
+  // multi-select toggles it alongside the options.
+  const toggleQOther = (multi: boolean) => {
+    setQOther((o) => (multi ? !o : true))
+    if (!multi) setQSelected([])
+  }
+  // Typing in the free-text box selects "Other" (never deselects, so a keystroke can't toggle
+  // it off); single-select clears any picked option.
+  const ensureQOther = (multi: boolean) => {
+    setQOther(true)
+    if (!multi) setQSelected([])
+  }
+
+  const resolveQuestion = async () => {
+    if (!question) return
+    const { interactionId, prompt } = question
+    // The free text counts only when it's the active choice: a pure free-form question (no
+    // options) or the "Other" option is selected. Otherwise the answer is the picked option(s).
+    const otherActive = (prompt.options ?? []).length === 0 || qOther
+    const selected_labels = qSelected
+    const freeform_text = otherActive ? qFreeform.trim() : ''
+    setQuestion(null)
+    setQSelected([])
+    setQFreeform('')
+    setQOther(false)
+    await fetch(`/api/interactions/${interactionId}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ selected_labels, freeform_text }),
     }).catch(() => {})
   }
 
@@ -539,6 +613,97 @@ export default function Chat({
           </div>
         </div>
       )}
+
+      {question &&
+        (() => {
+          const multi = question.prompt.multi_select === true
+          const options = question.prompt.options ?? []
+          const allowFreeform = question.prompt.allow_freeform !== false
+          const hasOptions = options.length > 0
+          // With options present, the free text is the "Other" choice (qOther gates it); with
+          // no options it IS the answer. Free text only counts toward canSubmit when active.
+          const otherActive = !hasOptions || qOther
+          const canSubmit =
+            qSelected.length > 0 || (otherActive && qFreeform.trim().length > 0)
+          return (
+            <form
+              className="px-5 pb-3"
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (canSubmit) void resolveQuestion()
+              }}
+            >
+              <div className="mx-auto max-w-xl rounded-2xl border border-brass/40 bg-paper-raised p-4 shadow-lg">
+                <p className="text-base font-medium text-ink">{question.prompt.question}</p>
+                {hasOptions && (
+                  <div className="mt-3 flex flex-col gap-2">
+                    {options.map((opt) => (
+                      <label
+                        key={opt.label}
+                        className="flex cursor-pointer items-start gap-2 text-sm text-ink-dim"
+                      >
+                        <input
+                          type={multi ? 'checkbox' : 'radio'}
+                          name="question-option"
+                          checked={qSelected.includes(opt.label)}
+                          onChange={() => toggleQOption(opt.label, multi)}
+                          className="mt-0.5 h-4 w-4 accent-brass"
+                        />
+                        <span>
+                          <span className="text-ink">{opt.label}</span>
+                          {opt.description && (
+                            <span className="block text-xs text-muted">{opt.description}</span>
+                          )}
+                        </span>
+                      </label>
+                    ))}
+                    {/* The free text as an explicit "Other" choice: its radio/checkbox shares
+                        the option group, and typing selects it (single-select clears any option). */}
+                    {allowFreeform && (
+                      <div className="flex items-start gap-2 text-sm text-ink-dim">
+                        <input
+                          type={multi ? 'checkbox' : 'radio'}
+                          name="question-option"
+                          checked={qOther}
+                          onChange={() => toggleQOther(multi)}
+                          className="mt-0.5 h-4 w-4 accent-brass"
+                          aria-label="Other"
+                        />
+                        <input
+                          className="w-full rounded-lg border border-line bg-paper px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-muted focus:border-brass/60"
+                          placeholder="Type your own answer…"
+                          value={qFreeform}
+                          onChange={(e) => {
+                            setQFreeform(e.target.value)
+                            ensureQOther(multi)
+                          }}
+                          onFocus={() => ensureQOther(multi)}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+                {!hasOptions && allowFreeform && (
+                  <input
+                    className="mt-3 w-full rounded-lg border border-line bg-paper px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-muted focus:border-brass/60"
+                    placeholder="Type an answer…"
+                    value={qFreeform}
+                    onChange={(e) => setQFreeform(e.target.value)}
+                  />
+                )}
+                <div className="mt-4 flex gap-2">
+                  <button
+                    type="submit"
+                    disabled={!canSubmit}
+                    className="rounded-full bg-brass px-5 py-2 font-medium text-paper transition-colors hover:bg-brass-soft disabled:opacity-30"
+                  >
+                    Submit
+                  </button>
+                </div>
+              </div>
+            </form>
+          )
+        })()}
 
       <form
         className="border-t border-line px-5 py-4"

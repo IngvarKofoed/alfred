@@ -14,7 +14,7 @@ export type RunEvent =
   | { type: 'tool_call_end'; id: string }
   | { type: 'done' }
   | { type: 'error'; message: string }
-  | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
+  | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
 
 export async function notifyRun(conversationId: string, event: RunEvent): Promise<void> {
