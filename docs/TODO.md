@@ -1,4 +1,5 @@
-- [ ] Debug page should be per conversation
+- [ ] Auto update harnes
+- [x] Debug page should be per conversation — reworked into a Conversation → Run → LLM-call/tool ledger (rail with run-status sparkline + token/cost totals, lazy-loaded per-run detail). (CHANGELOG 49)
 - [ ] Agent generated code running in the context of the tools.
 - [ ] Python execution sandbox
 - [x] Persist approval accross restarts — "Don't ask again" on the approval card persists into tools.require_approval (same store as the Tools page); + sweep bugfix for zombie awaiting_approval runs. (CHANGELOG 43)
