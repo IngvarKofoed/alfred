@@ -49,6 +49,12 @@ const schema = z.object({
   // off Postgres (ARCHITECTURE §6.5). Resolved via resolveInWorkspace, which confines every
   // path under one conversation's dir.
   WORKSPACE_ROOT: z.string().default('./data/conversations'),
+  // Auto-deploy updater (services/updater) — only that process reads these. DEPLOY_ENABLED is
+  // parsed explicitly (not z.coerce.boolean(), which coerces the string "false" to true).
+  DEPLOY_ENABLED: z.string().default('false').transform((v) => v.toLowerCase() === 'true'),
+  DEPLOY_BRANCH: z.string().default('main'),
+  DEPLOY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
+  DEPLOY_APPS: z.string().default('alfred-webserver,alfred-worker'),
 })
 
 export type Config = z.infer<typeof schema>

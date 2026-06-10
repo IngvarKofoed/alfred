@@ -76,7 +76,7 @@ External clients
 
 ## 5. Process Topology
 
-**Moved to `docs/DEPLOYMENT.md`** (§5). In brief: **pm2** supervises native Node processes from one `ecosystem.config.cjs`. Built today: `alfred-webserver` + `alfred-worker` (the browser bridge is embedded in the worker, §8); `alfred-discord`/`alfred-voice`/`alfred-triggers` are the reserved post-MVP shape.
+**Moved to `docs/DEPLOYMENT.md`** (§5). In brief: **pm2** supervises native Node processes from one `ecosystem.config.cjs`. Built today: `alfred-webserver` + `alfred-worker` (the browser bridge is embedded in the worker, §8) + `alfred-updater` (auto-deploy, inert unless `DEPLOY_ENABLED=true`); `alfred-discord`/`alfred-voice`/`alfred-triggers` are the reserved post-MVP shape.
 
 ---
 

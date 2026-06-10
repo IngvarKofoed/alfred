@@ -41,11 +41,12 @@ All processes are native (no Docker). Managed by **pm2** — the same process su
 | `postgres` | — | State, job queue, pub/sub | Auto-start via OS package manager; not under pm2 |
 | `alfred-webserver` | Node/TS | Browser ingress, serves PWA, SSE | Restart on failure |
 | `alfred-worker` | Node/TS | Agent execution loop + **embedded browser bridge** (WS server for the Chrome extension) | Restart on failure |
+| `alfred-updater` | Node/TS | Auto-deploy: polls git, rebuilds + restarts the managed apps; opt-in via `DEPLOY_ENABLED` | Restart on failure |
 | `alfred-discord` | Node/TS | Discord ingress (post-MVP) | Restart on failure |
 | `alfred-voice` | Node/TS | Voice orchestrator (native-app surface, post-MVP) | Restart on failure |
 | `alfred-triggers` | Node/TS | Scheduler / event-source ingress (post-MVP) | Restart on failure |
 
-**Built today:** only `alfred-webserver` and `alfred-worker` are in `ecosystem.config.cjs`; the `discord`/`voice`/`triggers` rows are the reserved post-MVP shape (so the topology is whole, not because they exist — §15). Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
+**Built today:** `alfred-webserver`, `alfred-worker`, and `alfred-updater` are in `ecosystem.config.cjs`; the `discord`/`voice`/`triggers` rows are the reserved post-MVP shape (so the topology is whole, not because they exist — §15). The updater is **inert unless `DEPLOY_ENABLED=true`** (a plain `pm2 start ecosystem.config.cjs` boots it idle); `pnpm deploy:up` (`pm2 start ecosystem.config.cjs --env deploy`) brings the stack up with it enabled. Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
 
 Deploy: `git pull && pnpm install && pnpm build && pm2 reload ecosystem.config.cjs`. Postgres is installed via the host's package manager and managed by the OS, not pm2. **Alternative** if pm2 ever stops fitting: each target's native supervisor (systemd/launchd), which is what pm2 delegates to anyway.
 
@@ -57,7 +58,7 @@ Three layers, increasing specificity: **(1) defaults in code** (`packages/shared
 
 ### 13.1 .env layout
 
-The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
+The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
 
 ```
 # Built
@@ -67,6 +68,10 @@ GEMINI_MODEL=gemini-2.5-flash    # provider-scoped; a future provider adds OPENA
 BRIDGE_WS_PORT=7865              # loopback-only WS for the extension; no token/MCP (127.0.0.1 + Origin guard)
 WEBSERVER_PORT=3000
 WORKSPACE_ROOT=./data/conversations  # per-conversation working dirs (§6.5); optional — defaults here, relative paths anchored at the repo root
+DEPLOY_ENABLED=false            # auto-deploy updater (alfred-updater, §5); default false — only the deploy box opts in
+DEPLOY_BRANCH=main              # branch the updater syncs to origin/<branch>
+DEPLOY_POLL_INTERVAL_MS=300000  # how often the updater checks origin (~5 min)
+DEPLOY_APPS=alfred-webserver,alfred-worker  # pm2 app names the updater stops/builds/restarts (never itself)
 # Observability is in-Postgres (llm_calls + /debug) — no keys.
 
 # Reserved (post-MVP)
@@ -100,6 +105,7 @@ alfred/
 ├─ services/                ← backend processes (Node/TS, pnpm workspace members)
 │  ├─ webserver/            ← Hono (API + static serving)
 │  ├─ worker/               ← agent worker (+ embedded browser bridge: src/browser/)
+│  ├─ updater/              ← auto-deploy: git poll → rebuild → restart
 │  ├─ discord-bot/          ← Discord ingress
 │  ├─ voice/                ← voice orchestrator (post-MVP)
 │  └─ triggers/             ← scheduler / event-source ingress (post-MVP)
@@ -136,5 +142,6 @@ pnpm install                          # workspace setup
 pnpm --filter "./services/*" build    # build all services
 pnpm --filter web dev                 # web dev server
 pm2 start ecosystem.config.cjs        # bring services up  (pm2 reload all = post-deploy)
+pnpm deploy:up                        # bring the stack up with auto-deploy enabled (pm2 --env deploy)
 open clients/ios/Alfred.xcworkspace   # iOS, post-MVP — Xcode does the rest
 ```
