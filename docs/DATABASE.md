@@ -118,7 +118,8 @@ tools                                 -- the worker-published tool catalog + own
   created_at        timestamptz default now()
   index (tool_group)
 
-memory_facts                          -- placeholder; expanded post-MVP
+memory_facts                          -- PLANNED, NOT YET CREATED — in no Drizzle schema or
+                                      -- migration; design only (ARCHITECTURE §6.4)
   id              uuid pk
   user_id         uuid fk → users.id
   scope           text                -- 'global' | 'project:<name>' | etc.

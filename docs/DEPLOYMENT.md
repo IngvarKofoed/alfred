@@ -48,7 +48,7 @@ All processes are native (no Docker). Managed by **pm2** — the same process su
 
 **Built today:** `alfred-webserver`, `alfred-worker`, and `alfred-updater` are in `ecosystem.config.cjs`; the `discord`/`voice`/`triggers` rows are the reserved post-MVP shape (so the topology is whole, not because they exist — §15). The updater is **inert unless `DEPLOY_ENABLED=true`** (a plain `pm2 start ecosystem.config.cjs` boots it idle); `pnpm deploy:up` (`pm2 start ecosystem.config.cjs --env deploy`) brings the stack up with it enabled. Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
 
-Deploy: `git pull && pnpm install && pnpm build && pm2 reload ecosystem.config.cjs`. Postgres is installed via the host's package manager and managed by the OS, not pm2. **Alternative** if pm2 ever stops fitting: each target's native supervisor (systemd/launchd), which is what pm2 delegates to anyway.
+Deploy: automated by `alfred-updater` — the authoritative sequence is stop-first: `pm2 stop <apps>` → `git checkout -f <branch>` + `git reset --hard origin/<branch>` → `pnpm install --frozen-lockfile` → `pnpm -r build` → `pnpm db:migrate` → `pm2 start <apps>` (with a `finally` that always brings the apps back up). Deploying by hand means running that same sequence manually. Postgres is installed via the host's package manager and managed by the OS, not pm2. **Alternative** if pm2 ever stops fitting: each target's native supervisor (systemd/launchd), which is what pm2 delegates to anyway.
 
 ---
 
@@ -108,7 +108,7 @@ alfred/
 │  ├─ webserver/            ← Hono (API + static serving)
 │  ├─ worker/               ← agent worker (+ embedded browser bridge: src/browser/)
 │  ├─ updater/              ← auto-deploy: git poll → rebuild → restart
-│  ├─ discord-bot/          ← Discord ingress
+│  ├─ discord-bot/          ← Discord ingress (post-MVP)
 │  ├─ voice/                ← voice orchestrator (post-MVP)
 │  └─ triggers/             ← scheduler / event-source ingress (post-MVP)
 ├─ clients/                 ← user-facing apps

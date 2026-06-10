@@ -27,7 +27,7 @@ A second run for the same conversation cannot be created while one is active. Th
 **Crash policy: fail-and-restart.** A crash (OOM, deploy, host reboot) abandons in-flight runs; we do not reconstruct them. The consequences, all accepted:
 
 - `agent-run` jobs use `retryLimit: 0` with an expiration longer than the max interaction timeout (§6.3), so a paused worker is never redelivered to a second worker — no duplicate execution, no fencing token needed.
-- On startup the worker runs a one-shot sweep marking any `running` / `awaiting_*` rows as `failed`, so the UI shows an honest failure instead of a zombie "thinking…" state. A planned deploy therefore also drops any pending approvals — intentional; the owner re-issues.
+- On startup the worker runs a one-shot sweep marking any non-terminal (`pending` / `running` / `awaiting_*`) rows as `failed`, so the UI shows an honest failure instead of a zombie "thinking…" state. A planned deploy therefore also drops any pending approvals — intentional; the owner re-issues.
 - For a single user who notices the restart, this is strictly simpler than durable resume and costs nothing this system needs.
 
 This is reversible: the run rows already live in Postgres, so durable resume could be layered on later if Alfred ever stopped being single-user-local.
@@ -133,7 +133,7 @@ The worker registers a `setTimeout` alongside the LISTEN. On fire:
 A worker dies (OOM, deploy, host reboot). This system does **not** reconstruct in-flight runs — it fails and restarts (§7.6):
 
 1. The crashed run is abandoned. Because `agent-run` jobs use `retryLimit: 0` (§6.3), pg-boss does not redeliver it to another worker, so there is no duplicate execution.
-2. On startup the worker sweeps every non-terminal run — `running`, `awaiting_*`, and orphaned `pending` runs whose pg-boss job was lost — to `failed`, cascading to their `tool_calls` and pending `user_interactions` (§10.9, invariant 4), so the UI shows an honest failure rather than a stuck "thinking…" state.
+2. On startup the worker sweeps every non-terminal run — `pending`, `running`, and `awaiting_*` — to `failed`, cascading to their `tool_calls` and pending `user_interactions` (§10.9, invariant 4), so the UI shows an honest failure rather than a stuck "thinking…" state. The sweep is unconditional: a `pending` run whose pg-boss job *survived* the restart (a message enqueued while the worker was down) is also failed, and the later-delivered job no-ops against the terminal row — a deliberate trade (no pg-boss state check, no half-resumed runs); the owner re-issues, same as any other restart loss.
 3. The owner re-issues whatever was lost.
 
 The one accepted residue: if the crash lands *after* a side-effecting tool executed but *before* its result was recorded, a manual re-issue could repeat the action. The owner knows the restart happened, and `write`/`destructive` actions are approval-gated (§16) regardless — acceptable for a single-user system.
@@ -160,9 +160,9 @@ Worst case: a tool already executing can't be cancelled cleanly (e.g. a browser 
 | LLM API transient (5xx, 429) | **Planned, not yet built.** Intended: provider abstraction retries with backoff (1s, 2s, 4s, 8s); after 4 attempts, fail with `error='llm_unavailable'`. Today there is no retry — a provider error propagates and fails the run immediately, captured in `agent_runs.error`. |
 | LLM API permanent (4xx) | Fail run with the API's error captured in `agent_runs.error`. *(Built.)* |
 | Tool error (thrown from `invoke`) | Caught by the loop; tool_result becomes `{ error:'<message>' }`. The agent sees it next turn and can adapt. *(Built.)* |
-| Tool timeout | Each tool declares a default timeout, returning `{ error:'timeout' }` on exceed. Built for the browser tools (30s per command, §8); the general per-tool-timeout framework arrives with the next non-browser tools. |
+| Tool timeout | Each tool declares a default timeout, returning `{ error:'timeout' }` on exceed. Built per tool family, not as a framework: browser tools 30s per command (§8); `run_python` a 1–300s clamp (default 60s) with a process-tree kill, `pip_install` its own install timeout (§7.3). A *general* per-tool-timeout mechanism still doesn't exist — each family carries its own. |
 | Cost cap | **Planned, not yet built.** Intended: a per-run cap (default $1, configurable), checked after each LLM call, failing with `error='cost_exceeded'`. Today per-call and per-run cost is *computed and recorded* (`llm_calls.cost_usd` → `agent_runs.cost_usd`, §6.5) but **never enforced** — nothing aborts a run for exceeding a budget. The layered run/objective/daily budgets (§7.7) build on this same unbuilt cap. |
-| Stuck / abandoned run (worker died or hung) | Startup sweep marks any `running` / `awaiting_*` rows as `failed` on worker boot (§10.5). No dead-letter machinery — a crash means restart, and the owner re-issues. *(Built.)* |
+| Stuck / abandoned run (worker died or hung) | Startup sweep marks any non-terminal (`pending` / `running` / `awaiting_*`) rows as `failed` on worker boot (§10.5). No dead-letter machinery — a crash means restart, and the owner re-issues. *(Built.)* |
 
 Pattern across all of these: **fail loudly into structured rows**, never silently. The `llm_calls` table captures LLM-level detail; `agent_runs` / `tool_calls` capture run-level outcomes — all in the one Postgres. (The two rows marked *planned* above are the exceptions still owed: a provider error currently fails loudly but without the retry, and there is no cost ceiling yet.)
 

@@ -97,7 +97,7 @@ The column-level data model — every table, column, index, and the interaction 
 - `tool_calls` — one per invoked tool (`trust_tier`, status).
 - `user_interactions` — generic pause-for-user (`approval`/`question`); the record of every owner decision.
 - `tools` — worker-published catalog + the owner's per-tool `require_approval`; read per run to gate (§16).
-- `memory_facts` — post-MVP placeholder (`embedding` unused until pgvector, §6.4).
+- `memory_facts` — **planned, not yet created** (design only; no schema entry or migration yet, §6.4).
 
 `agent_runs` + `tool_calls` + `user_interactions` together are the audit log — no separate `audit_log` table.
 
@@ -113,19 +113,19 @@ type RunEvent =
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
   | { type: 'interaction_resolved'; interactionId: string }
   | { type: 'done' }
-  | { type: 'cancelled' }
+  | { type: 'cancelled' }           // reserved for §10.6 — not in events.ts yet, nothing emits it
   | { type: 'error';                message: string }
 ```
 
-`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `interaction_required.kind` is only `'approval'` today (the `question` kind / `ask_user` isn't wired yet, though the DB column allows it); `cancelled` is distinct from `done` (§10.6).
+`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `interaction_required.kind` is only `'approval'` today (the `question` kind / `ask_user` isn't wired yet, though the DB column allows it); `cancelled` is distinct from `done` but belongs to the unbuilt cancellation flow (§10.6) — it's part of the designed shape, not yet of the `events.ts` type.
 
 ### 6.3 Job queue (pg-boss)
 
 pg-boss owns its own schema (`pgboss`), treated as a black box. Job payloads are minimal — `type AgentJob = { runId: uuid }` — the `agent_runs` row carries everything else, so a pulled-but-unacked job reconstructs from the run row, migrations don't ripple through payloads, and retries are idempotent (the worker skips already-finished runs). The worker calls `boss.work('agent-run', handler)` with concurrency; because a handler blocks in place while paused for user input (§10.2), `agent-run` jobs use **`retryLimit: 0`** and a **job expiration longer than the max interaction timeout** (§10.4) — a parked worker is never redelivered (no duplicate execution, §7.6), a lost run just fails. Recurring jobs (post-MVP) use `schedule()`.
 
-### 6.4 Memory (post-MVP placeholder)
+### 6.4 Memory (planned, not yet created)
 
-The `memory_facts` table exists from day one with an unused `embedding` column — defining it early forces the *what gets remembered* question now, lets the loop have a plain-rows `memory.read(scope)` from MVP, and makes pgvector activation a single migration + index, no schema change. Open: extraction strategy (LLM-summarized vs. user-flagged), decided when memory is the active target.
+The design: a `memory_facts` table with an unused `embedding` column, defined early to force the *what gets remembered* question, give the loop a plain-rows `memory.read(scope)` before pgvector, and make pgvector activation a single migration + index, no schema change. **The "exists from day one" intent was never executed** — the table is in no Drizzle schema and no migration; only this doc and `DATABASE.md` describe it. It lands when memory becomes the active build target (§15 step 10). Open: extraction strategy (LLM-summarized vs. user-flagged), decided then.
 
 ### 6.5 What's NOT in the database
 
@@ -214,6 +214,8 @@ A run's context is assembled fresh every invocation. The agent has no in-process
 [tools]     Tool definitions (name + description + JSON schema)
 ```
 
+*Built today:* the `[system]` slot is the static `SYSTEM_PROMPT` alone — the **identity block (current time, ingress, user) is not yet injected**; like the persona file above, a small deferred piece, not current behaviour.
+
 **History strategy (MVP)** — send the full history, fail loudly if it doesn't fit. *Intended:* a pre-flight headroom check (~80% of context) fails the run with `error='context_overflow'` so the owner can react. **Not yet built:** no headroom check today — overflow surfaces only as whatever raw provider error comes back. No automatic summarization in MVP (silent summarization loses context invisibly; modern 200k+ windows rarely hit this). **Presence-dependent:** fail-loudly only works with a human watching — autonomous triggers (§9.4) can't, so their overflow policy is the mandatory auto-summarize-with-trace of §7.7 (RUNTIME.md).
 
 **History strategy (post-MVP)** — explicit summarization, chosen when needed: either *interaction-gated* (raise a `question` to approve summarizing the oldest N) or *auto-with-trace* (summarize but record it as a synthetic message + trace + NOTIFY).
@@ -222,7 +224,7 @@ A run's context is assembled fresh every invocation. The agent has no in-process
 
 **Per-ingress persona overlays (post-MVP)** — the persona markdown can carry `## When on Discord` / `## When on Voice` sections appended by ingress, for tone shifts without forking the persona.
 
-**Identity** — trivial for a single user: the identity block states "You are talking to Ingvar," the time, and the ingress. Multi-user is out of scope (§1). **Single agent, many tools** — no multi-agent orchestration in v1.
+**Identity** *(intended — the block isn't injected yet, see above)* — trivial for a single user: the identity block states "You are talking to Ingvar," the time, and the ingress. Multi-user is out of scope (§1). **Single agent, many tools** — no multi-agent orchestration in v1.
 
 ### 7.6 Concurrency, serialization & resource ownership · 7.7 Autonomous & long-horizon runs
 
