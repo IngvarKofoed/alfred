@@ -3,12 +3,17 @@ import { getDb, tools as toolsTable } from '@alfred/db'
 import { sql } from 'drizzle-orm'
 import { getBridge } from './browser/bridge.js'
 import { makeBrowserTools } from './browser/tools.js'
+import { makeEmailTools } from './email/tools.js'
 import { makePythonTools } from './python/tools.js'
 import { makeAskUserTool, makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
 // state), so build them once at module load rather than per run.
 const BROWSER_TOOLS = makeBrowserTools(getBridge())
+
+// Email tools act on the mailbox, not a per-conversation workspace, so — like the browser
+// tools — they carry no per-run state and are built once at module load.
+const EMAIL_TOOLS = makeEmailTools()
 
 // ask_user's pause is run-bound (it closes over db + run + toolCallRowIds). toolCatalog()
 // only reads metadata, so it passes no pause — this stub stands in and is never invoked.
@@ -27,6 +32,7 @@ export function buildRunTools(
     makeAskUserTool(askUserPause ?? askUserPauseStub),
     ...makeFileTools(conversationId),
     ...makePythonTools(conversationId),
+    ...EMAIL_TOOLS,
     ...BROWSER_TOOLS,
   ]
 }

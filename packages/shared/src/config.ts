@@ -63,6 +63,23 @@ const schema = z.object({
   DEPLOY_BRANCH: z.string().default('main'),
   DEPLOY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
   DEPLOY_APPS: z.string().default('alfred-webserver,alfred-worker'),
+  // Email tools (worker's IMAP/SMTP family — spec docs/specs/2026-06-10-email-tools.md).
+  // All optional like GEMINI_API_KEY so non-email processes (and an email-less worker) still
+  // boot; the tools validate the required subset lazily per invoke (a clear "email not
+  // configured" tool-result, never a boot failure). *_SECURE are parsed like DEPLOY_ENABLED —
+  // an explicit string→boolean transform, not z.coerce.boolean() (which coerces "false" to true).
+  IMAP_HOST: z.string().optional(),
+  IMAP_PORT: z.coerce.number().int().positive().default(993),
+  IMAP_USER: z.string().optional(),
+  IMAP_PASSWORD: z.string().optional(),
+  IMAP_SECURE: z.string().default('true').transform((v) => v.toLowerCase() === 'true'),
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().positive().default(465),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASSWORD: z.string().optional(),
+  SMTP_SECURE: z.string().default('true').transform((v) => v.toLowerCase() === 'true'),
+  // From address for outgoing mail; defaults to SMTP_USER in the email module when unset.
+  EMAIL_FROM: z.string().optional(),
 })
 
 export type Config = z.infer<typeof schema>

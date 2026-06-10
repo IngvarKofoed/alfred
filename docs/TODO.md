@@ -10,5 +10,6 @@
 - [ ] Morning-briefing trigger — first autonomous trigger (§9.4) end-to-end as a single vertical slice (cron → enqueue a `human_in_loop=false` run → read inbox → push a summary), exercising the §7.7 autonomous seams on one concrete job.
 - [x] Python execution sandbox — run_python + pip_install over a shared lazily-created venv, cwd = the conversation workspace, approval-gated as group 'python'. (CHANGELOG 57)
 - [x] Persist approval accross restarts — "Don't ask again" on the approval card persists into tools.require_approval (same store as the Tools page); + sweep bugfix for zombie awaiting_approval runs. (CHANGELOG 43)
+- [x] Email tools — built-in IMAP/SMTP family (list/search/read + save_draft/send_email), provider-agnostic, connect-per-call, group 'email' (reads read-tier, send/draft write-tier). (CHANGELOG 61)
 - [x] Tool usage is hidden while its happening in web app, I think we should show this
 - [x] If no internet and "fetch failed", give better error message

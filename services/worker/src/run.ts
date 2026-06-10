@@ -29,7 +29,9 @@ const SYSTEM_PROMPT =
   'Images you create with generate_image are shown to the user automatically; ' +
   "don't thank the user for them or describe them back unless asked. " +
   "You can run Python in this conversation's working directory with run_python (the same directory " +
-  'the file tools use) and install packages with pip_install.'
+  'the file tools use) and install packages with pip_install. ' +
+  'You can list/search/read the owner’s inbox (list_emails, search_emails, read_email), save drafts, ' +
+  'and send mail — sending asks the owner first.'
 
 export interface RunDeps {
   provider?: LlmProvider
