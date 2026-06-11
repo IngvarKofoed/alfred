@@ -110,14 +110,15 @@ type RunEvent =
   | { type: 'token';                text: string }
   | { type: 'tool_call_start';      id: string; toolName: string; args?: unknown }
   | { type: 'tool_call_end';        id: string }
-  | { type: 'interaction_required'; interactionId: string; kind: 'approval' }
+  | { type: 'title';                title: string }
+  | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
   | { type: 'done' }
   | { type: 'cancelled' }           // reserved for §10.6 — not in events.ts yet, nothing emits it
   | { type: 'error';                message: string }
 ```
 
-`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `interaction_required.kind` is only `'approval'` today (the `question` kind / `ask_user` isn't wired yet, though the DB column allows it); `cancelled` is distinct from `done` but belongs to the unbuilt cancellation flow (§10.6) — it's part of the designed shape, not yet of the `events.ts` type.
+`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `title` carries the worker's auto-generated conversation title (§7.5 auto-name), applied to the chat header + history sidebar; `interaction_required.kind` is `'approval'` or `'question'` (the `ask_user` question path, CHANGELOG 59); `cancelled` is distinct from `done` but belongs to the unbuilt cancellation flow (§10.6) — it's part of the designed shape, not yet of the `events.ts` type.
 
 ### 6.3 Job queue (pg-boss)
 

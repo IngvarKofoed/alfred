@@ -12,6 +12,9 @@ export type RunEvent =
   // is never sent — it lives in tool_calls (the /debug page).
   | { type: 'tool_call_start'; id: string; toolName: string; args?: unknown }
   | { type: 'tool_call_end'; id: string }
+  // The worker auto-titled an untitled conversation (§7.5 auto-name); the client applies it
+  // to the header + sidebar. Tiny payload, well under the 8000-byte cap.
+  | { type: 'title'; title: string }
   | { type: 'done' }
   | { type: 'error'; message: string }
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }

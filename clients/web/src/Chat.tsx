@@ -44,6 +44,7 @@ type RunEvent =
   | { type: 'error'; message: string }
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
+  | { type: 'title'; title: string }
 
 // One ordered segment per thing the in-flight run has produced, in the order things actually
 // happened: a 'text' segment grows as tokens stream; a 'tool' segment is a chip that accumulates
@@ -199,6 +200,10 @@ export default function Chat({
         // loadHistory clears the live segments once the durable turns arrive (one render).
         setBusy(false)
         void loadHistory()
+      } else if (ev.type === 'title') {
+        // The worker's auto-generated title (sent after the first run names an untitled
+        // conversation) — same path /rename uses: updates the header + bumps the sidebar reload.
+        onTitleChange(ev.title)
       } else if (ev.type === 'error') {
         setLiveSegments([])
         setBusy(false)

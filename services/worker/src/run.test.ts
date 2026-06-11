@@ -87,9 +87,17 @@ describe.skipIf(!process.env.POSTGRES_URL)('worker runJob', () => {
       expect(assistant).toBeTruthy()
       expect(textOf(assistant!.content as never)).toBe('hello world')
 
+      // Two llm_calls now: the agent-loop call (tool_call_id IS NULL) plus the out-of-loop
+      // auto-title call (linked to a synthetic 'auto_title' tool_calls row, so rollupUsage's
+      // model derivation excludes it — §7.5 auto-name).
       const trace = await db.select().from(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
-      expect(trace).toHaveLength(1)
-      expect(trace[0]!.responseText).toBe('hello world')
+      expect(trace).toHaveLength(2)
+      const loopCall = trace.find((t) => t.toolCallId === null)
+      expect(loopCall!.responseText).toBe('hello world')
+      // The title call is attributed to a tool_calls row, never null — that's what keeps it
+      // out of agent_runs.model (the cost still rolls into agent_runs.cost_usd).
+      const titleCall = trace.find((t) => t.toolCallId !== null)
+      expect(titleCall).toBeTruthy()
     } finally {
       // FK order: user_interactions -> llm_calls -> tool_calls -> agent_runs ->
       // messages -> conversations

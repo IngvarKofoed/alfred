@@ -6,18 +6,19 @@ import {
   GeminiProvider,
   isImageResult,
   type LlmProvider,
+  type LlmTrace,
   type Message,
   runAgent,
   TracingProvider,
 } from '@alfred/agent-core'
-import { agentRuns, getDb, llmCalls, messages, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
+import { agentRuns, conversations, getDb, llmCalls, messages, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
-import { and, asc, eq } from 'drizzle-orm'
+import { and, asc, eq, isNull } from 'drizzle-orm'
 import pg from 'pg'
 import { buildRunTools } from './catalog.js'
 import { notifyRun } from './events.js'
 import { type ImageRef, writeImageToWorkspace } from './images.js'
-import { rowsToMessages } from './messages.js'
+import { rowsToMessages, textOf } from './messages.js'
 
 // MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
 // lease sits just above it so a job blocked on approval outlives the timeout.
@@ -66,29 +67,8 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     let notifyChain: Promise<void> = Promise.resolve()
     const base = deps.provider ?? new GeminiProvider()
     // Decorate with tracing: each provider call persists an llm_calls row (observability).
-    const provider = new TracingProvider(base, async (trace) => {
-      const promptTokens = trace.promptTokens ?? 0
-      const completionTokens = trace.completionTokens ?? 0
-      await db.insert(llmCalls).values({
-        agentRunId: runId,
-        model: trace.model,
-        request: trace.request,
-        tools: trace.tools,
-        responseText: trace.responseText,
-        responseToolCalls: trace.responseToolCalls,
-        promptTokens,
-        completionTokens,
-        costUsd: computeCostUsd(
-          trace.model,
-          promptTokens,
-          completionTokens,
-          trace.cachedTokens ?? 0,
-        ).toFixed(6),
-        finishReason: trace.finishReason ?? null,
-        latencyMs: trace.latencyMs,
-        error: trace.error ?? null,
-      })
-    })
+    // toolCallId stays null ⇒ rollupUsage counts these toward the run's model (loop calls).
+    const provider = new TracingProvider(base, (trace) => insertLlmCall(db, runId, trace))
 
     // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval /
     // ask_user can update the row the loop is talking about. Built before the toolset so
@@ -284,6 +264,12 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       }
     }
 
+    // Best-effort auto-title (§7.5 auto-name): one cheap out-of-loop LLM call from the opening
+    // exchange, gated on the title still being null. Runs BEFORE rollupUsage so the title
+    // call's cost rolls into the run (its synthetic tool_call_id keeps it out of the model
+    // pick), and never fails the already-successful run.
+    await maybeAutoTitle(db, base, run, history, finalMessages)
+
     await db
       .update(agentRuns)
       .set({ status: 'done', finishedAt: new Date(), ...(await rollupUsage(db, runId)) })
@@ -304,6 +290,187 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       })
       .where(eq(agentRuns.id, runId))
     await notifyRun(run.conversationId, { type: 'error', message })
+  }
+}
+
+// Persist one LlmTrace as an llm_calls row (the observability record, §6.5). Shared by the
+// loop's TracingProvider (toolCallId null ⇒ a loop call that counts toward the run's model)
+// and the out-of-loop auto-title call (toolCallId set ⇒ excluded from the model pick by
+// rollupUsage's tool_call_id IS NULL filter, while its cost still rolls into the run).
+async function insertLlmCall(
+  db: ReturnType<typeof getDb>,
+  runId: string,
+  trace: LlmTrace,
+  toolCallId?: string,
+): Promise<void> {
+  const promptTokens = trace.promptTokens ?? 0
+  const completionTokens = trace.completionTokens ?? 0
+  await db.insert(llmCalls).values({
+    agentRunId: runId,
+    toolCallId: toolCallId ?? null,
+    model: trace.model,
+    request: trace.request,
+    tools: trace.tools,
+    responseText: trace.responseText,
+    responseToolCalls: trace.responseToolCalls,
+    promptTokens,
+    completionTokens,
+    costUsd: computeCostUsd(
+      trace.model,
+      promptTokens,
+      completionTokens,
+      trace.cachedTokens ?? 0,
+    ).toFixed(6),
+    finishReason: trace.finishReason ?? null,
+    latencyMs: trace.latencyMs,
+    error: trace.error ?? null,
+  })
+}
+
+// Cap on each side of the opening exchange fed to the title prompt — a huge message can't
+// blow up the call (the model only needs the gist to title it).
+const TITLE_INPUT_CAP = 2000
+// Final sanitized title length cap (matches the sidebar's expectations).
+const TITLE_MAX_CHARS = 60
+
+// The message's prose for titling (reuses the canonical textOf — non-text parts contribute
+// nothing), trimmed and length-capped so a huge message can't blow up the prompt.
+function exchangeText(message: Message | undefined): string {
+  return message ? textOf(message.content).trim().slice(0, TITLE_INPUT_CAP) : ''
+}
+
+// Trim, strip surrounding quotes, collapse internal whitespace/newlines, cap length.
+// Returns '' when nothing usable remains (caller then leaves the title null to retry).
+function sanitizeTitle(raw: string): string {
+  let title = raw.trim().replace(/\s+/g, ' ')
+  // Strip a single layer of surrounding quotes the model sometimes adds — straight or curly,
+  // and curly pairs open/close with *different* chars (“…”), so match the pair, not a backref.
+  const quoted = title.match(/^["'“”](.*)["'“”]$/)
+  if (quoted) title = quoted[1]!.trim()
+  return title.slice(0, TITLE_MAX_CHARS).trim()
+}
+
+// Best-effort auto-title (§7.5 auto-name): one cheap out-of-loop LLM call from the opening
+// exchange, gated on the conversation's title still being null. Runs BEFORE the final
+// rollupUsage (so the title call's cost rolls into the run while its synthetic tool_call_id
+// keeps it out of the model derivation) and is wrapped entirely in try/catch — a titling
+// failure logs and is swallowed, never failing the already-successful run (mirrors the
+// best-effort "don't ask again" pattern). A failed attempt naturally retries on the next
+// still-null run.
+async function maybeAutoTitle(
+  db: ReturnType<typeof getDb>,
+  base: LlmProvider,
+  run: typeof agentRuns.$inferSelect,
+  history: Message[],
+  finalMessages: Message[],
+): Promise<void> {
+  let titleCallId: string | undefined
+  try {
+    // (a) Gate: only title while the conversation has no title — never overwrite an
+    // agent-set or /rename'd one (idempotent, self-healing).
+    const [conv] = await db
+      .select({ title: conversations.title })
+      .from(conversations)
+      .where(eq(conversations.id, run.conversationId))
+    if (!conv || conv.title !== null) return
+
+    // (b) Inputs: the opening exchange — the first user message and the first assistant reply.
+    const firstUser = history.find((m) => m.role === 'user')
+    const firstAssistant = finalMessages.slice(history.length).find((m) => m.role === 'assistant')
+    const userText = exchangeText(firstUser)
+    const assistantText = exchangeText(firstAssistant)
+    if (!userText && !assistantText) return // nothing to title from
+
+    // (c) Synthetic tool_calls row — the cost-attribution anchor (CHANGELOG 47): the title's
+    // llm_calls row links to it, so rollupUsage's tool_call_id IS NULL filter excludes the
+    // title model from the run's model pick while its cost still rolls in. Created 'running'
+    // (in-flight, like any tool call) and finalized to 'done'/'failed' below, so it never
+    // lingers as a result-less terminal row and respects §10.9 (running → done/failed).
+    const [titleCall] = await db
+      .insert(toolCalls)
+      .values({
+        agentRunId: run.id,
+        toolName: 'auto_title',
+        args: {},
+        trustTier: 'read',
+        status: 'running',
+        startedAt: new Date(),
+      })
+      .returning({ id: toolCalls.id })
+    titleCallId = titleCall!.id
+
+    // (d) The title call: drive the provider directly (tools: []), traced so it lands on
+    // /debug like any other call but linked to the synthetic tool_call. model undefined ⇒
+    // GeminiProvider falls back to GEMINI_MODEL (reuse the chat model, no new config key).
+    const titleMessages: Message[] = [
+      {
+        role: 'system',
+        content: [
+          {
+            type: 'text',
+            text:
+              'Generate a concise 3–6 word title for this conversation. ' +
+              'Reply with ONLY the title — no surrounding quotes, no trailing punctuation.',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text:
+              'Title this conversation based on its opening exchange:\n\n' +
+              `User: ${userText}\n\n` +
+              `Assistant: ${assistantText}`,
+          },
+        ],
+      },
+    ]
+    const titleProvider = new TracingProvider(base, (trace) =>
+      insertLlmCall(db, run.id, trace, titleCallId),
+    )
+    let raw = ''
+    for await (const ev of titleProvider.stream(titleMessages, [], {
+      model: run.model ?? undefined,
+    })) {
+      if (ev.type === 'text') raw += ev.text
+    }
+
+    // (e) Sanitize; an empty result leaves the title null so the next run retries.
+    const title = sanitizeTitle(raw)
+
+    // (f) Write the title — the `title IS NULL` guard closes the race with a concurrent
+    // /rename; `.returning()` tells us whether we actually won it (first writer wins), so we
+    // don't push a title the owner's /rename already overwrote.
+    const applied =
+      title.length > 0 &&
+      (
+        await db
+          .update(conversations)
+          .set({ title })
+          .where(and(eq(conversations.id, run.conversationId), isNull(conversations.title)))
+          .returning({ id: conversations.id })
+      ).length > 0
+
+    // Finalize the synthetic row (terminal, with the outcome) — never a result-less 'done'.
+    await db
+      .update(toolCalls)
+      .set({ status: 'done', finishedAt: new Date(), result: { title: title || null, applied } })
+      .where(eq(toolCalls.id, titleCallId))
+
+    // (g) Surface it live to the open chat + sidebar (§7.5) — only when we actually set it.
+    if (applied) await notifyRun(run.conversationId, { type: 'title', title })
+  } catch (err) {
+    console.error(`[run ${run.id}] auto-title failed:`, err)
+    // Mark the in-flight synthetic row failed (running → failed, §10.9) so it doesn't linger.
+    if (titleCallId) {
+      await db
+        .update(toolCalls)
+        .set({ status: 'failed', finishedAt: new Date(), error: String(err) })
+        .where(eq(toolCalls.id, titleCallId))
+        .catch(() => {})
+    }
   }
 }
 
