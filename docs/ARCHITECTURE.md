@@ -270,13 +270,13 @@ All ingresses follow the same shape: receive input → look up/create the conver
 **Hono** (small, fast, no SSR — the UI is a single-page chat behind auth). Actual routes (`services/webserver/src/app.ts`):
 
 - `GET /*` — serve the built PWA (static, fallback `index.html`); `GET /api/health` — liveness.
-- `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `GET /api/conversations/:id` — `{ id, title }` for the chat header (null title for a never-created conversation, not 404).
+- `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `GET /api/conversations/:id` — `{ id, title }` for the chat header (null title for a never-created conversation, not 404); `GET /api/conversations` — the owner's recent `web` conversations (`{ id, title, lastActiveAt }`, newest-active first, ≤100) backing the history sidebar.
 - `POST /api/conversations/:id/commands` — run a backend-owned slash command (`/rename`, `/help`) instead of messaging the agent: no message row, no run, no LLM cost; `GET /api/commands` — the command catalog driving the web autocomplete palette. Spec: `docs/specs/2026-06-09-chat-commands.md`.
 - `POST /api/conversations/:id/files` — multipart image upload into the conversation workspace (§6.5); `GET /media/:conversationId/:filename` — serve a workspace file (path-confined). Together they underpin vision input + in-chat image rendering.
 - `GET`/`POST /api/interactions/:id` — generic fetch-prompt + first-writer-wins resolve, serving *both* approvals and questions (§10.2). The POST accepts an optional `remember` flag that persists the decision into `tools.require_approval` (§16).
 - `GET`/`PATCH /api/tools` — tool catalog + per-tool approval settings (§16). Debug (§6.5): `GET /api/debug/conversations` — the per-conversation ledger (recent runs grouped by conversation, uncapped token/cost aggregates); `GET /api/debug/runs/:id` — the full per-run exchange. The flat `GET /api/debug/runs` list still exists but the page no longer uses it.
 
-No conversation-*list* route yet — the client opens a single conversation by id (a history/list view is post-MVP, §11).
+The client routes each conversation at `/conversation/:id` (deep-linkable, refresh-stable; `/` redirects to the last-opened or newest conversation), and `GET /api/conversations` backs a history sidebar (§11). Ordering uses `conversations.last_active_at`, bumped on each posted user message via `ensureConversation({ touch: true })` (spec `docs/specs/2026-06-11-conversation-list-history.md`).
 
 ### 9.2 Discord · 9.3 Voice · 9.4 Autonomous triggers — all post-MVP
 
@@ -292,15 +292,16 @@ No conversation-*list* route yet — the client opens a single conversation by i
 
 ## 11. Web Frontend
 
-**Stack** (as built — `clients/web/package.json`): **Vite + React + TS** (non-SSR SPA); **Tailwind v4** owning the design tokens (warm espresso/brass theme) with hand-rolled components (shadcn/Radix planned but *not adopted* — too small to earn it) and self-hosted Hanken Grotesk (no CDN, per CONCEPT); **`react-router-dom`** for Chat (`/`), Tools (`/tools`), Debug (`/debug`); **streaming via a hand-rolled `EventSource`**, not `@ai-sdk/react` (neither it nor TanStack Query is installed — chat state is plain `useState`, non-chat fetches plain `fetch`). **PWA (`vite-plugin-pwa`) planned, not yet installed** — a plain HTTPS SPA today; installability + Web Push land when notifications do (push intended for "agent finished" / "approval needed"; iOS 16.4+). **No voice — the PWA is chat-only** (§9.3).
+**Stack** (as built — `clients/web/package.json`): **Vite + React + TS** (non-SSR SPA); **Tailwind v4** owning the design tokens (warm espresso/brass theme) with hand-rolled components (shadcn/Radix planned but *not adopted* — too small to earn it) and self-hosted Hanken Grotesk (no CDN, per CONCEPT); **`react-router-dom`** for Chat (`/conversation/:id`, with `/` redirecting to the last-opened or newest conversation), Tools (`/tools`), Debug (`/debug`); **streaming via a hand-rolled `EventSource`**, not `@ai-sdk/react` (neither it nor TanStack Query is installed — chat state is plain `useState`, non-chat fetches plain `fetch`). **PWA (`vite-plugin-pwa`) planned, not yet installed** — a plain HTTPS SPA today; installability + Web Push land when notifications do (push intended for "agent finished" / "approval needed"; iOS 16.4+). **No voice — the PWA is chat-only** (§9.3).
 
 **Screens** — *Built:*
 
-- **Chat** (`/`, single conversation by id) — streams Alfred's turns as one cohesive live block; approvals render *inline* as a card (with a "don't ask again" checkbox that writes the §16 setting); tool calls show as quiet inline chips; image content (uploads, screenshots, generated) renders as thumbnails with a click-to-zoom lightbox; a paperclip control uploads images; the conversation title sits in the header; and a slash-command palette offers prefix autocomplete (`/rename`, `/help`).
+- **Chat** (`/conversation/:id`) — streams Alfred's turns as one cohesive live block; approvals render *inline* as a card (with a "don't ask again" checkbox that writes the §16 setting); tool calls show as quiet inline chips; image content (uploads, screenshots, generated) renders as thumbnails with a click-to-zoom lightbox; a paperclip control uploads images; the conversation title sits in the header; and a slash-command palette offers prefix autocomplete (`/rename`, `/help`).
 - **Tools** (`/tools`) — per-tool and per-group approval toggles (§16).
 - **Debug** (`/debug`) — a **per-conversation ledger**: conversations in a rail (run-status sparkline + token/cost totals), each expanding to a timeline of its runs, each run lazy-loading the full exchange (per-tool cost breakdown, `llm_calls`, tool calls). *Reworked from the original flat per-run `llm_calls` list.*
+- **Conversation history** — a collapsible sidebar on the chat surface lists past conversations (newest-active first; titled, or "New conversation" when untitled), each a `/conversation/:id` link with the active one highlighted; a persistent rail on desktop, an overlay drawer on mobile.
 
-*Planned:* a conversation list/history view (no list route yet, §9.1), an approvals queue, and Settings (keys, integrations, persona).
+*Planned:* an approvals queue and Settings (keys, integrations, persona).
 
 ---
 

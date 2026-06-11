@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
 import { type Db } from './client.js'
 import { conversations, users } from './schema.js'
@@ -10,14 +11,18 @@ export type DbOrTx = Db | Parameters<Parameters<Db['transaction']>[0]>[0]
 // Seed the owner user + the conversation row (idempotent), the one place that shape lives —
 // shared by the message ingress and the /rename command so they can't drift. When `title` is
 // given, it's folded into the same upsert (set on conflict), so naming a brand-new or an
-// existing conversation is a single atomic statement. ingress/channelKey default to the web
-// shape (channelKey = conversationId); a future ingress passes its own.
+// existing conversation is a single atomic statement. When `touch` is set, the conflict path
+// also bumps `lastActiveAt` to now() on the existing row (a brand-new insert already defaults
+// it to now(), so touch only matters for an existing row) — this is how a posted message keeps
+// the conversation's recency current for the history list. title + touch can apply together.
+// ingress/channelKey default to the web shape (channelKey = conversationId); a future ingress
+// passes its own.
 export async function ensureConversation(
   db: DbOrTx,
   conversationId: string,
-  opts: { ingress?: string; channelKey?: string; title?: string } = {},
+  opts: { ingress?: string; channelKey?: string; title?: string; touch?: boolean } = {},
 ): Promise<void> {
-  const { ingress = 'web', channelKey = conversationId, title } = opts
+  const { ingress = 'web', channelKey = conversationId, title, touch } = opts
   await db.insert(users).values({ id: OWNER_USER_ID, displayName: 'Owner' }).onConflictDoNothing()
   const insert = db
     .insert(conversations)
@@ -28,7 +33,11 @@ export async function ensureConversation(
       channelKey,
       ...(title !== undefined ? { title } : {}),
     })
-  await (title !== undefined
-    ? insert.onConflictDoUpdate({ target: conversations.id, set: { title } })
+  const set = {
+    ...(title !== undefined ? { title } : {}),
+    ...(touch ? { lastActiveAt: sql`now()` } : {}),
+  }
+  await (Object.keys(set).length > 0
+    ? insert.onConflictDoUpdate({ target: conversations.id, set })
     : insert.onConflictDoNothing())
 }

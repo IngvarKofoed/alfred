@@ -68,7 +68,7 @@ app.post('/api/conversations/:id/messages', async (c) => {
   let runId: string
   try {
     runId = await db.transaction(async (tx) => {
-      await ensureConversation(tx, conversationId)
+      await ensureConversation(tx, conversationId, { touch: true })
       const [msg] = await tx
         .insert(messages)
         .values({
@@ -177,6 +177,24 @@ app.get('/media/:conversationId/:filename', async (c) => {
   c.header('Content-Type', contentTypeFor(filename))
   c.header('Content-Length', String(info.size))
   return c.body(Readable.toWeb(createReadStream(abs)) as ReadableStream)
+})
+
+// The owner's recent web conversations, for the chat-surface history sidebar. Newest-active
+// first (the resurrected last_active_at, bumped per message), capped at 100. Selects
+// (id, title, last_active_at) only — no message join; an untitled row (null title) is labelled
+// "New conversation" by the client. Scoped to ingress='web' (post-MVP ingresses excluded).
+app.get('/api/conversations', async (c) => {
+  const rows = await getDb()
+    .select({
+      id: conversations.id,
+      title: conversations.title,
+      lastActiveAt: conversations.lastActiveAt,
+    })
+    .from(conversations)
+    .where(eq(conversations.ingress, 'web'))
+    .orderBy(desc(conversations.lastActiveAt))
+    .limit(100)
+  return c.json({ conversations: rows })
 })
 
 // Conversation metadata (the title), for the chat header. A never-created conversation is fine

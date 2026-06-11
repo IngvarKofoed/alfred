@@ -3,7 +3,7 @@
 - [ ] Agent generated code running in the context of the tools. — capability authoring: let Alfred write reusable scripts/skills (over the Python sandbox + workspace) that call other tools and can be re-invoked by name; the seed of self-extension.
 - [ ] Discord bot (build-order step 6) — second ingress over the same conversations/runs, proving "one Alfred, many surfaces, shared memory"; reactions as the approval UI.
 - [x] Wire up `ask_user` / the question pause path — built-in tool creating a `kind='question'` interaction, reusing the existing approval machinery (§7.3/§10.2). Lets Alfred ask the owner structured questions mid-run. (CHANGELOG 59; question-card "Other" free-text fix CHANGELOG 60)
-- [ ] Conversation list / history view in the web client — no list route yet (§9.1); the client opens a single conversation by id with no way to browse past ones.
+- [x] Conversation list / history view in the web client — URL routing `/conversation/:id` + a collapsible history sidebar backed by `GET /api/conversations`, ordered by the resurrected `last_active_at`. (CHANGELOG 63)
 - [ ] LLM retry/backoff (§10.7) — provider-level exponential backoff (1/2/4/8s, 4 attempts → `llm_unavailable`); today a transient 429/5xx kills the run immediately.
 - [ ] User-initiated cancellation (§10.6) — cancel route + `AbortSignal` into `runAgent` + mid-run status check; the `cancelled` event/transitions are reserved but nothing emits them.
 - [ ] Backup strategy (§17) — scheduled `pg_dump` + Chrome profile + `.env` + workspaces off-box (tailnet NAS or encrypted bucket), reusing the updater's process pattern. Before anything irreplaceable lands.
