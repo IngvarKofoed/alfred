@@ -35,6 +35,9 @@ export class GeminiProvider implements LlmProvider {
         model,
         contents: toGeminiContents(messages),
         config: {
+          // Abort is client-side only (per the SDK docs): it stops us reading the stream,
+          // not Google's generation — partially generated tokens may still be billed.
+          ...(opts?.signal ? { abortSignal: opts.signal } : {}),
           ...(systemInstruction ? { systemInstruction } : {}),
           ...(functionDeclarations.length ? { tools: [{ functionDeclarations }] } : {}),
         },
@@ -90,6 +93,10 @@ export class GeminiProvider implements LlmProvider {
 // recognize is rethrown untouched so genuine API errors (4xx/5xx) keep their own message.
 export function translateGeminiError(err: unknown): unknown {
   if (!(err instanceof Error)) return err
+  // An aborted request (the run was cancelled, §10.6) is not a connectivity failure — pass
+  // it through untouched so it is never rewritten into the offline message. The worker
+  // classifies cancels by its own AbortController's signal, never by error shape.
+  if (err.name === 'AbortError') return err
   const cause = (err as { cause?: unknown }).cause
   const code =
     cause && typeof cause === 'object' && 'code' in cause ? String((cause as { code: unknown }).code) : undefined

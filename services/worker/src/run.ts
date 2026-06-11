@@ -13,7 +13,7 @@ import {
 } from '@alfred/agent-core'
 import { agentRuns, conversations, getDb, llmCalls, messages, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
-import { and, asc, eq, isNull } from 'drizzle-orm'
+import { and, asc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
 import { buildRunTools } from './catalog.js'
 import { notifyRun } from './events.js'
@@ -39,19 +39,37 @@ export interface RunDeps {
 }
 
 // Advance one run to completion: load history, run the loop streaming tokens over NOTIFY,
-// persist the assistant turn, and move the run to done/failed. Idempotent on status.
+// persist the assistant turn, and move the run to done/failed. Idempotent on status. A
+// route-cancelled run (§10.6) is left exactly as the cancel route wrote it — the worker
+// only aborts promptly and tops up tokens/cost.
 export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
   const db = getDb()
 
   const [run] = await db.select().from(agentRuns).where(eq(agentRuns.id, runId))
   if (!run || run.status !== 'pending') return // already handled / cancelled
 
-  await db
-    .update(agentRuns)
-    .set({ status: 'running', startedAt: new Date() })
-    .where(eq(agentRuns.id, runId))
+  // One AbortController per run (§10.6). The cancel ROUTE owns the terminal write + cascade
+  // and NOTIFYs {type:'cancelled'}; the worker's only cancellation job is to abort the
+  // in-flight work and finalize without touching what the route wrote.
+  const controller = new AbortController()
+  let unwatch: (() => Promise<void>) | undefined
 
   try {
+    // Start the watcher BEFORE the pending->running flip so there is no notify gap: a cancel
+    // landing before the LISTEN already made the run terminal (so the guarded flip below
+    // loses and we bail), and a cancel landing after it fires the watcher. A watcher that
+    // fails to start lands in the catch below as an honest run failure.
+    unwatch = await watchForCancel(run.conversationId, () => controller.abort())
+
+    // Guarded flip (§10.9, terminal states are absorbing): a pre-pickup cancel already wrote
+    // 'cancelled' — losing here means never resurrect a terminal run.
+    const flipped = await db
+      .update(agentRuns)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'pending')))
+      .returning({ id: agentRuns.id })
+    if (flipped.length === 0) return // a cancel won the pre-pickup race
+
     const rows = await db
       .select({ role: messages.role, content: messages.content })
       .from(messages)
@@ -85,6 +103,7 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         toolCallId: toolCallRowIds.get(callId) ?? null,
         kind: 'question',
         prompt,
+        signal: controller.signal,
       })) as { selected_labels?: string[]; freeform_text?: string } | null
       // null/timeout ⇒ an error-shaped result so the model sees the question went unanswered
       // rather than mistaking it for an empty selection.
@@ -122,6 +141,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       tools,
       messages: history,
       model: run.model ?? undefined,
+      // The cancel signal (§10.6): the loop checks it at its turn/tool checkpoints and
+      // forwards it to the provider SDK, so a cancel kills the in-flight LLM stream too.
+      signal: controller.signal,
       onText: (delta) => {
         notifyChain = notifyChain.then(() =>
           notifyRun(run.conversationId, { type: 'token', text: delta }),
@@ -183,6 +205,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
             persistedResult = { error: 'image persistence failed', summary: outcome.result.summary }
           }
         }
+        // Guarded (§10.9, terminal states are absorbing): only a still-active row takes the
+        // outcome. A cancel's cascade may have already flipped this row to 'failed' while the
+        // invoke was in flight — the settled result is dropped and the cascade's write stands.
         await db
           .update(toolCalls)
           .set({
@@ -191,7 +216,12 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
             error: outcome.error ?? null,
             finishedAt: new Date(),
           })
-          .where(eq(toolCalls.id, rowId))
+          .where(
+            and(
+              eq(toolCalls.id, rowId),
+              inArray(toolCalls.status, ['pending', 'awaiting_user', 'running']),
+            ),
+          )
         notifyChain = notifyChain.then(() =>
           notifyRun(run.conversationId, { type: 'tool_call_end', id: call.id }),
         )
@@ -234,12 +264,29 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         if (call.group && call.trustTier !== 'destructive' && approvedGroups.has(call.group)) {
           return { approved: true }
         }
-        const verdict = await requestApproval(db, run.conversationId, runId, toolCallRowIds, call)
+        const verdict = await requestApproval(
+          db,
+          run.conversationId,
+          runId,
+          toolCallRowIds,
+          call,
+          controller.signal,
+        )
         if (verdict.approved && call.group) approvedGroups.add(call.group)
         return verdict
       },
     })
     await notifyChain
+
+    // A cancel that raced the finish line (§10.6): the route already wrote the terminal
+    // status; persisting the full assistant turn here would contradict the spec's "partial
+    // output is discarded" choice — bail now, shrinking the accepted race back to a true ms
+    // window (it previously spanned the NOTIFY flush + persist + the ~1s auto-title call).
+    // Usage-only top-up; status / finished_at belong to the route.
+    if (controller.signal.aborted) {
+      await rollupUsageOnly(db, runId)
+      return
+    }
 
     // Persist everything the loop appended beyond the input (the assistant turn(s)). Inline
     // `image` parts (carrying base64) are swapped for their on-disk reference so Postgres
@@ -267,20 +314,44 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // Best-effort auto-title (§7.5 auto-name): one cheap out-of-loop LLM call from the opening
     // exchange, gated on the title still being null. Runs BEFORE rollupUsage so the title
     // call's cost rolls into the run (its synthetic tool_call_id keeps it out of the model
-    // pick), and never fails the already-successful run.
-    await maybeAutoTitle(db, base, run, history, finalMessages)
+    // pick), and never fails the already-successful run. Skipped when a cancel raced the
+    // finish line — no point titling for a run the owner just killed.
+    if (!controller.signal.aborted) {
+      await maybeAutoTitle(db, base, run, history, finalMessages, controller.signal)
+    }
 
-    await db
+    // Guarded running -> done (§10.9, terminal states are absorbing): a cancel at the finish
+    // line already wrote 'cancelled', so losing means skip the done NOTIFY (the route's
+    // cancelled event was the user-facing signal). The messages persisted above stand — the
+    // accepted ms-window race (spec). On losing, still top up tokens/cost: no exception is
+    // thrown on this path, so the catch's rollup never runs for it.
+    const doneRows = await db
       .update(agentRuns)
       .set({ status: 'done', finishedAt: new Date(), ...(await rollupUsage(db, runId)) })
-      .where(eq(agentRuns.id, runId))
-    await notifyRun(run.conversationId, { type: 'done' })
+      .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'running')))
+      .returning({ id: agentRuns.id })
+    if (doneRows.length > 0) {
+      await notifyRun(run.conversationId, { type: 'done' })
+    } else {
+      await rollupUsageOnly(db, runId)
+    }
   } catch (err) {
+    if (controller.signal.aborted) {
+      // Cancelled (§10.6): the route already wrote the terminal status + cascade and told
+      // every client with its {type:'cancelled'} NOTIFY. The worker persists NO messages,
+      // emits NOTHING, and only tops up tokens/cost (best-effort) so the cancelled run's
+      // cost stays honest — status / finished_at / error are the route's, never touched here.
+      await rollupUsageOnly(db, runId)
+      return
+    }
     const message = err instanceof Error ? err.message : String(err)
     // Roll up usage on failure too: llm_calls rows are written per call (even when the
     // run later throws), so a run that made paid calls before failing still reports its
-    // true cost/tokens rather than the 0 default.
-    await db
+    // true cost/tokens rather than the 0 default. Guarded (§10.9): only an ACTIVE run may
+    // move to failed — if it's already terminal (route-cancelled without the signal having
+    // aborted yet, or swept), the write loses, the error NOTIFY is skipped, and we fall back
+    // to the same usage-only top-up.
+    const failedRows = await db
       .update(agentRuns)
       .set({
         status: 'failed',
@@ -288,8 +359,70 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         error: message,
         ...(await rollupUsage(db, runId)),
       })
-      .where(eq(agentRuns.id, runId))
-    await notifyRun(run.conversationId, { type: 'error', message })
+      .where(
+        and(
+          eq(agentRuns.id, runId),
+          inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']),
+        ),
+      )
+      .returning({ id: agentRuns.id })
+    if (failedRows.length > 0) {
+      await notifyRun(run.conversationId, { type: 'error', message })
+    } else {
+      await rollupUsageOnly(db, runId)
+    }
+  } finally {
+    // Always tear the watcher down — its dedicated LISTEN client must never outlive the run.
+    if (unwatch) await unwatch()
+  }
+}
+
+// Open a dedicated LISTEN connection (the same per-pause pattern awaitInteraction uses) on
+// the conversation channel and fire onCancel when the webserver's cancel route NOTIFYs
+// {type:'cancelled'} (§10.6). One connection per active run — fine at single-user scale.
+// Returns an async disposer; the caller runs it in a finally so the client never leaks.
+async function watchForCancel(
+  conversationId: string,
+  onCancel: () => void,
+): Promise<() => Promise<void>> {
+  const { POSTGRES_URL } = loadConfig()
+  if (!POSTGRES_URL) throw new Error('POSTGRES_URL is not set — required to watch for cancel')
+  const client = new pg.Client({ connectionString: POSTGRES_URL })
+  await client.connect()
+  // A dropped LISTEN socket (Postgres restart mid-run) is otherwise an unhandled 'error'
+  // EventEmitter event that crashes the whole worker; log and degrade — the run continues,
+  // cancellation just won't be observed for this run.
+  client.on('error', (err) => console.error(`[cancel-watch ${conversationId}] LISTEN connection error:`, err))
+  client.on('notification', (msg) => {
+    if (!msg.payload) return
+    try {
+      const event = JSON.parse(msg.payload)
+      if (event.type === 'cancelled') onCancel()
+    } catch {
+      // ignore malformed payloads
+    }
+  })
+  try {
+    await client.query(`LISTEN "conversation:${conversationId}"`)
+  } catch (err) {
+    await client.end().catch(() => {}) // don't leak the client when LISTEN itself fails
+    throw err
+  }
+  return async () => {
+    await client.query(`UNLISTEN "conversation:${conversationId}"`).catch(() => {})
+    await client.end().catch(() => {})
+  }
+}
+
+// Best-effort usage-only top-up for a run something ELSE already finalized (route-cancelled,
+// or swept while we raced): tokens/cost/model land on the row without touching status /
+// finished_at / error — those belong to whoever wrote the terminal state (§10.6). Never
+// throws: cost accounting must not mask the run's real outcome.
+async function rollupUsageOnly(db: ReturnType<typeof getDb>, runId: string): Promise<void> {
+  try {
+    await db.update(agentRuns).set(await rollupUsage(db, runId)).where(eq(agentRuns.id, runId))
+  } catch (err) {
+    console.error(`[run ${runId}] best-effort usage rollup failed:`, err)
   }
 }
 
@@ -363,6 +496,7 @@ async function maybeAutoTitle(
   run: typeof agentRuns.$inferSelect,
   history: Message[],
   finalMessages: Message[],
+  signal?: AbortSignal,
 ): Promise<void> {
   let titleCallId: string | undefined
   try {
@@ -431,8 +565,11 @@ async function maybeAutoTitle(
       insertLlmCall(db, run.id, trace, titleCallId),
     )
     let raw = ''
+    // The cancel signal rides along so a mid-title cancel aborts the stream into the catch
+    // below (the ~1s title call was otherwise the longest uncancellable stretch of the run).
     for await (const ev of titleProvider.stream(titleMessages, [], {
       model: run.model ?? undefined,
+      signal,
     })) {
       if (ev.type === 'text') raw += ev.text
     }
@@ -454,21 +591,24 @@ async function maybeAutoTitle(
       ).length > 0
 
     // Finalize the synthetic row (terminal, with the outcome) — never a result-less 'done'.
+    // Guarded running -> done (§10.9, terminal states are absorbing): a cancel cascade may
+    // have already flipped the row to 'failed' while the title call was in flight.
     await db
       .update(toolCalls)
       .set({ status: 'done', finishedAt: new Date(), result: { title: title || null, applied } })
-      .where(eq(toolCalls.id, titleCallId))
+      .where(and(eq(toolCalls.id, titleCallId), eq(toolCalls.status, 'running')))
 
     // (g) Surface it live to the open chat + sidebar (§7.5) — only when we actually set it.
     if (applied) await notifyRun(run.conversationId, { type: 'title', title })
   } catch (err) {
     console.error(`[run ${run.id}] auto-title failed:`, err)
     // Mark the in-flight synthetic row failed (running → failed, §10.9) so it doesn't linger.
+    // Same guard as the done path: the cancel cascade's terminal write is never overwritten.
     if (titleCallId) {
       await db
         .update(toolCalls)
         .set({ status: 'failed', finishedAt: new Date(), error: String(err) })
-        .where(eq(toolCalls.id, titleCallId))
+        .where(and(eq(toolCalls.id, titleCallId), eq(toolCalls.status, 'running')))
         .catch(() => {})
     }
   }
@@ -515,16 +655,23 @@ async function awaitInteraction(
     toolCallId: string | null
     kind: 'approval' | 'question'
     prompt: unknown
+    signal?: AbortSignal
   },
 ): Promise<unknown> {
-  const { conversationId, runId, toolCallId, kind, prompt } = args
+  const { conversationId, runId, toolCallId, kind, prompt, signal } = args
 
-  // (a) the tool_call is now waiting on the user.
+  // An already-cancelled run never opens a pause: bail before any writes. The loop's next
+  // checkpoint will throw, and the cancel route's cascade already handled the tool_call row —
+  // creating an interaction here would only orphan a pending row no one can resolve.
+  if (signal?.aborted) return null
+
+  // (a) the tool_call is now waiting on the user. Guarded (§10.9, terminal states are
+  // absorbing): a cancel cascade may already have flipped this row to 'failed'.
   if (toolCallId) {
     await db
       .update(toolCalls)
       .set({ status: 'awaiting_user' })
-      .where(eq(toolCalls.id, toolCallId))
+      .where(and(eq(toolCalls.id, toolCallId), eq(toolCalls.status, 'pending')))
   }
 
   // (b) record the pending interaction (the card the client renders).
@@ -540,11 +687,26 @@ async function awaitInteraction(
     .returning({ id: userInteractions.id })
   const interactionId = interaction!.id
 
-  // (c) the run is parked awaiting input; (d) tell the client.
-  await db
+  // (c) the run is parked awaiting input. Guarded running -> awaiting_approval: this is the
+  // §10.9 invariant-1 (terminal states are absorbing) guard for the pause-entry window —
+  // without it a cancel racing the pause resurrects a terminal run into the
+  // one-active-run index slot. Losing means the run was made terminal (cancelled/swept)
+  // between the loop checkpoint and here: flip the just-inserted interaction to 'cancelled'
+  // so no orphan pending row survives, skip the NOTIFY and the LISTEN, and bail.
+  const parked = await db
     .update(agentRuns)
     .set({ status: 'awaiting_approval' })
-    .where(eq(agentRuns.id, runId))
+    .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'running')))
+    .returning({ id: agentRuns.id })
+  if (parked.length === 0) {
+    await db
+      .update(userInteractions)
+      .set({ status: 'cancelled', resolvedAt: new Date() })
+      .where(and(eq(userInteractions.id, interactionId), eq(userInteractions.status, 'pending')))
+    return null
+  }
+
+  // (d) tell the client.
   await notifyRun(conversationId, { type: 'interaction_required', interactionId, kind })
 
   // (e) block until resolved on a dedicated LISTEN connection.
@@ -552,8 +714,13 @@ async function awaitInteraction(
   if (!POSTGRES_URL) throw new Error('POSTGRES_URL is not set — required to await interaction')
   const client = new pg.Client({ connectionString: POSTGRES_URL })
   await client.connect()
+  // A dropped LISTEN socket (Postgres restart mid-pause) is otherwise an unhandled 'error'
+  // EventEmitter event that crashes the whole worker; log and degrade (the timeout still
+  // bounds the pause).
+  client.on('error', (err) => console.error(`[interaction ${interactionId}] LISTEN connection error:`, err))
 
   let timeout: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
   try {
     await new Promise<void>((resolve) => {
       let done = false
@@ -567,7 +734,14 @@ async function awaitInteraction(
         if (!msg.payload) return
         try {
           const event = JSON.parse(msg.payload)
-          if (event.type === 'interaction_resolved' && event.interactionId === interactionId) {
+          if (
+            (event.type === 'interaction_resolved' && event.interactionId === interactionId) ||
+            // Run cancel (§10.6): the route's cascade already flipped this pending
+            // interaction to 'cancelled' — wake promptly. The post-wake read below returns a
+            // null response (approval ⇒ not approved, question ⇒ no_answer) and the aborted
+            // signal short-circuits the loop at its next checkpoint.
+            event.type === 'cancelled'
+          ) {
             finish()
           }
         } catch {
@@ -584,6 +758,15 @@ async function awaitInteraction(
           .then(() => finish())
       }, APPROVAL_TIMEOUT_MS)
 
+      // Wake on abort too: this pause's own LISTEN can subscribe AFTER the cancel NOTIFY
+      // fired, in which case it's never delivered on this connection. The run-level watcher
+      // (watchForCancel) always sees it and aborts the controller, so the abort event covers
+      // every NOTIFY this connection can miss.
+      onAbort = finish
+      signal?.addEventListener('abort', onAbort)
+      // addEventListener on an already-aborted signal never fires — check once after registering.
+      if (signal?.aborted) finish()
+
       // Subscribe, then check once for a resolution that raced the LISTEN.
       client
         .query(`LISTEN "conversation:${conversationId}"`)
@@ -594,6 +777,7 @@ async function awaitInteraction(
     })
   } finally {
     if (timeout) clearTimeout(timeout)
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
     await client.query(`UNLISTEN "conversation:${conversationId}"`).catch(() => {})
     await client.end().catch(() => {})
   }
@@ -604,7 +788,13 @@ async function awaitInteraction(
     .from(userInteractions)
     .where(eq(userInteractions.id, interactionId))
 
-  await db.update(agentRuns).set({ status: 'running' }).where(eq(agentRuns.id, runId))
+  // Guarded resume (§10.9, terminal states are absorbing): only a parked run goes back to
+  // running. A cancel during the pause already wrote 'cancelled'; losing here needs no
+  // handling — the aborted signal short-circuits the loop at its next checkpoint.
+  await db
+    .update(agentRuns)
+    .set({ status: 'running' })
+    .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'awaiting_approval')))
 
   return resolved?.response ?? null
 }
@@ -618,6 +808,7 @@ async function requestApproval(
   runId: string,
   toolCallRowIds: Map<string, string>,
   call: ApprovalRequest,
+  signal?: AbortSignal,
 ): Promise<ApprovalVerdict> {
   const prompt = {
     // Group calls render a task-scoped card: approving covers every action in the
@@ -636,6 +827,7 @@ async function requestApproval(
     toolCallId: toolCallRowIds.get(call.id) ?? null,
     kind: 'approval',
     prompt,
+    signal,
   })) as { approved?: boolean; note?: string } | null
   return response?.approved
     ? { approved: true, note: response.note }

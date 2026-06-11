@@ -1,7 +1,13 @@
 export type { Role, ContentPart, Message, StreamEvent } from './types.js'
 export type { LlmProvider, StreamOptions } from './provider.js'
 export { type Tool, type ToolContext, type ToolLlmCall, echoTool } from './tool.js'
-export { runAgent, type RunOptions, type ApprovalRequest, type ApprovalVerdict } from './loop.js'
+export {
+  runAgent,
+  CancelledError,
+  type RunOptions,
+  type ApprovalRequest,
+  type ApprovalVerdict,
+} from './loop.js'
 export { GeminiProvider } from './providers/gemini.js'
 export { TracingProvider, type LlmTrace } from './tracing.js'
 export { MODEL_PRICING, computeCostUsd, type ModelPrice } from './pricing.js'

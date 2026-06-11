@@ -16,6 +16,11 @@ export type RunEvent =
   // to the header + sidebar. Tiny payload, well under the 8000-byte cap.
   | { type: 'title'; title: string }
   | { type: 'done' }
+  // Run cancelled (§10.6). Emitted ONLY by the WEBSERVER cancel route — which composes the
+  // raw JSON itself, the way the resolve route emits interaction_resolved — never by the
+  // worker (it reacts to this event; it doesn't produce it). Listed here because events.ts
+  // stays the documented shape of everything on the conversation channel.
+  | { type: 'cancelled' }
   | { type: 'error'; message: string }
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }

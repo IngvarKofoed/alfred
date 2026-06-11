@@ -7,6 +7,7 @@ import {
   llmCalls,
   messages,
   pgNotify,
+  terminateRuns,
   toolCalls,
   tools as toolsTable,
   userInteractions,
@@ -92,6 +93,35 @@ app.post('/api/conversations/:id/messages', async (c) => {
 
   await enqueueAgentRun(runId)
   return c.json({ runId })
+})
+
+// Cancel the conversation's active run (§10.6). The route — not the worker — owns the
+// `cancelled` transition plus the §10.9 invariant-4 cascade, all in one transaction, so
+// cancel still frees the conversation when the worker is hung or dead (the case that most
+// needs it: the one-active-run index otherwise blocks new messages forever). The worker
+// reacts to the NOTIFY by aborting; it never writes `cancelled` itself. The partial unique
+// index guarantees at most one active run, so the RETURNING ids carry at most one entry.
+app.post('/api/conversations/:id/cancel', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+
+  const cancelled = await getDb().transaction((tx) =>
+    terminateRuns(tx, {
+      where: and(
+        eq(agentRuns.conversationId, conversationId),
+        inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']),
+      )!,
+      runStatus: 'cancelled',
+      error: null,
+      toolCallError: 'run cancelled',
+    }),
+  )
+  if (cancelled.length === 0) return c.json({ error: 'nothing to cancel' }, 409)
+
+  // NOTIFY only after the transaction committed, so anyone woken by the event (the parked
+  // worker, other ingresses) reads the terminal rows, never a pre-commit snapshot.
+  await pgNotify(`conversation:${conversationId}`, JSON.stringify({ type: 'cancelled' }))
+  return c.json({ cancelledRunId: cancelled[0] })
 })
 
 // Run a slash command (spec 2026-06-09-chat-commands). The client forwards a raw '/'-prefixed
@@ -197,17 +227,31 @@ app.get('/api/conversations', async (c) => {
   return c.json({ conversations: rows })
 })
 
-// Conversation metadata (the title), for the chat header. A never-created conversation is fine
-// — return a null title rather than 404.
+// Conversation metadata (the title), for the chat header, plus activeRun — whether a run is
+// currently in flight, so a mid-run refresh restores the busy state and the Stop button (the
+// owner's way to free a conversation stuck behind the one-active-run index). The existence
+// probe hits the partial active-status index, so it's cheap. A never-created conversation is
+// fine — return a null title (and no run can exist without the row's FK) rather than 404.
 app.get('/api/conversations/:id', async (c) => {
   const conversationId = c.req.param('id')
   if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
-  const [row] = await getDb()
+  const db = getDb()
+  const [row] = await db
     .select({ id: conversations.id, title: conversations.title })
     .from(conversations)
     .where(eq(conversations.id, conversationId))
-  if (!row) return c.json({ id: conversationId, title: null })
-  return c.json(row)
+  if (!row) return c.json({ id: conversationId, title: null, activeRun: false })
+  const [active] = await db
+    .select({ id: agentRuns.id })
+    .from(agentRuns)
+    .where(
+      and(
+        eq(agentRuns.conversationId, conversationId),
+        inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']),
+      ),
+    )
+    .limit(1)
+  return c.json({ ...row, activeRun: active !== undefined })
 })
 
 // Conversation history, so a page refresh restores the thread.
@@ -241,6 +285,10 @@ app.get('/api/conversations/:id/stream', (c) => {
     }
     const client = new pg.Client({ connectionString: POSTGRES_URL })
     await client.connect()
+    // A dropped LISTEN socket (Postgres restart) is otherwise an unhandled 'error'
+    // EventEmitter event that crashes the whole webserver; log and degrade — the browser's
+    // EventSource reconnects on its own.
+    client.on('error', (err) => console.error(`[sse ${conversationId}] LISTEN connection error:`, err))
     client.on('notification', (msg) => {
       if (msg.payload) void stream.writeSSE({ data: msg.payload })
     })

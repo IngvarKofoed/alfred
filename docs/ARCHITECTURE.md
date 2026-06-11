@@ -114,11 +114,11 @@ type RunEvent =
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
   | { type: 'done' }
-  | { type: 'cancelled' }           // reserved for §10.6 — not in events.ts yet, nothing emits it
+  | { type: 'cancelled' }           // emitted by the webserver cancel route, not the worker (§10.6)
   | { type: 'error';                message: string }
 ```
 
-`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `title` carries the worker's auto-generated conversation title (§7.5 auto-name), applied to the chat header + history sidebar; `interaction_required.kind` is `'approval'` or `'question'` (the `ask_user` question path, CHANGELOG 59); `cancelled` is distinct from `done` but belongs to the unbuilt cancellation flow (§10.6) — it's part of the designed shape, not yet of the `events.ts` type.
+`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `title` carries the worker's auto-generated conversation title (§7.5 auto-name), applied to the chat header + history sidebar; `interaction_required.kind` is `'approval'` or `'question'` (the `ask_user` question path, CHANGELOG 59); `cancelled` is distinct from `done` and is the one event the worker doesn't emit — the webserver's cancel route (§9.1) NOTIFYs it after writing the run terminal + cascade, and the worker reacts by aborting (§10.6, built).
 
 ### 6.3 Job queue (pg-boss)
 
@@ -271,7 +271,7 @@ All ingresses follow the same shape: receive input → look up/create the conver
 **Hono** (small, fast, no SSR — the UI is a single-page chat behind auth). Actual routes (`services/webserver/src/app.ts`):
 
 - `GET /*` — serve the built PWA (static, fallback `index.html`); `GET /api/health` — liveness.
-- `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `GET /api/conversations/:id` — `{ id, title }` for the chat header (null title for a never-created conversation, not 404); `GET /api/conversations` — the owner's recent `web` conversations (`{ id, title, lastActiveAt }`, newest-active first, ≤100) backing the history sidebar.
+- `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `POST …/cancel` — cancel the conversation's active run: terminal `cancelled` write + the §10.9 invariant-4 cascade in one transaction (the shared `terminateRuns`), then a `{type:'cancelled'}` NOTIFY; 409 when nothing is active (§10.6); `GET /api/conversations/:id` — `{ id, title, activeRun }` for the chat header and the refresh-proof busy/Stop state (null title + `activeRun: false` for a never-created conversation, not 404); `GET /api/conversations` — the owner's recent `web` conversations (`{ id, title, lastActiveAt }`, newest-active first, ≤100) backing the history sidebar.
 - `POST /api/conversations/:id/commands` — run a backend-owned slash command (`/rename`, `/help`) instead of messaging the agent: no message row, no run, no LLM cost; `GET /api/commands` — the command catalog driving the web autocomplete palette. Spec: `docs/specs/2026-06-09-chat-commands.md`.
 - `POST /api/conversations/:id/files` — multipart image upload into the conversation workspace (§6.5); `GET /media/:conversationId/:filename` — serve a workspace file (path-confined). Together they underpin vision input + in-chat image rendering.
 - `GET`/`POST /api/interactions/:id` — generic fetch-prompt + first-writer-wins resolve, serving *both* approvals and questions (§10.2). The POST accepts an optional `remember` flag that persists the decision into `tools.require_approval` (§16).

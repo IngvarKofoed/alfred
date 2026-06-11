@@ -5,7 +5,7 @@
 - [x] Wire up `ask_user` / the question pause path — built-in tool creating a `kind='question'` interaction, reusing the existing approval machinery (§7.3/§10.2). Lets Alfred ask the owner structured questions mid-run. (CHANGELOG 59; question-card "Other" free-text fix CHANGELOG 60)
 - [x] Conversation list / history view in the web client — URL routing `/conversation/:id` + a collapsible history sidebar backed by `GET /api/conversations`, ordered by the resurrected `last_active_at`. (CHANGELOG 63)
 - [ ] LLM retry/backoff (§10.7) — provider-level exponential backoff (1/2/4/8s, 4 attempts → `llm_unavailable`); today a transient 429/5xx kills the run immediately.
-- [ ] User-initiated cancellation (§10.6) — cancel route + `AbortSignal` into `runAgent` + mid-run status check; the `cancelled` event/transitions are reserved but nothing emits them.
+- [x] User-initiated cancellation (§10.6) — route-authoritative `POST /api/conversations/:id/cancel` (terminal write + §10.9 cascade via the shared `terminateRuns`) + worker `AbortController` killing the in-flight LLM stream + web Stop button with refresh-proof busy. (CHANGELOG 65)
 - [ ] Backup strategy (§17) — scheduled `pg_dump` + Chrome profile + `.env` + workspaces off-box (tailnet NAS or encrypted bucket), reusing the updater's process pattern. Before anything irreplaceable lands.
 - [ ] Morning-briefing trigger — first autonomous trigger (§9.4) end-to-end as a single vertical slice (cron → enqueue a `human_in_loop=false` run → read inbox → push a summary), exercising the §7.7 autonomous seams on one concrete job.
 - [x] Python execution sandbox — run_python + pip_install over a shared lazily-created venv, cwd = the conversation workspace, approval-gated as group 'python'. (CHANGELOG 57)

@@ -1,7 +1,8 @@
 import { loadConfig } from '@alfred/shared'
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, inArray, type SQL } from 'drizzle-orm'
 import PgBoss from 'pg-boss'
 import { getDb } from './client.js'
+import { type DbOrTx } from './queries.js'
 import { agentRuns, toolCalls, userInteractions } from './schema.js'
 
 // pg-boss lives here because it's Postgres infra sharing POSTGRES_URL. Consumers use
@@ -47,34 +48,59 @@ export async function workAgentRuns(handler: (runId: string) => Promise<void>): 
   })
 }
 
-// Startup sweep: any non-terminal run (pending/running/awaiting_approval) has no live worker
-// — we don't resume (ARCHITECTURE §7.6/§10.5) — so fail it and cascade per §10.9 invariant 4:
-// every non-terminal tool_call → failed, every still-pending interaction → cancelled. Without
-// the awaiting_approval case, a restart while an approval is open would leave a zombie run that
-// the one-active-run-per-conversation index never lets the conversation move past.
-export async function sweepOrphanedRuns(): Promise<number> {
+// §10.9 invariant 4 in one implementation: flip the runs matched by `where` to a terminal
+// status, then — in the same transaction — cascade: every non-terminal tool_call → failed,
+// every still-pending interaction → cancelled, so a terminated run can never leave zombie
+// rows behind (RUNTIME §10.5/§10.6). The caller owns the transaction (the tx param, like
+// ensureConversation): the startup sweep wraps its own, the webserver's cancel route folds
+// the cascade into its request transaction. Returns the ids of the runs actually
+// transitioned ([] when `where` matched nothing — e.g. nothing active to cancel).
+export async function terminateRuns(
+  tx: DbOrTx,
+  opts: {
+    where: SQL
+    runStatus: 'failed' | 'cancelled'
+    error: string | null
+    toolCallError: string
+  },
+): Promise<string[]> {
   const now = new Date()
+  const rows = await tx
+    .update(agentRuns)
+    .set({ status: opts.runStatus, error: opts.error, finishedAt: now })
+    .where(opts.where)
+    .returning({ id: agentRuns.id })
+  if (rows.length === 0) return []
+  const runIds = rows.map((r) => r.id)
+  await tx
+    .update(toolCalls)
+    .set({ status: 'failed', error: opts.toolCallError, finishedAt: now })
+    .where(
+      and(
+        inArray(toolCalls.agentRunId, runIds),
+        inArray(toolCalls.status, ['pending', 'awaiting_user', 'running']),
+      ),
+    )
+  await tx
+    .update(userInteractions)
+    .set({ status: 'cancelled', resolvedAt: now })
+    .where(and(inArray(userInteractions.agentRunId, runIds), eq(userInteractions.status, 'pending')))
+  return runIds
+}
+
+// Startup sweep: any non-terminal run (pending/running/awaiting_approval) has no live worker
+// — we don't resume (ARCHITECTURE §7.6/§10.5) — so fail it via the shared terminateRuns
+// cascade. Without the awaiting_approval case, a restart while an approval is open would leave
+// a zombie run that the one-active-run-per-conversation index never lets the conversation
+// move past.
+export async function sweepOrphanedRuns(): Promise<number> {
   return getDb().transaction(async (tx) => {
-    const rows = await tx
-      .update(agentRuns)
-      .set({ status: 'failed', error: 'orphaned (worker restart)', finishedAt: now })
-      .where(inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']))
-      .returning({ id: agentRuns.id })
-    if (rows.length === 0) return 0
-    const runIds = rows.map((r) => r.id)
-    await tx
-      .update(toolCalls)
-      .set({ status: 'failed', error: 'orphaned (worker restart)', finishedAt: now })
-      .where(
-        and(
-          inArray(toolCalls.agentRunId, runIds),
-          inArray(toolCalls.status, ['pending', 'awaiting_user', 'running']),
-        ),
-      )
-    await tx
-      .update(userInteractions)
-      .set({ status: 'cancelled', resolvedAt: now })
-      .where(and(inArray(userInteractions.agentRunId, runIds), eq(userInteractions.status, 'pending')))
-    return rows.length
+    const ids = await terminateRuns(tx, {
+      where: inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']),
+      runStatus: 'failed',
+      error: 'orphaned (worker restart)',
+      toolCallError: 'orphaned (worker restart)',
+    })
+    return ids.length
   })
 }

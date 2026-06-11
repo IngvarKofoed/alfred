@@ -50,6 +50,18 @@ export interface RunOptions {
   ) => void | Promise<void>
 }
 
+// Thrown by runAgent's cancellation checkpoints when the run's AbortSignal has fired
+// (RUNTIME §10.6). Exported so a caller *can* discriminate a cancel from a real failure
+// by error type — though the worker classifies by its own controller's signal.aborted
+// instead, so it never needs to import this. A cancel landing *between* checkpoints
+// surfaces as the provider's own abort rejection, which is equivalent for that reason.
+export class CancelledError extends Error {
+  constructor() {
+    super('run cancelled')
+    this.name = 'CancelledError'
+  }
+}
+
 // The hand-rolled agent loop (ARCHITECTURE §7.1). No framework: streaming, tool-call
 // parsing, and history are all explicit here. Returns the full message list including
 // the assistant's turns and any tool results.
@@ -60,6 +72,10 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]))
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Cancellation checkpoint (§10.6): bail before spending another model call. Mid-stream
+    // aborts are the provider's job — the signal is forwarded to the SDK via StreamOptions.
+    if (signal?.aborted) throw new CancelledError()
+
     let text = ''
     const toolCalls: { id: string; name: string; args: unknown }[] = []
 
@@ -84,6 +100,11 @@ export async function runAgent(opts: RunOptions): Promise<Message[]> {
 
     const resultParts: ContentPart[] = []
     for (const tc of toolCalls) {
+      // Cancellation checkpoint (§10.6): before onToolStart, so the worker never records a
+      // tool_calls row for a tool that will not run (a tool already mid-invoke when the
+      // cancel lands still settles on its own — interruptibility is bounded by the tool).
+      if (signal?.aborted) throw new CancelledError()
+
       const tool = toolsByName.get(tc.name)
       const trustTier = tool?.trustTier ?? 'read'
       const call: ApprovalRequest = {

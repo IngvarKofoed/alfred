@@ -92,6 +92,20 @@ export default function Chat({
 }) {
   const [history, setHistory] = useState<ChatMessage[]>([])
   const [busy, setBusy] = useState(false)
+  // Stop-button request (POST …/cancel) in flight — disables the button so a double-click
+  // can't fire two cancels. The actual teardown is never optimistic: it comes from the SSE
+  // 'cancelled' event (200) or the 409 self-heal in cancelRun.
+  const [cancelling, setCancelling] = useState(false)
+  // Set when a 'cancelled' SSE event lands: the worker's NOTIFY chain may flush a few straggler
+  // token / tool_call_* events after the route's cancel, and they must not resurrect the live
+  // block. Cleared once the post-cancel history reload settles (stragglers flush within the same
+  // tick as the cancel NOTIFY, so by then they're gone) and again when this tab starts a run
+  // (send()) — belt and braces. Time-bounding matters: a run started later from ANOTHER
+  // tab/device must stream normally here, not be dropped forever.
+  const cancelledRef = useRef(false)
+  // Set when this stream delivers a terminal event (done/cancelled/error) — gates the
+  // mount-time activeRun fetch so its stale snapshot can't re-set busy after the run ended.
+  const terminalSeenRef = useRef(false)
   const [input, setInput] = useState('')
   const [approval, setApproval] = useState<{
     interactionId: string
@@ -176,6 +190,21 @@ export default function Chat({
     const es = new EventSource(`/api/conversations/${conversationId}/stream`)
     es.onmessage = (e) => {
       const ev = JSON.parse(e.data) as RunEvent
+      // Straggler guard: after a cancel, the worker keeps flushing whatever its NOTIFY chain
+      // already queued — ignore those live-output events so they can't resurrect the live block.
+      // interaction_required is included because a straggler would re-open an approval card for
+      // an interaction the cancel cascade already resolved (§10.9 invariant 4); title because a
+      // post-cancel auto-title must not land out of band.
+      if (
+        cancelledRef.current &&
+        (ev.type === 'token' ||
+          ev.type === 'tool_call_start' ||
+          ev.type === 'tool_call_end' ||
+          ev.type === 'interaction_required' ||
+          ev.type === 'title')
+      ) {
+        return
+      }
       if (ev.type === 'token') {
         // Extend the trailing text segment, or open a new one if the last segment is a tool —
         // so text arriving after a tool starts a fresh segment below that chip (real order).
@@ -197,14 +226,35 @@ export default function Chat({
           segs.map((s) => (s.kind === 'tool' && s.id === ev.id ? { ...s, done: true } : s)),
         )
       } else if (ev.type === 'done' || ev.type === 'cancelled') {
-        // loadHistory clears the live segments once the durable turns arrive (one render).
-        setBusy(false)
-        void loadHistory()
+        terminalSeenRef.current = true
+        if (ev.type === 'cancelled') {
+          // The cancel route's cascade already resolved any pending interaction (§10.9
+          // invariant 4), so an open approval/question card must not linger; and any straggler
+          // events the worker flushes after this are dropped (see the guard above).
+          cancelledRef.current = true
+          setApproval(null)
+          setQuestion(null)
+          setQSelected([])
+          setQFreeform('')
+          setQOther(false)
+          // loadHistory clears the live segments once the durable turns arrive (one render).
+          setBusy(false)
+          // Time-bound the straggler guard: stragglers flush within the same tick as the cancel
+          // NOTIFY, so by the time this reload round-trips they're gone — and a run started
+          // afterwards from another tab/device must stream normally in this tab.
+          void loadHistory().then(() => {
+            cancelledRef.current = false
+          })
+        } else {
+          setBusy(false)
+          void loadHistory()
+        }
       } else if (ev.type === 'title') {
         // The worker's auto-generated title (sent after the first run names an untitled
         // conversation) — same path /rename uses: updates the header + bumps the sidebar reload.
         onTitleChange(ev.title)
       } else if (ev.type === 'error') {
+        terminalSeenRef.current = true
         setLiveSegments([])
         setBusy(false)
         setHistory((h) => [
@@ -216,8 +266,16 @@ export default function Chat({
         // the resolved prompt populates — approval card vs question card.
         const { interactionId, kind } = ev
         fetch(`/api/interactions/${interactionId}`)
-          .then((r) => r.json() as Promise<{ interaction: { prompt: QuestionPrompt | ApprovalPrompt } }>)
+          .then(
+            (r) =>
+              r.json() as Promise<{
+                interaction: { prompt: QuestionPrompt | ApprovalPrompt; status: string }
+              }>,
+          )
           .then((d) => {
+            // A late NOTIFY (cancel cascade, timeout, another ingress answering first) can land
+            // after the row is already terminal — never render a card for a non-pending row.
+            if (d.interaction.status !== 'pending') return
             if (kind === 'question') {
               setQuestion({ interactionId, prompt: d.interaction.prompt as QuestionPrompt })
               setQSelected([])
@@ -238,6 +296,28 @@ export default function Chat({
       }
     }
     return () => es.close()
+  }, [conversationId])
+
+  // Refresh-proof busy: if the conversation already has an active run (the page was refreshed
+  // mid-run), restore the busy state — the disabled composer, the thinking placeholder, and
+  // crucially the Stop button, the owner's only way to free a conversation stuck behind the
+  // one-active-run index. Mount-time is enough (the component remounts per conversation via
+  // key); a run that finished between this fetch and the EventSource opening (a missed 'done')
+  // self-heals via Stop's 409 path.
+  useEffect(() => {
+    let ignore = false
+    fetch(`/api/conversations/${conversationId}`)
+      .then((r) => r.json() as Promise<{ activeRun?: boolean }>)
+      .then((d) => {
+        // terminalSeenRef: this GET can resolve after the SSE already delivered the run's
+        // done/cancelled/error — a stale "active" snapshot must not re-set busy and stick
+        // the composer in Stop.
+        if (!ignore && d.activeRun && !terminalSeenRef.current) setBusy(true)
+      })
+      .catch(() => {})
+    return () => {
+      ignore = true
+    }
   }, [conversationId])
 
   // Keep the latest turn in view as messages arrive and tokens stream in. Instant (not smooth)
@@ -313,6 +393,7 @@ export default function Chat({
     if ((!text && attachments.length === 0) || busy) return
     setInput('')
     setPending([])
+    cancelledRef.current = false // a fresh run — its live events count again
     setBusy(true)
     stick.current = true // sending implies wanting to follow the new turn
 
@@ -334,6 +415,28 @@ export default function Chat({
         ...h,
         { role: 'assistant', content: [{ type: 'text', text: `⚠️ ${error ?? 'request failed'}` }] },
       ])
+    }
+  }
+
+  // Stop button: cancel the conversation's active run via the route (which owns the
+  // `cancelled` transition + cascade). On 200 nothing is cleared here — the SSE
+  // { type: 'cancelled' } event does the teardown, so every connected client converges the
+  // same way. On 409 the run finished (or failed) just before the click: self-heal by
+  // clearing busy + reloading, which also rescues a stuck-busy state (e.g. a 'done' missed
+  // between the mount-time activeRun fetch and the EventSource opening).
+  const cancelRun = async () => {
+    if (cancelling) return
+    setCancelling(true)
+    try {
+      const res = await fetch(`/api/conversations/${conversationId}/cancel`, { method: 'POST' })
+      if (res.status === 409) {
+        setBusy(false)
+        void loadHistory()
+      }
+    } catch {
+      // Network failure: leave state as-is — the Stop button re-enables for another try.
+    } finally {
+      setCancelling(false)
     }
   }
 
@@ -833,13 +936,26 @@ export default function Chat({
               aria-expanded={showCommands}
               aria-controls="command-suggestions"
             />
-            <button
-              type="submit"
-              disabled={busy || (!input.trim() && pending.length === 0)}
-              className="rounded-full bg-brass px-4 py-2 text-sm font-medium text-paper transition-colors hover:bg-brass-soft disabled:opacity-30"
-            >
-              Send
-            </button>
+            {busy ? (
+              /* While a run is active the composer's action is Stop — type="button" so it
+                 never submits the form. Disabled only while the cancel POST is in flight. */
+              <button
+                type="button"
+                onClick={() => void cancelRun()}
+                disabled={cancelling}
+                className="rounded-full bg-brass px-4 py-2 text-sm font-medium text-paper transition-colors hover:bg-brass-soft disabled:opacity-30"
+              >
+                Stop
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim() && pending.length === 0}
+                className="rounded-full bg-brass px-4 py-2 text-sm font-medium text-paper transition-colors hover:bg-brass-soft disabled:opacity-30"
+              >
+                Send
+              </button>
+            )}
           </div>
         </div>
       </form>

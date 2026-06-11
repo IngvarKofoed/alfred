@@ -8,4 +8,5 @@ export {
   enqueueAgentRun,
   workAgentRuns,
   sweepOrphanedRuns,
+  terminateRuns,
 } from './boss.js'

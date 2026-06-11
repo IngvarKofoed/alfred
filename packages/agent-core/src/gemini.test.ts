@@ -72,6 +72,14 @@ describe('translateGeminiError', () => {
     const apiErr = new Error('got status: 429 Too Many Requests')
     expect(translateGeminiError(apiErr)).toBe(apiErr)
   })
+
+  it('passes an abort through untouched (a cancelled run is not a connectivity failure)', () => {
+    // A cancelled run (§10.6) aborts the in-flight request; the resulting AbortError must
+    // never be rewritten into the offline message — same instance out, no translation.
+    const abortErr = new Error('This operation was aborted')
+    abortErr.name = 'AbortError'
+    expect(translateGeminiError(abortErr)).toBe(abortErr)
+  })
 })
 
 // Live integration test: hits the real Gemini API. Skipped when GEMINI_API_KEY is

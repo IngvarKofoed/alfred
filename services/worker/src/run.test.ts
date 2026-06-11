@@ -11,7 +11,7 @@ import {
   userInteractions,
   users,
 } from '@alfred/db'
-import { and, asc, eq } from 'drizzle-orm'
+import { and, asc, eq, inArray } from 'drizzle-orm'
 import { describe, expect, it } from 'vitest'
 import { textOf } from './messages.js'
 import { runJob } from './run.js'
@@ -181,6 +181,126 @@ describe.skipIf(!process.env.POSTGRES_URL)('worker runJob', () => {
         expect(returned?.some((t) => t.name === 'set_conversation_title')).toBe(true)
       } finally {
         await db.delete(userInteractions).where(eq(userInteractions.agentRunId, run!.id))
+        await db.delete(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
+        await db.delete(toolCalls).where(eq(toolCalls.agentRunId, run!.id))
+        await db.delete(agentRuns).where(eq(agentRuns.conversationId, convId))
+        await db.delete(messages).where(eq(messages.conversationId, convId))
+        await db.delete(conversations).where(eq(conversations.id, convId))
+      }
+    },
+    15_000,
+  )
+
+  it('does not resurrect a cancelled run', async () => {
+    const db = getDb()
+    const convId = crypto.randomUUID()
+
+    await db.insert(users).values({ id: OWNER_USER_ID, displayName: 'Owner' }).onConflictDoNothing()
+    await db
+      .insert(conversations)
+      .values({ id: convId, userId: OWNER_USER_ID, ingress: 'web', channelKey: convId })
+    // A pre-pickup cancel (§10.6): the route already wrote the terminal status before the
+    // pg-boss job was delivered. The delivered job must no-op against it.
+    const [run] = await db
+      .insert(agentRuns)
+      .values({ conversationId: convId, status: 'cancelled', finishedAt: new Date() })
+      .returning()
+
+    let streamCalled = false
+    const provider: LlmProvider = {
+      async *stream() {
+        streamCalled = true
+        yield { type: 'text', text: 'must never stream' }
+      },
+    }
+
+    try {
+      await runJob(run!.id, { provider })
+
+      // Terminal states are absorbing (§10.9): still cancelled, never flipped to running.
+      const [after] = await db.select().from(agentRuns).where(eq(agentRuns.id, run!.id))
+      expect(after!.status).toBe('cancelled')
+      expect(after!.startedAt).toBeNull()
+      expect(streamCalled).toBe(false)
+
+      const rows = await db.select().from(messages).where(eq(messages.conversationId, convId))
+      expect(rows.some((r) => r.role === 'assistant')).toBe(false)
+    } finally {
+      await db.delete(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
+      await db.delete(agentRuns).where(eq(agentRuns.conversationId, convId))
+      await db.delete(messages).where(eq(messages.conversationId, convId))
+      await db.delete(conversations).where(eq(conversations.id, convId))
+    }
+  })
+
+  it(
+    'cancel mid-stream: route writes cancelled, worker aborts, persists nothing, status stands',
+    async () => {
+      const db = getDb()
+      const convId = crypto.randomUUID()
+
+      await db
+        .insert(users)
+        .values({ id: OWNER_USER_ID, displayName: 'Owner' })
+        .onConflictDoNothing()
+      await db
+        .insert(conversations)
+        .values({ id: convId, userId: OWNER_USER_ID, ingress: 'web', channelKey: convId })
+      const [userMsg] = await db
+        .insert(messages)
+        .values({ conversationId: convId, role: 'user', content: [{ type: 'text', text: 'go' }] })
+        .returning()
+      const [run] = await db
+        .insert(agentRuns)
+        .values({ conversationId: convId, triggerMessageId: userMsg!.id, status: 'pending' })
+        .returning()
+
+      // A provider that, mid-stream, performs the cancel ROUTE's effect — the guarded
+      // terminal write + the {type:'cancelled'} NOTIFY (the cascade is a no-op here: no
+      // tool_calls or interactions exist mid-text-stream) — then, like the real SDK, dies
+      // with a rejection once the worker's watcher has aborted the run's signal.
+      const provider: LlmProvider = {
+        async *stream(_messages, _tools, opts) {
+          yield { type: 'text', text: 'partial ' }
+          await db
+            .update(agentRuns)
+            .set({ status: 'cancelled', error: null, finishedAt: new Date() })
+            .where(
+              and(
+                eq(agentRuns.id, run!.id),
+                inArray(agentRuns.status, ['pending', 'running', 'awaiting_approval']),
+              ),
+            )
+          await pgNotify(`conversation:${convId}`, JSON.stringify({ type: 'cancelled' }))
+          // Wait for the NOTIFY -> watcher -> abort round-trip; fail loudly (not flakily)
+          // if it never lands rather than hanging the suite.
+          for (let i = 0; i < 200 && !opts?.signal?.aborted; i++) {
+            await new Promise((r) => setTimeout(r, 50))
+          }
+          if (!opts?.signal?.aborted) throw new Error('cancel NOTIFY never aborted the run signal')
+          throw new Error('stream aborted')
+        },
+      }
+
+      try {
+        await runJob(run!.id, { provider })
+
+        // The route's terminal write stands. Not 'done' ⇒ the guarded done UPDATE lost ⇒ no
+        // done NOTIFY (it is gated on that UPDATE winning); error stays null ⇒ the guarded
+        // failed UPDATE lost ⇒ no error NOTIFY (gated the same way).
+        const [after] = await db.select().from(agentRuns).where(eq(agentRuns.id, run!.id))
+        expect(after!.status).toBe('cancelled')
+        expect(after!.error).toBeNull()
+
+        // The cancelled path persists nothing — the streamed 'partial ' text is discarded.
+        const rows = await db.select().from(messages).where(eq(messages.conversationId, convId))
+        expect(rows.some((r) => r.role === 'assistant')).toBe(false)
+
+        // Exactly one llm_calls row: the aborted loop call (traced via finally). No
+        // auto-title call ⇒ the cancelled finalization skipped it.
+        const trace = await db.select().from(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
+        expect(trace).toHaveLength(1)
+      } finally {
         await db.delete(llmCalls).where(eq(llmCalls.agentRunId, run!.id))
         await db.delete(toolCalls).where(eq(toolCalls.agentRunId, run!.id))
         await db.delete(agentRuns).where(eq(agentRuns.conversationId, convId))
