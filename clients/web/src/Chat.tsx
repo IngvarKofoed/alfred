@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 type ContentPart = {
   type: string
@@ -531,11 +533,12 @@ export default function Chat({
               {liveSegments.map((seg, i) =>
                 seg.kind === 'text' ? (
                   seg.text && (
-                    <div
-                      key={`t${i}`}
-                      className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink"
-                    >
-                      {seg.text}
+                    <div key={`t${i}`} className="max-w-[92%]">
+                      <Markdown
+                        text={seg.text}
+                        onImageSettled={pinToBottom}
+                        onOpenImage={setLightbox}
+                      />
                     </div>
                   )
                 ) : (
@@ -839,6 +842,171 @@ export default function Chat({
   )
 }
 
+// A markdown-embedded image (`![](url)`). NOT auto-loaded: the URL is shown as a click-to-load
+// chip first, so an assistant message carrying email/web-sourced content (ARCHITECTURE §16)
+// can't silently beacon a tracking pixel to an attacker-chosen host on render. Once loaded it's
+// width-constrained, lightbox-clickable, and fires onSettled so a late-laying-out image re-pins
+// the scroll (the markdown <img> otherwise bypasses ChatImage's onSettled wiring).
+function MarkdownImage({
+  src,
+  alt,
+  onSettled,
+  onOpen,
+}: {
+  src?: string
+  alt?: string
+  onSettled?: () => void
+  onOpen?: (src: string) => void
+}) {
+  const [loaded, setLoaded] = useState(false)
+  if (!src) return null
+  if (!loaded) {
+    let host = src
+    try {
+      host = new URL(src).host
+    } catch {
+      /* keep the raw src if it isn't a parseable URL */
+    }
+    return (
+      <button
+        type="button"
+        onClick={() => setLoaded(true)}
+        className="my-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2 text-xs text-ink-dim transition-colors hover:border-brass/40 hover:text-ink"
+      >
+        <span aria-hidden>🖼</span>
+        <span className="truncate">Load image{alt ? `: ${alt}` : ''}</span>
+        <span className="shrink-0 text-muted">{host}</span>
+      </button>
+    )
+  }
+  return (
+    <img
+      src={src}
+      alt={alt ?? ''}
+      loading="lazy"
+      onLoad={onSettled}
+      onError={onSettled}
+      onClick={onOpen ? () => onOpen(src) : undefined}
+      className={`my-2 max-h-72 max-w-full rounded-xl border border-line object-contain${
+        onOpen ? ' cursor-zoom-in transition-opacity hover:opacity-90' : ''
+      }`}
+    />
+  )
+}
+
+// Renders Alfred's message text as GitHub-flavored markdown (lists, tables, code, links, …),
+// themed to the espresso/brass palette. react-markdown never renders raw HTML (no rehype-raw),
+// so model/email-sourced content can't inject markup — XSS-safe by construction. Block elements
+// carry their own vertical margins; the wrapper zeroes the first/last so spacing is tight. Used
+// for assistant text only (user + system lines stay plain). Streaming partial markdown renders
+// fine — react-markdown emits what it can parse so far. memo'd so an unchanged text segment
+// (an earlier finished segment, or any durable bubble) doesn't re-parse when the parent
+// re-renders — only the actively-streaming trailing segment re-parses per token.
+const Markdown = memo(function Markdown({
+  text,
+  onImageSettled,
+  onOpenImage,
+}: {
+  text: string
+  onImageSettled?: () => void
+  onOpenImage?: (src: string) => void
+}) {
+  return (
+    <div className="leading-relaxed text-ink [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="my-2">{children}</p>,
+          strong: ({ children }) => <strong className="font-semibold text-ink">{children}</strong>,
+          em: ({ children }) => <em className="italic">{children}</em>,
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-brass underline decoration-brass/40 underline-offset-2 transition-colors hover:decoration-brass"
+            >
+              {children}
+            </a>
+          ),
+          ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
+          ol: ({ children }) => <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
+          // GFM task-list items carry a `task-list-item` class and render a checkbox; drop the
+          // disc marker on those so the bullet doesn't double up with the checkbox.
+          li: ({ children, className }) => (
+            <li
+              className={`pl-0.5 marker:text-muted${
+                className?.includes('task-list-item') ? ' list-none' : ''
+              }`}
+            >
+              {children}
+            </li>
+          ),
+          // GFM task-list checkbox — themed to the brass accent (it's disabled/read-only, just a marker).
+          input: ({ type, checked }) =>
+            type === 'checkbox' ? (
+              <input
+                type="checkbox"
+                checked={!!checked}
+                readOnly
+                disabled
+                className="mr-1.5 align-middle accent-brass"
+                aria-hidden
+              />
+            ) : null,
+          h1: ({ children }) => <h1 className="my-3 text-xl font-semibold text-ink">{children}</h1>,
+          h2: ({ children }) => <h2 className="my-3 text-lg font-semibold text-ink">{children}</h2>,
+          h3: ({ children }) => (
+            <h3 className="my-2 text-base font-semibold text-ink">{children}</h3>
+          ),
+          h4: ({ children }) => <h4 className="my-2 font-semibold text-ink">{children}</h4>,
+          blockquote: ({ children }) => (
+            <blockquote className="my-2 border-l-2 border-brass/40 pl-3 text-ink-dim">
+              {children}
+            </blockquote>
+          ),
+          hr: () => <hr className="my-3 border-line" />,
+          // Inline code; block code (inside <pre>) gets bg/padding/color reset by the <pre> below,
+          // and `[&>code]:text-xs` there restores a readable size (else 0.85em × text-xs ≈ 10px).
+          code: ({ children }) => (
+            <code className="rounded bg-surface px-1.5 py-0.5 font-mono text-[0.85em] text-brass-soft">
+              {children}
+            </code>
+          ),
+          pre: ({ children }) => (
+            <pre className="my-2 overflow-x-auto rounded-lg bg-surface p-3 font-mono text-xs text-ink-dim [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-xs [&>code]:text-ink-dim">
+              {children}
+            </pre>
+          ),
+          img: ({ src, alt }) => (
+            <MarkdownImage
+              src={typeof src === 'string' ? src : undefined}
+              alt={alt}
+              onSettled={onImageSettled}
+              onOpen={onOpenImage}
+            />
+          ),
+          table: ({ children }) => (
+            <div className="my-2 overflow-x-auto">
+              <table className="w-full border-collapse text-sm">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => (
+            <th className="border border-line bg-surface px-2 py-1 text-left font-semibold text-ink">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="border border-line px-2 py-1 text-ink-dim">{children}</td>
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  )
+})
+
 function Bubble({
   role,
   conversationId,
@@ -889,7 +1057,9 @@ function Bubble({
         <span className="text-xs font-semibold uppercase tracking-[0.2em] text-brass">Alfred</span>
       )}
       {text && (
-        <div className="max-w-[92%] whitespace-pre-wrap leading-relaxed text-ink">{text}</div>
+        <div className="max-w-[92%]">
+          <Markdown text={text} onImageSettled={onImageSettled} onOpenImage={onOpenImage} />
+        </div>
       )}
       {images.length > 0 && (
         <div className="flex flex-wrap gap-2 pt-0.5">
