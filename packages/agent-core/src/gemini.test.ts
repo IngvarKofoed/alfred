@@ -1,6 +1,8 @@
+import { ApiError } from '@google/genai'
 import { describe, expect, it } from 'vitest'
 import { runAgent } from './loop.js'
 import { GeminiProvider, toGeminiContents, translateGeminiError } from './providers/gemini.js'
+import { TransientLlmError } from './retry.js'
 import { echoTool } from './tool.js'
 import type { Message } from './types.js'
 
@@ -61,16 +63,38 @@ describe('translateGeminiError', () => {
     expect((out as Error).message).toMatch(/Couldn't reach the Gemini API/)
   })
 
-  it('includes the underlying code when the cause carries one', () => {
+  it('includes the underlying code when the cause carries one, tagged transient', () => {
     const err = new TypeError('fetch failed')
     ;(err as { cause?: unknown }).cause = { code: 'ENOTFOUND' }
     const out = translateGeminiError(err)
     expect((out as Error).message).toContain('ENOTFOUND')
+    // Connectivity failures are retryable — the RetryProvider (RUNTIME §10.7) re-attempts them.
+    expect(out).toBeInstanceOf(TransientLlmError)
   })
 
   it('passes a genuine API error through untouched', () => {
     const apiErr = new Error('got status: 429 Too Many Requests')
     expect(translateGeminiError(apiErr)).toBe(apiErr)
+  })
+
+  it('tags a 429 ApiError as TransientLlmError, message preserved, original as cause', () => {
+    const apiErr = new ApiError({ message: 'Too Many Requests', status: 429 })
+    const out = translateGeminiError(apiErr)
+    expect(out).toBeInstanceOf(TransientLlmError)
+    expect((out as Error).message).toBe('Too Many Requests')
+    expect((out as { cause?: unknown }).cause).toBe(apiErr)
+  })
+
+  it('tags a 5xx ApiError as TransientLlmError', () => {
+    const apiErr = new ApiError({ message: 'Service Unavailable', status: 503 })
+    expect(translateGeminiError(apiErr)).toBeInstanceOf(TransientLlmError)
+  })
+
+  it('passes a 4xx ApiError through untouched (permanent, never retried)', () => {
+    const apiErr = new ApiError({ message: 'Bad Request', status: 400 })
+    const out = translateGeminiError(apiErr)
+    expect(out).toBe(apiErr)
+    expect(out).not.toBeInstanceOf(TransientLlmError)
   })
 
   it('passes an abort through untouched (a cancelled run is not a connectivity failure)', () => {

@@ -1,6 +1,13 @@
 import { loadConfig } from '@alfred/shared'
-import { type Content, type FunctionDeclaration, GoogleGenAI, type Part } from '@google/genai'
+import {
+  ApiError,
+  type Content,
+  type FunctionDeclaration,
+  GoogleGenAI,
+  type Part,
+} from '@google/genai'
 import type { LlmProvider, StreamOptions } from '../provider.js'
+import { TransientLlmError } from '../retry.js'
 import type { Tool } from '../tool.js'
 import type { Message, StreamEvent } from '../types.js'
 
@@ -89,14 +96,21 @@ export class GeminiProvider implements LlmProvider {
 // Node's fetch throws `TypeError: fetch failed` with the real cause nested in `err.cause`
 // (a DNS/connection error carrying a `.code`). The bare "fetch failed" that otherwise
 // reaches the owner via agent_runs.error / the NOTIFY error event is useless — translate
-// the common offline/unreachable cases into something actionable. Anything we don't
-// recognize is rethrown untouched so genuine API errors (4xx/5xx) keep their own message.
+// the common offline/unreachable cases into something actionable. Retryable failures
+// (HTTP 429/5xx and the recognized connectivity cases) surface as TransientLlmError so
+// the RetryProvider (retry.ts, RUNTIME §10.7) re-attempts them; anything else passes
+// through untouched so genuine API errors (4xx) keep their own message.
 export function translateGeminiError(err: unknown): unknown {
   if (!(err instanceof Error)) return err
   // An aborted request (the run was cancelled, §10.6) is not a connectivity failure — pass
   // it through untouched so it is never rewritten into the offline message. The worker
   // classifies cancels by its own AbortController's signal, never by error shape.
   if (err.name === 'AbortError') return err
+  // Rate limits and server-side failures are transient — tag them retryable, message
+  // preserved. Other ApiErrors (4xx) are permanent and never retried.
+  if (err instanceof ApiError && (err.status === 429 || err.status >= 500)) {
+    return new TransientLlmError(err.message, { cause: err })
+  }
   const cause = (err as { cause?: unknown }).cause
   const code =
     cause && typeof cause === 'object' && 'code' in cause ? String((cause as { code: unknown }).code) : undefined
@@ -119,7 +133,7 @@ export function translateGeminiError(err: unknown): unknown {
   const isOffline = code ? offlineCodes.has(code) : err.message === 'fetch failed'
   if (isOffline) {
     const detail = code ? ` (${code})` : ''
-    return new Error(
+    return new TransientLlmError(
       `Couldn't reach the Gemini API — check your internet connection and try again${detail}.`,
       { cause: err },
     )

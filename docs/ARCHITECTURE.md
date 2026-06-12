@@ -287,7 +287,7 @@ The client routes each conversation at `/conversation/:id` (deep-linkable, refre
 
 ## 10. Runtime Flows
 
-**Moved to `docs/RUNTIME.md`** (§10): the cross-process choreography — happy path (§10.1), interaction/approval protocol + multi-ingress surfacing (§10.2–10.3), timeouts (§10.4), worker-crash sweep (§10.5), cancellation (§10.6), errors (§10.7 — LLM retry/backoff and the cost cap are *planned, not yet built*), idempotency (§10.8), and the **state machines & invariants** governing the three `status` columns (§10.9). Read it before touching the worker, loop, or run state.
+**Moved to `docs/RUNTIME.md`** (§10): the cross-process choreography — happy path (§10.1), interaction/approval protocol + multi-ingress surfacing (§10.2–10.3), timeouts (§10.4), worker-crash sweep (§10.5), cancellation (§10.6), errors (§10.7 — LLM retry/backoff is built; the cost cap remains *planned, not yet built*), idempotency (§10.8), and the **state machines & invariants** governing the three `status` columns (§10.9). Read it before touching the worker, loop, or run state.
 
 ---
 

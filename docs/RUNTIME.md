@@ -152,14 +152,14 @@ Worst case unchanged: a tool already executing can't be cancelled cleanly (e.g. 
 
 | Error class | Behavior |
 |-------------|----------|
-| LLM API transient (5xx, 429) | **Planned, not yet built.** Intended: provider abstraction retries with backoff (1s, 2s, 4s, 8s); after 4 attempts, fail with `error='llm_unavailable'`. Today there is no retry — a provider error propagates and fails the run immediately, captured in `agent_runs.error`. |
+| LLM API transient (5xx, 429) | Retried by agent-core's `RetryProvider` decorator (wrapping `TracingProvider`, so each failed attempt is its own `llm_calls` row): up to 4 retries at 1/2/4/8s backoff, only before the first streamed event reaches the consumer — a mid-stream failure stays fatal. An abort is never retried, and the backoff sleep aborts immediately. Exhausted retries fail the run with an `llm_unavailable:`-prefixed error in `agent_runs.error`. Providers classify by throwing `TransientLlmError` (Gemini: `ApiError` 429/≥500 plus the recognized offline codes). *(Built.)* |
 | LLM API permanent (4xx) | Fail run with the API's error captured in `agent_runs.error`. *(Built.)* |
 | Tool error (thrown from `invoke`) | Caught by the loop; tool_result becomes `{ error:'<message>' }`. The agent sees it next turn and can adapt. *(Built.)* |
 | Tool timeout | Each tool declares a default timeout, returning `{ error:'timeout' }` on exceed. Built per tool family, not as a framework: browser tools 30s per command (§8); `run_python` a 1–300s clamp (default 60s) with a process-tree kill, `pip_install` its own install timeout (§7.3). A *general* per-tool-timeout mechanism still doesn't exist — each family carries its own. |
 | Cost cap | **Planned, not yet built.** Intended: a per-run cap (default $1, configurable), checked after each LLM call, failing with `error='cost_exceeded'`. Today per-call and per-run cost is *computed and recorded* (`llm_calls.cost_usd` → `agent_runs.cost_usd`, §6.5) but **never enforced** — nothing aborts a run for exceeding a budget. The layered run/objective/daily budgets (§7.7) build on this same unbuilt cap. |
 | Stuck / abandoned run (worker died or hung) | Startup sweep marks any non-terminal (`pending` / `running` / `awaiting_*`) rows as `failed` on worker boot (§10.5). No dead-letter machinery — a crash means restart, and the owner re-issues. *(Built.)* |
 
-Pattern across all of these: **fail loudly into structured rows**, never silently. The `llm_calls` table captures LLM-level detail; `agent_runs` / `tool_calls` capture run-level outcomes — all in the one Postgres. (The two rows marked *planned* above are the exceptions still owed: a provider error currently fails loudly but without the retry, and there is no cost ceiling yet.)
+Pattern across all of these: **fail loudly into structured rows**, never silently. The `llm_calls` table captures LLM-level detail; `agent_runs` / `tool_calls` capture run-level outcomes — all in the one Postgres. (The one row still marked *planned* above is the exception still owed: there is no cost ceiling yet.)
 
 ### 10.8 Idempotency
 

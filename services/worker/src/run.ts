@@ -8,6 +8,7 @@ import {
   type LlmProvider,
   type LlmTrace,
   type Message,
+  RetryProvider,
   runAgent,
   TracingProvider,
 } from '@alfred/agent-core'
@@ -86,7 +87,10 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     const base = deps.provider ?? new GeminiProvider()
     // Decorate with tracing: each provider call persists an llm_calls row (observability).
     // toolCallId stays null ⇒ rollupUsage counts these toward the run's model (loop calls).
-    const provider = new TracingProvider(base, (trace) => insertLlmCall(db, runId, trace))
+    // Retry wraps OUTSIDE tracing so each failed attempt is its own traced row (§10.7) —
+    // up to 4 retries at 1/2/4/8s on transient errors; exhausted retries fail the run
+    // through the existing failed path with an llm_unavailable:-prefixed error.
+    const provider = new RetryProvider(new TracingProvider(base, (trace) => insertLlmCall(db, runId, trace)))
 
     // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval /
     // ask_user can update the row the loop is talking about. Built before the toolset so
@@ -561,6 +565,9 @@ async function maybeAutoTitle(
         ],
       },
     ]
+    // Deliberately NOT RetryProvider-wrapped (unlike the loop provider): titling is
+    // best-effort and self-healing — retrying would hold the run's `done` up to ~15s
+    // longer for a cosmetic feature (spec 2026-06-11-llm-retry-backoff, resolved choice).
     const titleProvider = new TracingProvider(base, (trace) =>
       insertLlmCall(db, run.id, trace, titleCallId),
     )

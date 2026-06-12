@@ -73,19 +73,28 @@ export class TracingProvider implements LlmProvider {
       error = err instanceof Error ? err.message : String(err)
       throw err
     } finally {
-      await this.onTrace({
-        model,
-        request: messages,
-        tools: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.inputSchema })),
-        responseText,
-        responseToolCalls,
-        promptTokens,
-        cachedTokens,
-        completionTokens,
-        finishReason,
-        latencyMs: Date.now() - start,
-        error,
-      })
+      // Best-effort: a throw from a finally REPLACES the in-flight exception, so a failed
+      // trace write (e.g. a transient Postgres error in the worker's llm_calls insert) would
+      // otherwise mask the provider's own error — defeating the RetryProvider's
+      // TransientLlmError check — or fail a healthy stream. Observability must never
+      // change the call's outcome; log and move on.
+      try {
+        await this.onTrace({
+          model,
+          request: messages,
+          tools: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.inputSchema })),
+          responseText,
+          responseToolCalls,
+          promptTokens,
+          cachedTokens,
+          completionTokens,
+          finishReason,
+          latencyMs: Date.now() - start,
+          error,
+        })
+      } catch (traceErr) {
+        console.error('[tracing] failed to record LLM trace:', traceErr)
+      }
     }
   }
 }
