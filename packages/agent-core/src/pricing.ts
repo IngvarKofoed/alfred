@@ -1,3 +1,5 @@
+import type { SpeechUsage } from './speech-provider.js'
+
 // Model pricing — public reference data (USD per 1M tokens), keyed by model id.
 // Lives in code, not .env: it's not a secret and not per-deployment (every Alfred
 // install pays Google's list price), it's structured, and price changes want a
@@ -63,4 +65,52 @@ export function computeCostUsd(
       ? images * price.perImageOutput
       : (completionTokens / 1e6) * price.outputPerMTok
   return inputCost + outputCost
+}
+
+// Speech (STT/TTS) audio rates — USD per 1M tokens. Kept SEPARATE from MODEL_PRICING/computeCostUsd
+// because the rates attach to a model id that's also used for text (STT reuses gemini-2.5-flash,
+// whose text input bills $0.30/1M for the chat loop), so they can't live in a single
+// MODEL_PRICING[model] lookup. Sources: https://ai.google.dev/gemini-api/docs/pricing (audio tier).
+// Speech rates by kind: STT bills audio input + text output; TTS bills text input + audio output.
+const SPEECH_RATES: Record<'stt' | 'tts', { inputPerMTok: number; outputPerMTok: number }> = {
+  stt: { inputPerMTok: 1.0, outputPerMTok: 2.5 }, // gemini-2.5-flash: audio in / text out
+  tts: { inputPerMTok: 0.5, outputPerMTok: 10.0 }, // gemini-2.5-flash-preview-tts: text in / audio out
+}
+
+// Cost in USD for one speech call. promptTokens = input side, completionTokens = output side; a
+// missing count contributes 0 (mirroring computeCostUsd's "unknown → 0, never a guess").
+export function computeSpeechCostUsd(usage: SpeechUsage, kind: 'stt' | 'tts'): number {
+  const { inputPerMTok, outputPerMTok } = SPEECH_RATES[kind]
+  return (
+    ((usage.promptTokens ?? 0) / 1e6) * inputPerMTok +
+    ((usage.completionTokens ?? 0) / 1e6) * outputPerMTok
+  )
+}
+
+// Build the recordOutOfLoopLlmCall fields for a speech leg from its usage — the one place that owns
+// the kind → tool name / "verb" / rate mapping and the `?? 0` token defaults, so the two recording
+// sites (webserver STT, worker TTS) can't drift. `detail` appends the per-call size to a consistent
+// "<verb> <detail>" request summary.
+export function speechLlmCallFields(
+  usage: SpeechUsage,
+  kind: 'stt' | 'tts',
+  opts: { detail: string; responseSummary?: string },
+): {
+  toolName: 'stt' | 'tts'
+  model: string
+  requestSummary: string
+  responseSummary: string
+  promptTokens: number
+  completionTokens: number
+  costUsd: number
+} {
+  return {
+    toolName: kind,
+    model: usage.model,
+    requestSummary: `${kind === 'stt' ? 'transcribe' : 'synthesize'} ${opts.detail}`,
+    responseSummary: opts.responseSummary ?? '',
+    promptTokens: usage.promptTokens ?? 0,
+    completionTokens: usage.completionTokens ?? 0,
+    costUsd: computeSpeechCostUsd(usage, kind),
+  }
 }

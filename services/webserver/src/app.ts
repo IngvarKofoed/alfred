@@ -7,12 +7,13 @@ import {
   llmCalls,
   messages,
   pgNotify,
+  recordOutOfLoopLlmCall,
   terminateRuns,
   toolCalls,
   tools as toolsTable,
   userInteractions,
 } from '@alfred/db'
-import { makeSttProvider } from '@alfred/agent-core'
+import { makeSttProvider, speechLlmCallFields, type SpeechUsage } from '@alfred/agent-core'
 import {
   audioMimeForExt,
   extForAudioMime,
@@ -215,8 +216,9 @@ app.post('/api/conversations/:id/audio', async (c) => {
   // provider's raw error text to the caller.
   const audio = Buffer.from(await file.arrayBuffer())
   let text: string
+  let sttUsage: SpeechUsage | undefined
   try {
-    ;({ text } = await makeSttProvider().transcribe(audio, { mimeType: file.type }))
+    ;({ text, usage: sttUsage } = await makeSttProvider().transcribe(audio, { mimeType: file.type }))
   } catch (err) {
     console.error('STT transcription failed:', err)
     return c.json({ error: 'speech recognition failed' }, 503)
@@ -235,6 +237,24 @@ app.post('/api/conversations/:id/audio', async (c) => {
       return c.json({ error: 'Alfred is already working on this conversation' }, 409)
     }
     throw err
+  }
+
+  // Record the STT speech-leg call against the run (best-effort, like maybeAutoTitle): a
+  // synthetic tool_calls row + a linked llm_calls row so its tokens/cost roll into the run
+  // without mislabeling the run's model. rollupUsage runs at the run's END (worker), long
+  // after this row is written, so the timing is safe. A failure here must never fail the turn.
+  if (sttUsage) {
+    try {
+      await recordOutOfLoopLlmCall(db, {
+        runId,
+        ...speechLlmCallFields(sttUsage, 'stt', {
+          detail: `${audio.length} bytes`,
+          responseSummary: transcript.slice(0, 120),
+        }),
+      })
+    } catch (err) {
+      console.error('[audio] STT cost record failed:', err)
+    }
   }
 
   await enqueueAgentRun(runId)

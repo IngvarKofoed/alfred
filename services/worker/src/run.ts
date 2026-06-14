@@ -11,10 +11,11 @@ import {
   type Message,
   RetryProvider,
   runAgent,
+  speechLlmCallFields,
   TracingProvider,
   type TtsProvider,
 } from '@alfred/agent-core'
-import { agentRuns, conversations, getDb, llmCalls, messages, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
+import { agentRuns, conversations, getDb, llmCalls, messages, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
 import { and, asc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
@@ -131,6 +132,15 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     let ttsBuffer = ''
     let ttsSeq = 0
     let ttsChain: Promise<void> = Promise.resolve()
+    // TTS cost accounting (spec 2026-06-14): accumulate per-clip usage across the run and record
+    // ONE aggregated 'tts' synthetic tool_call + llm_calls row before the done rollup, exactly like
+    // generate_image / auto_title (out-of-loop attribution). Stays 0/unset when speak=false.
+    const ttsUsage = {
+      model: undefined as string | undefined,
+      promptTokens: 0,
+      completionTokens: 0,
+      clips: 0,
+    }
 
     // Synthesize one sentence and push it as a tts_audio clip in seq order. Best-effort: any
     // failure (synthesis or workspace write) logs and drops the clip, never throwing into the
@@ -143,7 +153,17 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       const seq = ttsSeq++
       ttsChain = ttsChain.then(async () => {
         try {
-          const { audio, mimeType } = await provider.synthesize(text, { signal: controller.signal })
+          const { audio, mimeType, usage } = await provider.synthesize(text, {
+            signal: controller.signal,
+          })
+          // Accumulate this clip's usage for the aggregated 'tts' cost row (recorded after the
+          // ttsChain drains). Missing token counts contribute 0 ("unknown -> 0, never a guess").
+          if (usage) {
+            ttsUsage.model = usage.model
+            ttsUsage.promptTokens += usage.promptTokens ?? 0
+            ttsUsage.completionTokens += usage.completionTokens ?? 0
+            ttsUsage.clips++
+          }
           const ref = writeAudioToWorkspace(run.conversationId, audio, mimeType)
           await notifyRun(run.conversationId, {
             type: 'tts_audio',
@@ -439,6 +459,34 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // on TTS) and the catch path never awaits it. Inert when tts is unset (ttsChain stays a
     // resolved promise), so a typed run adds nothing.
     await ttsChain
+
+    // TTS cost accounting (spec 2026-06-14): one aggregated out-of-loop 'tts' row for the run's
+    // clips — a synthetic tool_call + linked llm_calls row (CHANGELOG 47 / auto_title pattern),
+    // so the cost rolls into the run without leaking the speech model into agent_runs.model.
+    // Placed BEFORE the final rollupUsage so its llm_calls row is summed into the done update,
+    // and gated on NOT aborted (a cancelled run discarded its tail, §10.6) + a known model.
+    // Best-effort — observability must never fail an otherwise-successful run.
+    if (!controller.signal.aborted && ttsUsage.model) {
+      try {
+        await recordOutOfLoopLlmCall(db, {
+          runId,
+          ...speechLlmCallFields(
+            {
+              model: ttsUsage.model,
+              promptTokens: ttsUsage.promptTokens,
+              completionTokens: ttsUsage.completionTokens,
+            },
+            'tts',
+            { detail: `${ttsUsage.clips} clip(s)` },
+          ),
+        })
+      } catch (err) {
+        console.error(
+          `[run ${runId}] TTS cost record failed:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+    }
 
     // Guarded running -> done (§10.9, terminal states are absorbing): a cancel at the finish
     // line already wrote 'cancelled', so losing means skip the done NOTIFY (the route's

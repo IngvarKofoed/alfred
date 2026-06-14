@@ -8,16 +8,29 @@ import { GoogleGenAI, Modality } from '@google/genai'
 // speak Alfred's streamed reply sentence-by-sentence. Both are provider-swappable by config
 // (STT_PROVIDER / TTS_PROVIDER), default Google (one credential, reusing @google/genai).
 
+// Token usage for one speech call — the audio sibling of ImageUsage (image-provider.ts). Read
+// from Gemini's usageMetadata (promptTokenCount / candidatesTokenCount); priced per kind by
+// computeSpeechCostUsd (pricing.ts), since the STT model id is shared with the chat loop but
+// bills audio input at a different rate. ElevenLabs returns no usage (it doesn't bill in tokens).
+export interface SpeechUsage {
+  model: string
+  promptTokens?: number
+  completionTokens?: number
+}
+
 // STT: audio in, text out (whole-utterance batch — no streaming STT, spec non-goal).
 export interface SttProvider {
-  transcribe(audio: Buffer, opts: { mimeType: string }): Promise<{ text: string }>
+  transcribe(audio: Buffer, opts: { mimeType: string }): Promise<{ text: string; usage?: SpeechUsage }>
 }
 
 // TTS: text in, audio out. `signal` threads a run cancel (§10.6) so in-flight synthesis aborts.
 // `mimeType` lets the worker pick the clip's file extension (the /media route derives the
 // Content-Type back from the filename).
 export interface TtsProvider {
-  synthesize(text: string, opts?: { signal?: AbortSignal }): Promise<{ audio: Buffer; mimeType: string }>
+  synthesize(
+    text: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<{ audio: Buffer; mimeType: string; usage?: SpeechUsage }>
 }
 
 // Config keys for the speech providers (added to the shared zod schema by the config slice).
@@ -76,7 +89,10 @@ export class GoogleSttProvider implements SttProvider {
     this.model = opts?.model ?? config.GEMINI_MODEL ?? DEFAULT_STT_MODEL
   }
 
-  async transcribe(audio: Buffer, opts: { mimeType: string }): Promise<{ text: string }> {
+  async transcribe(
+    audio: Buffer,
+    opts: { mimeType: string },
+  ): Promise<{ text: string; usage?: SpeechUsage }> {
     const response = await this.ai.models.generateContent({
       model: this.model,
       contents: [
@@ -98,7 +114,17 @@ export class GoogleSttProvider implements SttProvider {
       .map((p) => p.text)
       .join('')
       .trim()
-    return { text }
+
+    // Token counts for cost accounting (reads usageMetadata as GeminiImageProvider does).
+    const meta = response.usageMetadata
+    return {
+      text,
+      usage: {
+        model: this.model,
+        promptTokens: meta?.promptTokenCount,
+        completionTokens: meta?.candidatesTokenCount,
+      },
+    }
   }
 }
 
@@ -135,7 +161,7 @@ export class GoogleTtsProvider implements TtsProvider {
   async synthesize(
     text: string,
     opts?: { signal?: AbortSignal },
-  ): Promise<{ audio: Buffer; mimeType: string }> {
+  ): Promise<{ audio: Buffer; mimeType: string; usage?: SpeechUsage }> {
     const response = await this.ai.models.generateContent({
       model: this.model,
       contents: [{ role: 'user', parts: [{ text }] }],
@@ -155,7 +181,18 @@ export class GoogleTtsProvider implements TtsProvider {
     const pcm = Buffer.from(inline.data, 'base64')
     const sampleRate = parseSampleRate(inline.mimeType) ?? 24000
     const wav = pcmToWav(pcm, { sampleRate, channels: 1, bitsPerSample: 16 })
-    return { audio: wav, mimeType: 'audio/wav' }
+
+    // Token counts for cost accounting (audio output rides candidatesTokenCount).
+    const meta = response.usageMetadata
+    return {
+      audio: wav,
+      mimeType: 'audio/wav',
+      usage: {
+        model: this.model,
+        promptTokens: meta?.promptTokenCount,
+        completionTokens: meta?.candidatesTokenCount,
+      },
+    }
   }
 }
 
@@ -173,7 +210,10 @@ export class ElevenLabsSttProvider implements SttProvider {
     this.apiKey = apiKey
   }
 
-  async transcribe(audio: Buffer, opts: { mimeType: string }): Promise<{ text: string }> {
+  async transcribe(
+    audio: Buffer,
+    opts: { mimeType: string },
+  ): Promise<{ text: string; usage?: SpeechUsage }> {
     const form = new FormData()
     form.append('model_id', ELEVENLABS_STT_MODEL)
     form.append('file', new Blob([new Uint8Array(audio)], { type: opts.mimeType }), 'audio')
@@ -211,7 +251,7 @@ export class ElevenLabsTtsProvider implements TtsProvider {
   async synthesize(
     text: string,
     opts?: { signal?: AbortSignal },
-  ): Promise<{ audio: Buffer; mimeType: string }> {
+  ): Promise<{ audio: Buffer; mimeType: string; usage?: SpeechUsage }> {
     const res = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(this.voice)}`,
       {

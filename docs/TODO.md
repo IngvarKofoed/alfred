@@ -1,3 +1,5 @@
+- [ ] Show token and cost at the bottom of a conversation, update along the way 
+
 - [x] Auto update harnes
 - [x] Debug page should be per conversation — reworked into a Conversation → Run → LLM-call/tool ledger (rail with run-status sparkline + token/cost totals, lazy-loaded per-run detail). (CHANGELOG 49)
 - [ ] Agent generated code running in the context of the tools. — capability authoring: let Alfred write reusable scripts/skills (over the Python sandbox + workspace) that call other tools and can be re-invoked by name; the seed of self-extension.
@@ -13,3 +15,6 @@
 - [x] Email tools — built-in IMAP/SMTP family (list/search/read + save_draft/send_email), provider-agnostic, connect-per-call, group 'email' (reads read-tier, send/draft write-tier). (CHANGELOG 61)
 - [x] Tool usage is hidden while its happening in web app, I think we should show this
 - [x] If no internet and "fetch failed", give better error message
+- [ ] Long-term memory (pgvector, §6.4) — cross-conversation memory: create `memory_facts`, a plain-rows `memory.read(scope)` write/read path the loop consults during context assembly, then pgvector embeddings for semantic recall. The "one Alfred, one memory" pillar; open: extraction strategy (LLM-summarized vs. user-flagged).
+- [ ] Identity block + persona file (§7.5) — inject the `[system]` identity block (current time, ingress, user) the loop currently omits, and move the hardcoded `SYSTEM_PROMPT` to `packages/agent-core/personas/alfred.md`. Small, improves every turn, and a prerequisite for autonomous runs (which need time + presence).
+- [ ] Per-run cost cap enforcement (§10.7) — the planned-but-unbuilt budget guard: a configurable per-run USD cap checked after each LLM call, failing the run with `error='cost_exceeded'`. Cost is already computed onto `agent_runs.cost_usd`; nothing enforces it. A safety net before autonomous / looping runs.

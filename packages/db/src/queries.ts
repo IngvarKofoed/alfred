@@ -1,7 +1,7 @@
 import { sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
 import { type Db } from './client.js'
-import { agentRuns, conversations, messages, users } from './schema.js'
+import { agentRuns, conversations, llmCalls, messages, toolCalls, users } from './schema.js'
 
 // A Db handle or a transaction handle — so helpers can run standalone or inside a caller's
 // transaction (e.g. the message ingress, which seeds the conversation in the same tx as the
@@ -64,4 +64,57 @@ export async function createUserMessageRun(
     })
     .returning()
   return run!.id
+}
+
+// Record an out-of-loop LLM call (one the worker/webserver made outside the agent loop —
+// e.g. STT/TTS for voice) against a run, the same way the worker attributes generate_image /
+// auto_title: insert a synthetic terminal `tool_calls` row, then an `llm_calls` row linked to
+// it by `toolCallId`. The non-null link keeps the call's cost in `rollupUsage`'s all-calls sum
+// while excluding its model from the run's model derivation (tool_call_id IS NULL rows only),
+// so the speech model never mislabels the run. The call has already completed (unlike
+// auto_title, which starts 'running'), so the synthetic row is inserted terminal ('done').
+// `costUsd` is a precomputed number; stored via .toFixed(6) for the numeric column (keeping
+// @alfred/db free of any pricing/agent-core dependency).
+export async function recordOutOfLoopLlmCall(
+  db: DbOrTx,
+  params: {
+    runId: string
+    toolName: string // 'stt' | 'tts'
+    model: string
+    requestSummary: string
+    responseSummary: string
+    promptTokens: number
+    completionTokens: number
+    costUsd: number
+  },
+): Promise<void> {
+  const now = new Date()
+  const [call] = await db
+    .insert(toolCalls)
+    .values({
+      agentRunId: params.runId,
+      toolName: params.toolName,
+      args: {},
+      trustTier: 'read', // fixed: out-of-loop AI calls are read-tier audit anchors, never owner-gated
+      status: 'done', // fixed: recorded post-completion (auto_title starts 'running'; these don't)
+      startedAt: now,
+      finishedAt: now,
+      result: { summary: params.responseSummary },
+    })
+    .returning({ id: toolCalls.id })
+  await db.insert(llmCalls).values({
+    agentRunId: params.runId,
+    toolCallId: call!.id,
+    model: params.model,
+    request: { tool: true, summary: params.requestSummary },
+    tools: null,
+    responseText: params.responseSummary,
+    responseToolCalls: null,
+    promptTokens: params.promptTokens,
+    completionTokens: params.completionTokens,
+    costUsd: params.costUsd.toFixed(6),
+    finishReason: null,
+    latencyMs: 0,
+    error: null,
+  })
 }
