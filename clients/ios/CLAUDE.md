@@ -1,19 +1,24 @@
 # Alfred — clients/ios/
 
-The native iOS app (post-MVP): the only voice surface — chat + hands-free voice with on-device wake word. See `docs/INGRESSES.md` §9.3 (voice pipeline) and `docs/DEPLOYMENT.md` §14.2 (polyglot handling) for context.
+The native iOS app. **Built today: the text-chat MVP** — a SwiftUI iPhone app that is a thin REST+SSE client of the existing `alfred-webserver` (the same API the web PWA uses), with no backend changes. Spec: `docs/specs/2026-06-14-ios-text-chat-mvp.md`. It is structured so the **post-MVP voice increment** — server-side STT/TTS (INGRESSES §9.3) with on-device `AVAudioEngine` voice-processing (Apple AEC + noise suppression for "listen while speaking" / barge-in) — slots in behind one transport seam. See `docs/INGRESSES.md` §9.3 (voice pipeline) and `docs/DEPLOYMENT.md` §14.2 (polyglot handling).
 
-Contents: Swift + SPM, opened via `Alfred.xcworkspace`. **Not** a pnpm workspace member — its toolchain is entirely separate from the Node/TS stack; `pnpm install` from the root ignores it.
+Contents: a SwiftUI + Swift Concurrency app at `clients/ios/Alfred/` (`Alfred.xcodeproj`, target `Alfred`, deployment iOS 26, Swift 5 language mode), **no third-party dependencies** (Foundation/SwiftUI/PhotosUI/UserNotifications/UIKit only). The project uses **file-system synchronized groups** — a `.swift` file added under the source root (`clients/ios/Alfred/Alfred/`) automatically joins the target, so do **not** hand-edit `Alfred.xcodeproj/project.pbxproj`. **Not** a pnpm workspace member — its toolchain is separate from the Node/TS stack; `pnpm install` from the root ignores it.
 
 ## Required tools
 
-None mandated beyond Xcode's own toolchain (`xcodebuild` / Xcode). There is no Swift LSP wired into this environment; use Xcode for navigation.
+None mandated beyond Xcode's own toolchain (`xcodebuild` / Xcode). There is no Swift LSP wired into this environment; use Xcode for navigation. Editor SourceKit diagnostics can show stale cross-file "cannot find … in scope" errors before a build index exists — `xcodebuild … build` is authoritative.
 
 ## Testing
 
-Tests use **XCTest** via Xcode / `xcodebuild test`. Do not introduce a different test framework without updating the architecture doc.
+Tests use **Swift Testing** (`import Testing`) — Apple's default for new Xcode projects — run via Xcode / `xcodebuild test`. This supersedes the earlier XCTest-only mandate (owner decision, 2026-06-14); the generated `AlfredUITests` template still uses XCTest, which is fine to keep alongside. Do not introduce a third test framework without updating this doc.
+
+## Build / verify
+
+- Build (simulator, no signing): `xcodebuild -project clients/ios/Alfred/Alfred.xcodeproj -scheme Alfred -destination 'generic/platform=iOS Simulator' -configuration Debug build CODE_SIGNING_ALLOWED=NO`.
+- The app needs a server base URL (Settings) reachable over the tailnet; an end-to-end run requires the webserver + worker stack up.
 
 ## Subtree-scoped rules
 
-- **Post-MVP — do not start here.** This subtree is built only when the voice orchestrator (`services/voice`) is the active target (build-order step 8, §15).
-- **The app's only contract with the backend is the voice WebSocket** — bidirectional audio + a control channel (§9.3). API keys for STT/TTS live server-side, never in the client.
-- **Cross-protocol changes are atomic.** A change to the voice WebSocket protocol lands in one commit touching both `services/voice/` and `clients/ios/` — that atomicity is the whole point of the single repo (§14.2).
+- **The backend contract is the `alfred-webserver` REST + SSE API** (text chat — the built MVP). The voice WebSocket (§9.3) is an **additional, later** contract for the audio leg only — not the sole contract. API keys for STT/TTS live server-side, never in the client.
+- **Keep the transport seam.** The conversation logic consumes an `AsyncStream<RunEvent>` (plus side-channel REST) through a transport abstraction, so a future `VoiceSession` can emit the same events into the same view model. Don't bake SSE-only assumptions into the view layer.
+- **Cross-protocol changes are atomic.** A change to the (future) voice WebSocket protocol lands in one commit touching both `services/voice/` and `clients/ios/` — that atomicity is the point of the single repo (§14.2).

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  App Transport Security: allow plain-HTTP connections so the app can talk to the
+	  Alfred webserver over a LAN / Tailscale IP (e.g. http://100.x.y.z:3000). iOS blocks
+	  cleartext HTTP by default; Safari is exempt (which is why it reaches /api/health) but
+	  URLSession is not. This is acceptable for a single-user personal app on a trusted
+	  network. To drop this exception, front the webserver with `tailscale serve` (HTTPS
+	  MagicDNS) and point the app at the https:// host instead.
+
+	  Only this NSAppTransportSecurity dict lives here; GENERATE_INFOPLIST_FILE=YES merges
+	  the standard generated keys (bundle id, scene manifest, orientations, …) on top.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+</dict>
+</plist>
