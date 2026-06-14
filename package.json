@@ -16,8 +16,9 @@
     "db:migrate": "pnpm --filter @alfred/db db:migrate",
     "predev": "pnpm --filter \"./packages/*\" build",
     "dev": "concurrently -k -n worker,server,web -c green,cyan,magenta \"pnpm --filter @alfred/worker dev\" \"pnpm --filter @alfred/webserver dev\" \"pnpm --filter @alfred/web dev\"",
-    "dev:up": "pnpm db:start ; pnpm db:migrate && pnpm dev",
-    "deploy:up": "pm2 start ecosystem.config.cjs --env deploy"
+    "dev:up": "pnpm db:start || echo db already running && pnpm db:migrate && pnpm dev",
+    "deploy:up": "pm2 start ecosystem.config.cjs --env deploy",
+    "deploy:down": "pm2 kill"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
