@@ -12,7 +12,12 @@ const webRoot = './clients/web/dist'
 app.use('/*', serveStatic({ root: webRoot }))
 app.get('*', serveStatic({ path: `${webRoot}/index.html` })) // SPA fallback
 
-// Bind loopback only — the server sits behind `tailscale serve` (ARCHITECTURE §12).
-serve({ fetch: app.fetch, hostname: '127.0.0.1', port: config.WEBSERVER_PORT }, (info) => {
-  console.log(`alfred-webserver listening on http://127.0.0.1:${info.port}`)
+// Bind address from config (WEBSERVER_HOST): default 0.0.0.0 = LAN/tailnet-reachable (e.g. the
+// iOS app); set to 127.0.0.1 to restrict to loopback when fronted only by `tailscale serve`
+// (ARCHITECTURE §12). No auth — network position is the authentication, and the LAN behind the
+// home firewall is part of that boundary.
+serve({ fetch: app.fetch, hostname: config.WEBSERVER_HOST, port: config.WEBSERVER_PORT }, (info) => {
+  const lan = config.WEBSERVER_HOST === '0.0.0.0' || config.WEBSERVER_HOST === '::'
+  const shown = lan ? `${config.WEBSERVER_HOST} (LAN-reachable)` : config.WEBSERVER_HOST
+  console.log(`alfred-webserver listening on http://${shown}:${info.port}`)
 })

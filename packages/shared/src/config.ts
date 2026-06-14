@@ -32,6 +32,12 @@ loadDotenv()
 // only the webserver port; later steps extend the schema.
 const schema = z.object({
   WEBSERVER_PORT: z.coerce.number().int().positive().default(3000),
+  // Interface the webserver binds to. Default 0.0.0.0 = reachable on the LAN / tailnet (so the
+  // iOS app and other owner devices can connect); set WEBSERVER_HOST=127.0.0.1 to restrict to
+  // loopback (e.g. when fronted solely by `tailscale serve`). The webserver has no auth —
+  // network position IS the authentication (ARCHITECTURE §12), and the LAN behind the home
+  // firewall is part of that trusted boundary. (The browser bridge stays loopback-only, §8.)
+  WEBSERVER_HOST: z.string().default('0.0.0.0'),
   // Optional so non-DB processes (e.g. the webserver) still boot without a database.
   // packages/db enforces presence when a client is actually created.
   POSTGRES_URL: z.string().url().optional(),

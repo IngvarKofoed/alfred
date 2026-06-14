@@ -58,7 +58,7 @@ Three layers, increasing specificity: **(1) defaults in code** (`packages/shared
 
 ### 13.1 .env layout
 
-The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
+The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
 
 ```
 # Built
@@ -67,6 +67,7 @@ GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash    # provider-scoped; a future provider adds OPENAI_MODEL/etc.
 BRIDGE_WS_PORT=7865              # loopback-only WS for the extension; no token/MCP (127.0.0.1 + Origin guard)
 WEBSERVER_PORT=3000
+WEBSERVER_HOST=0.0.0.0           # bind interface; default 0.0.0.0 = LAN/tailnet-reachable (iOS app); set 127.0.0.1 for loopback-only (§12). No auth — network position is the auth; the browser bridge stays loopback (§8)
 WORKSPACE_ROOT=./data/conversations  # per-conversation working dirs (§6.5); optional — defaults here, relative paths anchored at the repo root
 PYTHON_BIN=python3               # interpreter used to create the shared venv for run_python/pip_install (§7.3); default python3 (POSIX) / python (Windows)
 PYTHON_VENV_DIR=./data/python-venv  # shared venv for the worker's Python tools; lazily created; relative paths anchored at the repo root
