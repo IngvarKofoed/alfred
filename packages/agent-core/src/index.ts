@@ -20,3 +20,13 @@ export {
   GeminiImageProvider,
   ImagenProvider,
 } from './image-provider.js'
+export {
+  type SttProvider,
+  type TtsProvider,
+  GoogleSttProvider,
+  GoogleTtsProvider,
+  ElevenLabsSttProvider,
+  ElevenLabsTtsProvider,
+  makeSttProvider,
+  makeTtsProvider,
+} from './speech-provider.js'

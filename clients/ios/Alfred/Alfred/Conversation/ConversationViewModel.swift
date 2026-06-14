@@ -73,6 +73,11 @@ final class ConversationViewModel {
     var errorBanner: String?
     /// Called when the title changes, so the parent (list/header) can update + reload the list.
     var onTitleChange: ((String) -> Void)?
+    /// The voice layer, set while hands-free is active. `tts_audio` events are forwarded to it for
+    /// playback and it's told when a run terminates so it can resume listening. Weak: the
+    /// controller owns its own lifecycle (started/stopped by the view), voice is purely additive
+    /// and only active when wired — text chat behaves identically when this is nil.
+    weak var voice: VoiceController?
 
     // MARK: - Dependencies
 
@@ -234,7 +239,7 @@ final class ConversationViewModel {
         // (done/cancelled/error) and interaction_resolved still flow through.
         if cancelledStraggler {
             switch event {
-            case .token, .toolCallStart, .toolCallEnd, .interactionRequired, .title:
+            case .token, .toolCallStart, .toolCallEnd, .interactionRequired, .title, .ttsAudio:
                 return
             default:
                 break
@@ -271,6 +276,10 @@ final class ConversationViewModel {
             busy = false
             approval = nil
             question = nil
+            // Tell the voice layer the run finished so it can drain its playback queue and resume
+            // listening (no-op when voice is off — it's nil). Voice is additive: text chat is
+            // unchanged.
+            voice?.runCompleted()
             // On cancel, drop stragglers until the post-cancel reload settles (they flush within
             // the same tick as the cancel NOTIFY, so by then they're gone) — and a run started
             // afterwards from another ingress must stream normally, hence the time-bounded clear.
@@ -285,7 +294,16 @@ final class ConversationViewModel {
             liveSegments = []
             liveTick += 1
             busy = false
+            // An error is terminal too — let the voice layer resume listening (no-op when off).
+            voice?.runCompleted()
             appendWarning(message)
+
+        case .ttsAudio(let seq, let path, let mimeType):
+            // A server-synthesized TTS clip is ready. Forward it to the voice layer for ordered
+            // playback; it's invisible to the transcript (no message row). A live event for the
+            // current run, so keep the run-tracking flags honest.
+            observedLiveEvent()
+            voice?.enqueueClip(seq: seq, path: path, mimeType: mimeType)
 
         case .title(let newTitle):
             title = newTitle

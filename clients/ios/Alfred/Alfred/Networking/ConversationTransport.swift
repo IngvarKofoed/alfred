@@ -38,6 +38,10 @@ protocol ConversationTransport: AnyObject {
     /// Upload an image into the conversation workspace.
     func upload(conversationId: String, jpegData: Data) async throws -> Attachment
 
+    /// Upload a WAV utterance to the STT+run-creation route; returns `{ runId, transcript }`.
+    /// Throws `.emptyTranscript` on HTTP 422 (silence/noise) and `.busy` on 409.
+    func uploadAudio(conversationId: String, wavData: Data) async throws -> AudioUploadResponse
+
     /// Resolve a workspace-relative path to an absolute /media URL.
     func mediaURL(conversationId: String, path: String) -> URL?
 }

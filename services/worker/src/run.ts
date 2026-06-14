@@ -7,15 +7,18 @@ import {
   isImageResult,
   type LlmProvider,
   type LlmTrace,
+  makeTtsProvider,
   type Message,
   RetryProvider,
   runAgent,
   TracingProvider,
+  type TtsProvider,
 } from '@alfred/agent-core'
 import { agentRuns, conversations, getDb, llmCalls, messages, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
 import { and, asc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
+import { writeAudioToWorkspace } from './audio.js'
 import { buildRunTools } from './catalog.js'
 import { notifyRun } from './events.js'
 import { type ImageRef, writeImageToWorkspace } from './images.js'
@@ -24,6 +27,30 @@ import { rowsToMessages, textOf } from './messages.js'
 // MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
 // lease sits just above it so a job blocked on approval outlives the timeout.
 const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
+
+// Voice TTS (run.speak, spec 2026-06-14): flush a sentence to synthesis once it ends on a
+// .!?/newline boundary AND is at least this long, so a tiny fragment ("Hi.") still speaks but
+// an abbreviation mid-sentence doesn't trigger a premature, choppy clip.
+const TTS_MIN_SENTENCE_CHARS = 12
+
+// Strip light markdown so the spoken text reads as plain prose, not symbols ("star star bold").
+// Best-effort and conservative — emphasis/heading/code markers, link/image syntax (keep the
+// visible label, drop the URL). Not a full markdown parser; the model's prose is mostly plain.
+function stripMarkdownForSpeech(text: string): string {
+  return (
+    text
+      // images then links: ![alt](url) / [label](url) -> alt / label
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+      // fenced/inline code fences -> drop the backticks, keep the content
+      .replace(/`+/g, '')
+      // emphasis/bold markers and leading heading hashes/blockquote markers
+      .replace(/[*_~]+/g, '')
+      .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+      .replace(/^\s{0,3}>\s?/gm, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  )
+}
 
 // Minimal system prompt for now; full persona assembly (§7.5) is deferred.
 const SYSTEM_PROMPT =
@@ -84,6 +111,57 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
 
     // Serialize NOTIFYs so tokens reach the client in order (onText is synchronous).
     let notifyChain: Promise<void> = Promise.resolve()
+
+    // Server-pushed TTS (spec 2026-06-14), gated entirely on run.speak — for a typed /messages
+    // run (speak=false) this whole block is inert and the path is byte-for-byte today's. The
+    // provider is constructed lazily + best-effort: a construction throw (provider not
+    // configured) logs once and disables TTS for this run; the run then proceeds completely
+    // normally. Synthesis is serialized through ttsChain (exactly like notifyChain) so clips
+    // emit in seq order and one synthesis runs at a time; a per-clip synth/write failure logs
+    // and DROPS that clip — it never throws into the run. Audio bytes go to the workspace; only
+    // a path + seq ride NOTIFY.
+    let tts: TtsProvider | undefined
+    if (run.speak) {
+      try {
+        tts = makeTtsProvider()
+      } catch (err) {
+        console.error(`[run ${runId}] TTS unavailable; speaking disabled for this run:`, err)
+      }
+    }
+    let ttsBuffer = ''
+    let ttsSeq = 0
+    let ttsChain: Promise<void> = Promise.resolve()
+
+    // Synthesize one sentence and push it as a tts_audio clip in seq order. Best-effort: any
+    // failure (synthesis or workspace write) logs and drops the clip, never throwing into the
+    // run. The cancel signal threads into synthesize so a cancel kills in-flight TTS.
+    const speakSentence = (sentence: string): void => {
+      if (!tts) return
+      const text = stripMarkdownForSpeech(sentence)
+      if (!text) return
+      const provider = tts
+      const seq = ttsSeq++
+      ttsChain = ttsChain.then(async () => {
+        try {
+          const { audio, mimeType } = await provider.synthesize(text, { signal: controller.signal })
+          const ref = writeAudioToWorkspace(run.conversationId, audio, mimeType)
+          await notifyRun(run.conversationId, {
+            type: 'tts_audio',
+            seq,
+            path: ref.path,
+            mimeType: ref.mimeType,
+          })
+        } catch (err) {
+          // Log only the message (not the full error object) — a provider error can embed the
+          // upstream response body, which shouldn't land verbatim in the worker log.
+          console.error(
+            `[run ${runId}] TTS clip ${seq} failed; dropped:`,
+            err instanceof Error ? err.message : String(err),
+          )
+        }
+      })
+    }
+
     const base = deps.provider ?? new GeminiProvider()
     // Decorate with tracing: each provider call persists an llm_calls row (observability).
     // toolCallId stays null ⇒ rollupUsage counts these toward the run's model (loop calls).
@@ -152,6 +230,29 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         notifyChain = notifyChain.then(() =>
           notifyRun(run.conversationId, { type: 'token', text: delta }),
         )
+        // Voice (run.speak): accumulate the streamed text and flush each COMPLETE sentence to
+        // TTS as it lands, so reply audio starts at the first sentence rather than the whole
+        // turn. Inert when tts is unset (speak=false or provider unavailable).
+        if (!tts) return
+        ttsBuffer += delta
+        // Flush up to the first sentence boundary whose chunk is at least the min length; keep
+        // the trailing partial for the next delta / the final flush. A short leading fragment
+        // ("Hi.", "Sure.") must NOT stop the scan — it merges into the next clip. Breaking on it
+        // (the earlier bug) re-matched that same boundary on every delta, so a reply opening with
+        // a short sentence never streamed any audio until the whole-turn final flush.
+        for (;;) {
+          const re = /[.!?\n]/g
+          let end = -1
+          for (let m = re.exec(ttsBuffer); m; m = re.exec(ttsBuffer)) {
+            if (ttsBuffer.slice(0, m.index + 1).trim().length >= TTS_MIN_SENTENCE_CHARS) {
+              end = m.index + 1
+              break
+            }
+          }
+          if (end === -1) break
+          speakSentence(ttsBuffer.slice(0, end))
+          ttsBuffer = ttsBuffer.slice(end)
+        }
       },
       onToolStart: async (call) => {
         const [row] = await db
@@ -292,6 +393,14 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       return
     }
 
+    // Voice (run.speak): flush the trailing buffer (the last sentence, which may not have ended
+    // on a boundary) as a final clip. Only reached when NOT aborted (the abort path returned
+    // above), so a cancelled run never synthesizes its tail. Inert when tts is unset.
+    if (tts && ttsBuffer.trim().length > 0) {
+      speakSentence(ttsBuffer)
+      ttsBuffer = ''
+    }
+
     // Persist everything the loop appended beyond the input (the assistant turn(s)). Inline
     // `image` parts (carrying base64) are swapped for their on-disk reference so Postgres
     // stays blob-free; the bytes were written to the workspace in onToolEnd. The persisted
@@ -323,6 +432,13 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     if (!controller.signal.aborted) {
       await maybeAutoTitle(db, base, run, history, finalMessages, controller.signal)
     }
+
+    // Voice (run.speak): drain the TTS chain so every clip's tts_audio event is sent BEFORE the
+    // terminal `done` event (the app uses `done` to stop expecting more audio). Reached only on
+    // the success path — the aborted/cancel path returned above (a cancelled run must not wait
+    // on TTS) and the catch path never awaits it. Inert when tts is unset (ttsChain stays a
+    // resolved promise), so a typed run adds nothing.
+    await ttsChain
 
     // Guarded running -> done (§10.9, terminal states are absorbing): a cancel at the finish
     // line already wrote 'cancelled', so losing means skip the done NOTIFY (the route's

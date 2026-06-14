@@ -1,7 +1,7 @@
 import { sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
 import { type Db } from './client.js'
-import { conversations, users } from './schema.js'
+import { agentRuns, conversations, messages, users } from './schema.js'
 
 // A Db handle or a transaction handle — so helpers can run standalone or inside a caller's
 // transaction (e.g. the message ingress, which seeds the conversation in the same tx as the
@@ -40,4 +40,28 @@ export async function ensureConversation(
   await (Object.keys(set).length > 0
     ? insert.onConflictDoUpdate({ target: conversations.id, set })
     : insert.onConflictDoNothing())
+}
+
+// Seed the conversation (touching recency), persist a user message, and create its pending run —
+// the one place this "new user turn" shape lives, shared by the text ingress (POST /messages)
+// and the voice ingress (POST /audio, speak=true). Runs inside the caller's transaction so the
+// one-active-run unique-index violation surfaces as the caller's 409. Returns the new run id.
+export async function createUserMessageRun(
+  db: DbOrTx,
+  conversationId: string,
+  content: (typeof messages.$inferInsert)['content'],
+  opts: { speak?: boolean } = {},
+): Promise<string> {
+  await ensureConversation(db, conversationId, { touch: true })
+  const [msg] = await db.insert(messages).values({ conversationId, role: 'user', content }).returning()
+  const [run] = await db
+    .insert(agentRuns)
+    .values({
+      conversationId,
+      triggerMessageId: msg!.id,
+      status: 'pending',
+      ...(opts.speak ? { speak: true } : {}),
+    })
+    .returning()
+  return run!.id
 }

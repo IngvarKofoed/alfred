@@ -32,6 +32,11 @@ struct ConversationView: View {
     /// foreground re-open so we don't double-start the freshly-built view model.
     @State private var stoppedForBackground = false
 
+    /// The hands-free voice layer, created when the mic toggle is turned on and torn down when
+    /// turned off / the conversation changes. Wired into the view model (`vm.voice`) so `tts_audio`
+    /// events route to it. Voice is purely additive: when nil, text chat behaves identically.
+    @State private var voice: VoiceController?
+
     var body: some View {
         VStack(spacing: 0) {
             if let vm {
@@ -49,8 +54,11 @@ struct ConversationView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task(id: conversationId) {
             // Rebuild the view model whenever the conversation changes, and start it (load
-            // history + meta + open the SSE stream). The previous vm, if any, is stopped.
+            // history + meta + open the SSE stream). The previous vm, if any, is stopped, and
+            // voice (tied to the old conversation) is torn down.
             vm?.stop()
+            voice?.stop()
+            voice = nil
             let model = ConversationViewModel(
                 conversationId: conversationId,
                 client: app.client,
@@ -59,16 +67,23 @@ struct ConversationView: View {
             vm = model
             model.start()
         }
-        .onDisappear { vm?.stop() }
+        .onDisappear {
+            vm?.stop()
+            voice?.stop()
+            voice = nil
+        }
         .onChange(of: scenePhase) { _, phase in
             // The SSE stream is suspended while backgrounded; stop it on background and
             // re-open it on return so a run that progressed while away is picked up again.
             // The flag gates the re-open so we don't double-start the view model that
-            // `.task` already started on first appearance.
+            // `.task` already started on first appearance. Voice is stopped on background too —
+            // its audio session/engine shouldn't hold the mic while suspended.
             guard let vm else { return }
             switch phase {
             case .background:
                 vm.stop()
+                voice?.stop()
+                voice = nil
                 stoppedForBackground = true
             case .active where stoppedForBackground:
                 stoppedForBackground = false
@@ -175,6 +190,9 @@ struct ConversationView: View {
 
     private func composer(_ vm: ConversationViewModel) -> some View {
         VStack(spacing: 8) {
+            if let voice, voice.isOn {
+                voiceIndicator(voice)
+            }
             if !pending.isEmpty || uploading {
                 pendingStrip
             }
@@ -184,6 +202,8 @@ struct ConversationView: View {
                         .font(.title3)
                 }
                 .disabled(vm.busy || uploading)
+
+                micButton(vm)
 
                 TextField("Message Alfred…", text: $draft, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
@@ -220,6 +240,99 @@ struct ConversationView: View {
             .padding()
             .presentationDetents([.height(160)])
         }
+    }
+
+    // MARK: - Voice
+
+    /// The hands-free toggle. Tapping it creates + starts a VoiceController (wiring it into the
+    /// view model so `tts_audio` events route to playback) or stops + tears it down.
+    private func micButton(_ vm: ConversationViewModel) -> some View {
+        Button {
+            Task { await toggleVoice(vm) }
+        } label: {
+            Image(systemName: (voice?.isOn ?? false) ? "mic.fill" : "mic")
+                .font(.title3)
+        }
+        .tint((voice?.isOn ?? false) ? Color.accentColor : Color.gray)
+        .accessibilityLabel((voice?.isOn ?? false) ? "Turn voice off" : "Turn voice on")
+    }
+
+    private func toggleVoice(_ vm: ConversationViewModel) async {
+        if let voice, voice.isOn {
+            voice.stop()
+            vm.voice = nil
+            self.voice = nil
+            return
+        }
+        let controller = VoiceController(
+            conversationId: conversationId,
+            transport: app.client,
+            onTranscript: { [weak vm] transcript in
+                // Optimistically reflect what Alfred heard as a user message; the durable row
+                // arrives on the next history reload like any text turn.
+                vm?.messages.append(ChatMessage.optimisticUser(text: transcript, attachments: []))
+            }
+        )
+        voice = controller
+        vm.voice = controller
+        await controller.start()
+        // start() may have failed (mic denied / session error) and stayed off — leave it wired so
+        // the indicator/error surfaces; the next tap retries cleanly.
+    }
+
+    /// A clear listening/speaking indicator shown above the composer while voice is on.
+    @ViewBuilder
+    private func voiceIndicator(_ voice: VoiceController) -> some View {
+        HStack(spacing: 8) {
+            switch voice.phase {
+            case .listening:
+                Image(systemName: "waveform")
+                    .foregroundStyle(.green)
+                Text("Listening…")
+            case .capturing:
+                Image(systemName: "waveform")
+                    .symbolEffect(.variableColor.iterative, options: .repeating)
+                    .foregroundStyle(.green)
+                Text("Listening…")
+            case .thinking:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Thinking…")
+            case .speaking:
+                Image(systemName: "speaker.wave.2.fill")
+                    .symbolEffect(.variableColor.iterative, options: .repeating)
+                    .foregroundStyle(Color.accentColor)
+                Text("Speaking…")
+            case .off:
+                EmptyView()
+            }
+            if voice.phase == .listening || voice.phase == .capturing {
+                micLevelBar(voice.inputLevel)
+            }
+            if let message = voice.errorMessage {
+                Text(message)
+                    .foregroundStyle(.red)
+            }
+            Spacer()
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Live mic level (RMS) shown while listening, as an on-device calibration aid: the green fill
+    /// crosses roughly a quarter at the speech threshold. If it never moves while you speak, the
+    /// mic isn't delivering frames (an audio-route/engine problem, not a threshold one).
+    @ViewBuilder
+    private func micLevelBar(_ level: Float) -> some View {
+        let fraction = CGFloat(min(1, max(0, level / 0.05)))
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.25))
+                Capsule().fill(Color.green).frame(width: geo.size.width * fraction)
+            }
+        }
+        .frame(width: 56, height: 4)
     }
 
     private var pendingStrip: some View {

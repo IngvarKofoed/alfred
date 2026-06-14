@@ -1,7 +1,7 @@
 import {
   agentRuns,
   conversations,
-  ensureConversation,
+  createUserMessageRun,
   enqueueAgentRun,
   getDb,
   llmCalls,
@@ -12,7 +12,15 @@ import {
   tools as toolsTable,
   userInteractions,
 } from '@alfred/db'
-import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
+import { makeSttProvider } from '@alfred/agent-core'
+import {
+  audioMimeForExt,
+  extForAudioMime,
+  extForImageMime,
+  imageMimeForExt,
+  loadConfig,
+  resolveInWorkspace,
+} from '@alfred/shared'
 import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
 import { Hono, type Context } from 'hono'
 import { executeCommand, listCommands } from './commands.js'
@@ -68,22 +76,12 @@ app.post('/api/conversations/:id/messages', async (c) => {
   const db = getDb()
   let runId: string
   try {
-    runId = await db.transaction(async (tx) => {
-      await ensureConversation(tx, conversationId, { touch: true })
-      const [msg] = await tx
-        .insert(messages)
-        .values({
-          conversationId,
-          role: 'user',
-          content: [...(text ? [{ type: 'text', text }] : []), ...imageParts],
-        })
-        .returning()
-      const [run] = await tx
-        .insert(agentRuns)
-        .values({ conversationId, triggerMessageId: msg!.id, status: 'pending' })
-        .returning()
-      return run!.id
-    })
+    runId = await db.transaction((tx) =>
+      createUserMessageRun(tx, conversationId, [
+        ...(text ? [{ type: 'text', text }] : []),
+        ...imageParts,
+      ]),
+    )
   } catch (err) {
     if (isUniqueViolation(err)) {
       return c.json({ error: 'Alfred is already working on this conversation' }, 409)
@@ -184,6 +182,63 @@ app.post('/api/conversations/:id/files', async (c) => {
   await writeFile(abs, Buffer.from(await file.arrayBuffer()))
 
   return c.json({ path: relPath, mimeType: file.type })
+})
+
+// Voice input (spec 2026-06-14-voice-stt-tts). Upload a recorded utterance: STT-transcribe it,
+// then create the user message + a `speak` run in the SAME transaction shape as POST /messages
+// (so the rest of the pipeline — NOTIFY/SSE, the worker — is unchanged). Multipart like /files
+// (file field "file"); the worker reads run.speak to synthesize TTS for the reply. Returns the
+// transcript so the app can show what it heard. An empty transcript (silence/noise) → 422 so the
+// app resumes listening without a ghost message; a concurrent active run → 409 ("busy"), exactly
+// like /messages.
+app.post('/api/conversations/:id/audio', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+
+  const form = await c.req.parseBody().catch(() => null)
+  const file = form?.['file']
+  if (!(file instanceof File)) return c.json({ error: 'file is required' }, 400)
+
+  // A missing content-type is a malformed request (400); a present-but-unsupported one is 415.
+  if (!file.type) return c.json({ error: 'audio content-type is required' }, 400)
+  if (!extForAudioMime(file.type)) {
+    return c.json({ error: `unsupported type: ${file.type}` }, 415)
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return c.json({ error: 'file too large (max 10 MB)' }, 413)
+  }
+
+  // STT outside the transaction (it's a slow network call to the speech provider; a missing
+  // provider key surfaces here as a thrown error, not a boot failure — mirrors GEMINI_API_KEY).
+  // Wrap the call: a provider error (incl. ElevenLabs' message that embeds the upstream response
+  // body) is logged server-side but returned to the client as a clean 503 — never leak the
+  // provider's raw error text to the caller.
+  const audio = Buffer.from(await file.arrayBuffer())
+  let text: string
+  try {
+    ;({ text } = await makeSttProvider().transcribe(audio, { mimeType: file.type }))
+  } catch (err) {
+    console.error('STT transcription failed:', err)
+    return c.json({ error: 'speech recognition failed' }, 503)
+  }
+  const transcript = text.trim()
+  if (!transcript) return c.json({ error: 'no speech detected' }, 422)
+
+  const db = getDb()
+  let runId: string
+  try {
+    runId = await db.transaction((tx) =>
+      createUserMessageRun(tx, conversationId, [{ type: 'text', text: transcript }], { speak: true }),
+    )
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      return c.json({ error: 'Alfred is already working on this conversation' }, 409)
+    }
+    throw err
+  }
+
+  await enqueueAgentRun(runId)
+  return c.json({ runId, transcript })
 })
 
 // Serve a file from the conversation's workspace (the UI fetches images here after a run).
@@ -614,11 +669,12 @@ app.get('/api/debug/runs/:id', async (c) => {
   return c.json({ run, calls, toolCalls: tools })
 })
 
-// Map a stored filename's extension to a content type. Uploads are written with an
-// extension derived from their (validated) mime type, so this round-trips correctly; an
-// unknown extension falls back to a generic binary type.
+// Map a stored filename's extension to a content type. Uploads (images) and TTS clips (audio)
+// are written with an extension derived from their (validated/provider) mime type, so this
+// round-trips correctly: try image first, then audio, then fall back to a generic binary type.
 function contentTypeFor(filename: string): string {
-  return imageMimeForExt(path.extname(filename)) ?? 'application/octet-stream'
+  const ext = path.extname(filename)
+  return imageMimeForExt(ext) ?? audioMimeForExt(ext) ?? 'application/octet-stream'
 }
 
 function isUniqueViolation(err: unknown): boolean {

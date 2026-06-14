@@ -46,6 +46,16 @@ const schema = z.object({
   GEMINI_API_KEY: z.string().optional(),
   // Provider-scoped so other providers can add their own (OPENAI_MODEL, etc.).
   GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
+  // Voice STT/TTS providers (spec docs/specs/2026-06-14-voice-stt-tts.md). Keys live
+  // server-side, never in the client (ARCHITECTURE §9.3). Default 'google' reuses the
+  // Gemini-native audio path (@google/genai + GEMINI_API_KEY); GOOGLE_SPEECH_API_KEY is the
+  // Google Cloud Speech REST fallback. All optional like GEMINI_API_KEY: a route that needs an
+  // unconfigured provider returns a clear error at call time, never a boot failure.
+  STT_PROVIDER: z.enum(['google', 'elevenlabs']).default('google'),
+  TTS_PROVIDER: z.enum(['google', 'elevenlabs']).default('google'),
+  GOOGLE_SPEECH_API_KEY: z.string().optional(),
+  ELEVENLABS_API_KEY: z.string().optional(),
+  TTS_VOICE: z.string().optional(),
   // Port the embedded browser bridge's WebSocket server listens on (127.0.0.1 only). The
   // Chrome extension connects here. No auth token / extension-ID needed — the bridge binds
   // to loopback and gates on a chrome-extension:// Origin (ARCHITECTURE §8).

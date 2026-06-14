@@ -18,5 +18,13 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<!--
+	  Microphone access for the hands-free voice feature (spec
+	  docs/specs/2026-06-14-voice-stt-tts.md): the app captures audio on-device, detects
+	  end-of-utterance with a VAD, and uploads the clip to the server for transcription.
+	  Speech recognition / synthesis stay server-side.
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Alfred uses the microphone for hands-free voice — your speech is sent to your own Alfred server to transcribe and reply.</string>
 </dict>
 </plist>

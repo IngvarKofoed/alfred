@@ -1,7 +1,5 @@
-import { randomBytes } from 'node:crypto'
-import fs from 'node:fs'
-import path from 'node:path'
-import { extForImageMime, resolveInWorkspace } from '@alfred/shared'
+import { extForImageMime } from '@alfred/shared'
+import { writeBytesToWorkspace } from './workspace-files.js'
 
 // A persisted image reference — the DB/wire form (Postgres stays blob-free, the spec's
 // Approach A). The inline base64 lives only in agent-core's `image` ContentPart in memory.
@@ -12,18 +10,13 @@ export interface ImageRef {
 }
 
 // Write base64 image bytes into the conversation workspace and return the workspace-relative
-// reference. Creates the conversation dir lazily on first write. The filename carries a random
-// suffix as well as the timestamp so two same-prefix images written in the same millisecond
-// (e.g. parallel generate_image calls in one turn) can't collide and overwrite each other.
+// reference. Naming + confinement live in writeBytesToWorkspace (shared with the audio writer).
 export function writeImageToWorkspace(
   conversationId: string,
   prefix: string,
   image: { mimeType: string; data: string },
 ): ImageRef {
   const ext = extForImageMime(image.mimeType) ?? 'bin'
-  const relPath = `${prefix}-${Date.now()}-${randomBytes(4).toString('hex')}.${ext}`
-  const abs = resolveInWorkspace(conversationId, relPath)
-  fs.mkdirSync(path.dirname(abs), { recursive: true })
-  fs.writeFileSync(abs, Buffer.from(image.data, 'base64'))
-  return { type: 'image', path: relPath, mimeType: image.mimeType }
+  const path = writeBytesToWorkspace(conversationId, prefix, Buffer.from(image.data, 'base64'), ext)
+  return { type: 'image', path, mimeType: image.mimeType }
 }

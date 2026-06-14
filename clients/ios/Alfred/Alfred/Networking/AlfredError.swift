@@ -10,6 +10,9 @@ nonisolated enum AlfredError: Error {
     case notConfigured
     /// HTTP 409 — the conversation already has an active run.
     case busy
+    /// HTTP 422 — the uploaded audio transcribed to nothing (silence/noise); the caller can
+    /// resume listening rather than surfacing this as an error.
+    case emptyTranscript
     /// A non-success HTTP status (carrying the status code).
     case http(Int)
     /// The response body could not be decoded into the expected shape.
@@ -27,6 +30,8 @@ extension AlfredError: LocalizedError {
             return "No server configured — set the base URL in Settings."
         case .busy:
             return "Alfred is already working on this conversation."
+        case .emptyTranscript:
+            return "Didn't catch that — try speaking again."
         case .http(let code):
             return "Request failed (HTTP \(code))."
         case .decoding:

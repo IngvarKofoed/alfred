@@ -177,6 +177,51 @@ final class AlfredClient {
         }
     }
 
+    // MARK: - Audio upload (voice)
+
+    /// Upload a WAV utterance to the STT+run-creation route. Returns `{ runId, transcript }` on
+    /// success. Maps HTTP 422 → `.emptyTranscript` (silence/noise) so the caller can resume
+    /// listening without surfacing an error, and keeps `perform()`'s 409 → `.busy` mapping.
+    func uploadAudio(conversationId: String, wavData: Data) async throws -> AudioUploadResponse {
+        let target = try url("/api/conversations/\(encodePathSegment(conversationId))/audio")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var request = URLRequest(url: target)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        var body = Data()
+        let crlf = "\r\n"
+        body.append("--\(boundary)\(crlf)")
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\(crlf)")
+        body.append("Content-Type: audio/wav\(crlf)\(crlf)")
+        body.append(wavData)
+        body.append(crlf)
+        body.append("--\(boundary)--\(crlf)")
+        request.httpBody = body
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw AlfredError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw AlfredError.decoding
+        }
+        if http.statusCode == 409 { throw AlfredError.busy }
+        if http.statusCode == 422 { throw AlfredError.emptyTranscript }
+        guard (200...299).contains(http.statusCode) else {
+            throw AlfredError.http(http.statusCode)
+        }
+        do {
+            return try AlfredJSON.decoder.decode(AudioUploadResponse.self, from: data)
+        } catch {
+            throw AlfredError.decoding
+        }
+    }
+
     // MARK: - Interactions
 
     private struct InteractionResponse: Decodable { let interaction: Interaction }

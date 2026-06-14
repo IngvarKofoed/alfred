@@ -15,6 +15,11 @@ export type RunEvent =
   // The worker auto-titled an untitled conversation (§7.5 auto-name); the client applies it
   // to the header + sidebar. Tiny payload, well under the 8000-byte cap.
   | { type: 'title'; title: string }
+  // Server-pushed TTS for a voice run (run.speak). Audio BYTES never ride NOTIFY — the event
+  // carries only a workspace-relative `path` (served by GET /media/:conversationId/:filename)
+  // plus a per-run 0-based `seq` for playback order; the iOS voice player fetches & plays each
+  // clip in order, the web client ignores the event (spec 2026-06-14-voice-stt-tts).
+  | { type: 'tts_audio'; seq: number; path: string; mimeType: string }
   | { type: 'done' }
   // Run cancelled (§10.6). Emitted ONLY by the WEBSERVER cancel route — which composes the
   // raw JSON itself, the way the resolve route emits interaction_resolved — never by the

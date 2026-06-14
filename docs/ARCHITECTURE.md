@@ -111,6 +111,7 @@ type RunEvent =
   | { type: 'tool_call_start';      id: string; toolName: string; args?: unknown }
   | { type: 'tool_call_end';        id: string }
   | { type: 'title';                title: string }
+  | { type: 'tts_audio';            seq: number; path: string; mimeType: string }
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
   | { type: 'done' }
@@ -118,7 +119,7 @@ type RunEvent =
   | { type: 'error';                message: string }
 ```
 
-`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `title` carries the worker's auto-generated conversation title (§7.5 auto-name), applied to the chat header + history sidebar; `interaction_required.kind` is `'approval'` or `'question'` (the `ask_user` question path, CHANGELOG 59); `cancelled` is distinct from `done` and is the one event the worker doesn't emit — the webserver's cancel route (§9.1) NOTIFYs it after writing the run terminal + cascade, and the worker reacts by aborting (§10.6, built).
+`NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `title` carries the worker's auto-generated conversation title (§7.5 auto-name), applied to the chat header + history sidebar; `tts_audio` carries a workspace-relative `path` to a synthesized speech clip (served by `/media`) plus a per-run, 0-based `seq` for playback order — audio bytes never ride NOTIFY; emitted only for `speak` runs (iOS voice, §7.2), ignored by the web client; `interaction_required.kind` is `'approval'` or `'question'` (the `ask_user` question path, CHANGELOG 59); `cancelled` is distinct from `done` and is the one event the worker doesn't emit — the webserver's cancel route (§9.1) NOTIFYs it after writing the run terminal + cascade, and the worker reacts by aborting (§10.6, built).
 
 ### 6.3 Job queue (pg-boss)
 
@@ -170,6 +171,8 @@ interface LlmProvider {
 ```
 
 **Image generation is a parallel abstraction.** Text streaming lives behind `LlmProvider`; image *generation* lives behind a sibling **`ImageProvider`** interface (`packages/agent-core/src/image-provider.ts`). Two impls are built: `GeminiImageProvider` (Gemini-native "Nano Banana" models over `generateContent` + `inlineData`) and `ImagenProvider` (Imagen 4 models over `generateImages` + `imageBytes`). The worker's `images-registry.ts` maps six model ids to the right provider, and the built-in `generate_image` tool takes a `model` enum arg so the agent picks per call (default `gemini-2.5-flash-image`). The cost of these out-of-loop AI calls is attributed via the tool-context seam (§7.3) and recorded on `llm_calls` linked to the originating `tool_call` (§6.5).
+
+**Speech is another parallel pair.** Voice (iOS, §9.3/INGRESSES) rides the text pipeline as an I/O modality, fronted by sibling **`SttProvider`** (audio→text) and **`TtsProvider`** (text→audio) interfaces (`packages/agent-core/src/speech-provider.ts`). Google (`@google/genai` + `GEMINI_API_KEY`, Gemini-native audio; PCM TTS wrapped in a WAV container, no transcode dep) and ElevenLabs (`fetch` + `ELEVENLABS_API_KEY`) impls are selected by `makeSttProvider()`/`makeTtsProvider()` on the `STT_PROVIDER`/`TTS_PROVIDER` config (default `google`); a missing key for the selected provider errors at call time, never at boot. The webserver uses STT (its first `@alfred/agent-core` dependency), the worker uses TTS.
 
 ### 7.3 Tool interface
 
@@ -273,7 +276,8 @@ All ingresses follow the same shape: receive input → look up/create the conver
 - `GET /*` — serve the built PWA (static, fallback `index.html`); `GET /api/health` — liveness.
 - `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `POST …/cancel` — cancel the conversation's active run: terminal `cancelled` write + the §10.9 invariant-4 cascade in one transaction (the shared `terminateRuns`), then a `{type:'cancelled'}` NOTIFY; 409 when nothing is active (§10.6); `GET /api/conversations/:id` — `{ id, title, activeRun }` for the chat header and the refresh-proof busy/Stop state (null title + `activeRun: false` for a never-created conversation, not 404); `GET /api/conversations` — the owner's recent `web` conversations (`{ id, title, lastActiveAt }`, newest-active first, ≤100) backing the history sidebar.
 - `POST /api/conversations/:id/commands` — run a backend-owned slash command (`/rename`, `/help`) instead of messaging the agent: no message row, no run, no LLM cost; `GET /api/commands` — the command catalog driving the web autocomplete palette. Spec: `docs/specs/2026-06-09-chat-commands.md`.
-- `POST /api/conversations/:id/files` — multipart image upload into the conversation workspace (§6.5); `GET /media/:conversationId/:filename` — serve a workspace file (path-confined). Together they underpin vision input + in-chat image rendering.
+- `POST /api/conversations/:id/files` — multipart image upload into the conversation workspace (§6.5); `GET /media/:conversationId/:filename` — serve a workspace file (path-confined; audio Content-Types too). Together they underpin vision input + in-chat image rendering.
+- `POST /api/conversations/:id/audio` — multipart audio upload (iOS voice, §7.2): STT-transcribes, then in the same transaction shape as `/messages` inserts the user message (text = transcript) + a `speak` run and returns `{ runId, transcript }`; 422 on an empty transcript (silence), 409 on an active run.
 - `GET`/`POST /api/interactions/:id` — generic fetch-prompt + first-writer-wins resolve, serving *both* approvals and questions (§10.2). The POST accepts an optional `remember` flag that persists the decision into `tools.require_approval` (§16).
 - `GET`/`PATCH /api/tools` — tool catalog + per-tool approval settings (§16). Debug (§6.5): `GET /api/debug/conversations` — the per-conversation ledger (recent runs grouped by conversation, uncapped token/cost aggregates); `GET /api/debug/runs/:id` — the full per-run exchange. The flat `GET /api/debug/runs` list still exists but the page no longer uses it.
 

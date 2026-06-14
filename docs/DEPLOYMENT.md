@@ -58,7 +58,7 @@ Three layers, increasing specificity: **(1) defaults in code** (`packages/shared
 
 ### 13.1 .env layout
 
-The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
+The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`, `STT_PROVIDER`/`TTS_PROVIDER`/`GOOGLE_SPEECH_API_KEY`/`ELEVENLABS_API_KEY`/`TTS_VOICE`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
 
 ```
 # Built
@@ -86,6 +86,11 @@ SMTP_USER=alfred@example.com     # SMTP login
 SMTP_PASSWORD=...                # SMTP password (app password)
 SMTP_SECURE=true                 # implicit TLS
 EMAIL_FROM=alfred@example.com    # From header on outgoing mail; default: SMTP_USER
+STT_PROVIDER=google              # speech-to-text provider for iOS voice (§7.2): 'google' | 'elevenlabs'
+TTS_PROVIDER=google              # text-to-speech provider for iOS voice: 'google' | 'elevenlabs'
+GOOGLE_SPEECH_API_KEY=...        # optional; Google Cloud Speech REST fallback if Gemini-native audio is unavailable
+ELEVENLABS_API_KEY=...           # optional; required only when STT_PROVIDER/TTS_PROVIDER=elevenlabs
+TTS_VOICE=...                    # optional; provider-specific default voice id
 # Observability is in-Postgres (llm_calls + /debug) — no keys.
 
 # Reserved (post-MVP)

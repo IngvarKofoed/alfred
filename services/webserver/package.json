@@ -9,6 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@alfred/agent-core": "workspace:*",
     "@alfred/db": "workspace:*",
     "@alfred/shared": "workspace:*",
     "@hono/node-server": "^1.13.0",

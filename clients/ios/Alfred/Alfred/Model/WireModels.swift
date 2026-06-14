@@ -142,6 +142,13 @@ nonisolated struct ConversationMeta: Decodable {
     let activeRun: Bool
 }
 
+/// The `{ runId, transcript }` returned by `POST /api/conversations/:id/audio` — the run created
+/// from the transcribed audio, plus the transcript so the app can show what it heard.
+nonisolated struct AudioUploadResponse: Decodable {
+    let runId: String
+    let transcript: String
+}
+
 // MARK: - Interactions
 
 nonisolated enum InteractionKind: String, Decodable {
@@ -232,6 +239,10 @@ nonisolated enum RunEvent: Decodable {
     case interactionRequired(interactionId: String, kind: InteractionKind)
     case interactionResolved(interactionId: String)
     case title(String)
+    /// A server-synthesized TTS clip ready for playback. `path` is workspace-relative (resolve via
+    /// `/media`); `seq` is a per-run 0-based playback index. Consumed by the voice player; the
+    /// transcript view ignores it.
+    case ttsAudio(seq: Int, path: String, mimeType: String)
     case unknown
 
     private enum CodingKeys: String, CodingKey {
@@ -244,6 +255,9 @@ nonisolated enum RunEvent: Decodable {
         case interactionId
         case kind
         case title
+        case seq
+        case path
+        case mimeType
     }
 
     init(from decoder: Decoder) throws {
@@ -276,6 +290,12 @@ nonisolated enum RunEvent: Decodable {
             )
         case "title":
             self = .title((try? c.decode(String.self, forKey: .title)) ?? "")
+        case "tts_audio":
+            self = .ttsAudio(
+                seq: (try? c.decode(Int.self, forKey: .seq)) ?? 0,
+                path: (try? c.decode(String.self, forKey: .path)) ?? "",
+                mimeType: (try? c.decode(String.self, forKey: .mimeType)) ?? "audio/wav"
+            )
         default:
             self = .unknown
         }

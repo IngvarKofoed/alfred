@@ -84,6 +84,7 @@ export const agentRuns = pgTable(
     promptTokens: integer('prompt_tokens').notNull().default(0),
     completionTokens: integer('completion_tokens').notNull().default(0),
     costUsd: numeric('cost_usd', { precision: 10, scale: 6 }).notNull().default('0'),
+    speak: boolean('speak').notNull().default(false), // voice runs (POST .../audio) set this true; the worker reads it to gate TTS (spec 2026-06-14)
     startedAt: timestamp('started_at', { withTimezone: true }),
     finishedAt: timestamp('finished_at', { withTimezone: true }),
     error: text('error'),

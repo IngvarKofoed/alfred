@@ -160,6 +160,9 @@ importers:
 
   services/webserver:
     dependencies:
+      '@alfred/agent-core':
+        specifier: workspace:*
+        version: link:../../packages/agent-core
       '@alfred/db':
         specifier: workspace:*
         version: link:../../packages/db

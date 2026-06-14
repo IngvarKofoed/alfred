@@ -45,6 +45,10 @@ type RunEvent =
   | { type: 'interaction_required'; interactionId: string; kind: 'approval' | 'question' }
   | { type: 'interaction_resolved'; interactionId: string }
   | { type: 'title'; title: string }
+  // Server-pushed TTS clip (voice, spec 2026-06-14). The web client is chat-only (voice lives
+  // only in the native app, §9.3), so it carries the type for completeness but ignores the
+  // event — the handler's if/else chain has no branch for it, so it falls through.
+  | { type: 'tts_audio'; seq: number; path: string; mimeType: string }
 
 // One ordered segment per thing the in-flight run has produced, in the order things actually
 // happened: a 'text' segment grows as tokens stream; a 'tool' segment is a chip that accumulates
