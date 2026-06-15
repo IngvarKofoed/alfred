@@ -13,10 +13,10 @@ export default tseslint.config(
     },
   },
   {
-    // Node-run ESM build scripts (e.g. the chrome-extension esbuild build).
-    files: ['**/build.js'],
+    // Node-run ESM build scripts (e.g. the chrome-extension esbuild build, scripts/*.mjs).
+    files: ['**/build.js', 'scripts/**/*.mjs'],
     languageOptions: {
-      globals: { process: 'readonly', console: 'readonly' },
+      globals: { process: 'readonly', console: 'readonly', URL: 'readonly' },
     },
   },
 )

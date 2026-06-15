@@ -50,6 +50,8 @@ All processes are native (no Docker). Managed by **pm2** — the same process su
 
 Deploy: automated by `alfred-updater` — the authoritative sequence is stop-first: `pm2 stop <apps>` → `git checkout -f <branch>` + `git reset --hard origin/<branch>` → `pnpm install --frozen-lockfile` → `pnpm -r build` → `pnpm db:migrate` → `pm2 start <apps>` (with a `finally` that always brings the apps back up). Deploying by hand means running that same sequence manually. Postgres is installed via the host's package manager and managed by the OS, not pm2. **Alternative** if pm2 ever stops fitting: each target's native supervisor (systemd/launchd), which is what pm2 delegates to anyway.
 
+**App versioning (git-describe).** The running stack reports its version from git, not a hand-bumped number. `scripts/gen-version.mjs` resolves `git describe --tags --long --always --dirty` (e.g. `v0.1.0-12-g98af7ae`, `-dirty` on an unclean tree) **once at build time** and writes the gitignored `packages/shared/src/version.ts`; `@alfred/shared` re-exports it as `APP_VERSION`. The bake is wired into `@alfred/shared`'s own `build` script (so the deploy's `pnpm -r build` step always refreshes it, shared being built first), and into the root `predev` for local runs. The running app never shells out to git — it reads the baked constant (`"0.0.0-unknown"` if the bake never ran). Surfaced on `GET /api/health` (`version`) and the `alfred-worker` boot log. A new release is just a new annotated tag (`git tag -a v0.2.0 -m …`) — no code change. (The home-box deploy has full git history, so the shallow-CI-clone caveat that bites tag-based versioning elsewhere doesn't apply here.)
+
 ---
 
 ## 13. Configuration & Secrets

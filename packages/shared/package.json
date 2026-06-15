@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "node ../../scripts/gen-version.mjs && tsc -p tsconfig.json"
   },
   "dependencies": {
     "dotenv": "^16.4.0",

@@ -15,6 +15,7 @@ import {
 } from '@alfred/db'
 import { makeSttProvider, speechLlmCallFields, type SpeechUsage } from '@alfred/agent-core'
 import {
+  APP_VERSION,
   audioMimeForExt,
   extForAudioMime,
   extForImageMime,
@@ -38,7 +39,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 // 10 MB
 
-app.get('/api/health', (c) => c.json({ ok: true }))
+app.get('/api/health', (c) => c.json({ ok: true, version: APP_VERSION }))
 
 // Post a user message: persist it + a pending run in one transaction, then enqueue the
 // job. The one-active-run index makes a concurrent send fail -> 409 ("busy").

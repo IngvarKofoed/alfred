@@ -1,7 +1,10 @@
 import { sweepOrphanedRuns, workAgentRuns } from '@alfred/db'
+import { APP_VERSION } from '@alfred/shared'
 import { getBridge } from './browser/bridge.js'
 import { publishToolCatalog } from './catalog.js'
 import { runJob } from './run.js'
+
+console.log(`alfred-worker: version ${APP_VERSION}`)
 
 // Fail-and-restart: on boot, any run left 'running' is orphaned -> mark it failed.
 const swept = await sweepOrphanedRuns()

@@ -12,10 +12,12 @@ const { describe, expect, it } = await import('vitest')
 const CONV = '0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b'
 
 describe('webserver', () => {
-  it('GET /api/health returns { ok: true }', async () => {
+  it('GET /api/health returns { ok: true } with a version string', async () => {
     const res = await app.request('/api/health')
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ ok: true })
+    const body = (await res.json()) as { ok: boolean; version: string }
+    expect(body.ok).toBe(true)
+    expect(typeof body.version).toBe('string')
   })
 
   it('POST /files uploads an image and GET /media serves it back', async () => {

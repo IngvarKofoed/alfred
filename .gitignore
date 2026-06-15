@@ -6,3 +6,5 @@ dist/
 .pnpm-store/
 # Per-conversation workspaces (uploaded/generated images, files) — user content, never committed.
 data/
+# Generated at build time by scripts/gen-version.mjs (git-describe version stamp).
+packages/shared/src/version.ts
