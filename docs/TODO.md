@@ -1,4 +1,5 @@
 - [ ] Show token and cost at the bottom of a conversation, update along the way 
+- [x] Prevent lock screen, because it stops the audio and mic — iOS VoiceController disables the system idle timer (`UIApplication.shared.isIdleTimerDisabled`) for the whole hands-free session (set on successful start, cleared in stop()). (CHANGELOG 79)
 
 - [x] Auto update harnes
 - [x] Debug page should be per conversation — reworked into a Conversation → Run → LLM-call/tool ledger (rail with run-status sparkline + token/cost totals, lazy-loaded per-run detail). (CHANGELOG 49)

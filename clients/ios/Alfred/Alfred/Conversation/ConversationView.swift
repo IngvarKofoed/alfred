@@ -276,6 +276,16 @@ struct ConversationView: View {
         voice = controller
         vm.voice = controller
         await controller.start()
+        // If the view tore this controller down while start() was suspended (e.g. at the mic
+        // permission prompt) — conversation change, onDisappear, or backgrounding all run
+        // `voice?.stop(); voice = nil` — it's now orphaned: `voice` no longer points at it.
+        // start() may have since reached `.listening` and grabbed the mic + disabled auto-lock,
+        // with nothing left to call stop(). Stop it so neither leaks.
+        guard voice === controller else {
+            controller.stop()
+            if vm.voice === controller { vm.voice = nil }
+            return
+        }
         // start() may have failed (mic denied / session error) and stayed off — leave it wired so
         // the indicator/error surfaces; the next tap retries cleanly.
     }

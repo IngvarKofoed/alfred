@@ -32,6 +32,7 @@
 
 @preconcurrency import AVFoundation
 import Foundation
+import UIKit
 
 @MainActor
 @Observable
@@ -180,6 +181,11 @@ final class VoiceController {
         }
         resetCapture()
         phase = .listening
+        // Keep the screen awake for the whole hands-free session: the system auto-lock
+        // deactivates the audio session, which stops the mic AND playback and silently
+        // strands the loop. Cleared in stop() (the single teardown path). Scoped to an
+        // active session only, so a denied/failed start above never holds the screen on.
+        UIApplication.shared.isIdleTimerDisabled = true
     }
 
     /// Stop everything: engine, playback, capture state. Returns to `off`.
@@ -192,6 +198,8 @@ final class VoiceController {
         anyClipEnqueued = false
         runDoneWaitingForDrain = false
         phase = .off
+        // Re-enable auto-lock — the hands-free session that needed the screen awake is over.
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     /// Toggle convenience for the UI button.
