@@ -20,6 +20,11 @@ export type RunEvent =
   // plus a per-run 0-based `seq` for playback order; the iOS voice player fetches & plays each
   // clip in order, the web client ignores the event (spec 2026-06-14-voice-stt-tts).
   | { type: 'tts_audio'; seq: number; path: string; mimeType: string }
+  // Live "along the way" usage: the CUMULATIVE token/cost total for the CURRENT run (a full
+  // snapshot, not a delta — so a missed event self-corrects, last-wins). costUsd is a NUMBER
+  // (USD). Emitted after each IN-LOOP llm_calls write; tiny payload, far under the 8000-byte
+  // NOTIFY cap. Consumed by the client footer (spec 2026-06-15-conversation-token-cost-footer).
+  | { type: 'usage'; promptTokens: number; completionTokens: number; costUsd: number }
   | { type: 'done' }
   // Run cancelled (§10.6). Emitted ONLY by the WEBSERVER cancel route — which composes the
   // raw JSON itself, the way the resolve route emits interaction_resolved — never by the

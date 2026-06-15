@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { usd } from './format'
 
 type RunRow = {
   id: string
@@ -513,15 +514,6 @@ function lastTime(cv: ConversationRow): string | null {
   return r?.startedAt ?? r?.finishedAt ?? null
 }
 
-// cost_usd arrives as a numeric string. Trim trailing zeros so sub-cent costs stay
-// legible (e.g. $0.0012) without padding every value to 6 decimals.
-function usd(v: string | null): string {
-  if (v == null) return '—'
-  const n = Number(v)
-  if (!Number.isFinite(n)) return '—'
-  if (n === 0) return '$0'
-  return '$' + n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')
-}
 
 function clockTime(r: RunRow): string {
   const t = r.startedAt ?? r.finishedAt

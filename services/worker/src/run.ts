@@ -82,6 +82,12 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
   // in-flight work and finalize without touching what the route wrote.
   const controller = new AbortController()
   let unwatch: (() => Promise<void>) | undefined
+  // Serialize NOTIFYs so tokens reach the client in order (onText is synchronous). Declared
+  // BEFORE the try so the catch can drain it before the `error` NOTIFY — the success path drains
+  // it before `done` (below) and the cancel path is client-guarded, so `error` is otherwise the
+  // one terminal event that could let a queued `usage` snapshot land after it (stranding the
+  // client: composer stuck busy / footer double-counting).
+  let notifyChain: Promise<void> = Promise.resolve()
 
   try {
     // Start the watcher BEFORE the pending->running flip so there is no notify gap: a cancel
@@ -110,8 +116,18 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       ...(await rowsToMessages(run.conversationId, rows)),
     ]
 
-    // Serialize NOTIFYs so tokens reach the client in order (onText is synchronous).
-    let notifyChain: Promise<void> = Promise.resolve()
+    // Live "along the way" usage (spec 2026-06-15): accumulate the run's IN-LOOP token/cost as
+    // each llm_calls row is written and push a CUMULATIVE snapshot over NOTIFY. Capture the
+    // snapshot into a const synchronously so a later increment can't mutate an already-queued
+    // event; chaining on notifyChain in the same synchronous tick as the increment guarantees
+    // every usage event lands before the `await notifyChain` that precedes the `done` NOTIFY.
+    // Only loop calls + onToolLlmCall feed this; maybeAutoTitle / TTS are intentionally left to
+    // the client's terminal meta re-fetch (they run at/after the done boundary).
+    const runUsage = { promptTokens: 0, completionTokens: 0, costUsd: 0 }
+    const emitUsage = () => {
+      const snapshot = { type: 'usage' as const, ...runUsage }
+      notifyChain = notifyChain.then(() => notifyRun(run.conversationId, snapshot))
+    }
 
     // Server-pushed TTS (spec 2026-06-14), gated entirely on run.speak — for a typed /messages
     // run (speak=false) this whole block is inert and the path is byte-for-byte today's. The
@@ -188,7 +204,23 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // Retry wraps OUTSIDE tracing so each failed attempt is its own traced row (§10.7) —
     // up to 4 retries at 1/2/4/8s on transient errors; exhausted retries fail the run
     // through the existing failed path with an llm_unavailable:-prefixed error.
-    const provider = new RetryProvider(new TracingProvider(base, (trace) => insertLlmCall(db, runId, trace)))
+    const provider = new RetryProvider(
+      new TracingProvider(base, (trace) => {
+        // Accumulate + chain the cumulative-usage NOTIFY SYNCHRONOUSLY (before awaiting the
+        // insert), so the usage event is always queued ahead of the `await notifyChain` that
+        // gates the `done` NOTIFY — no usage event can land after `done`.
+        runUsage.promptTokens += trace.promptTokens ?? 0
+        runUsage.completionTokens += trace.completionTokens ?? 0
+        runUsage.costUsd += computeCostUsd(
+          trace.model,
+          trace.promptTokens ?? 0,
+          trace.completionTokens ?? 0,
+          trace.cachedTokens ?? 0,
+        )
+        emitUsage()
+        return insertLlmCall(db, runId, trace)
+      }),
+    )
 
     // Maps an agent-core call id to the tool_calls row id, so onToolEnd / requestApproval /
     // ask_user can update the row the loop is talking about. Built before the toolset so
@@ -357,6 +389,19 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       onToolLlmCall: async (callId, call) => {
         const promptTokens = call.promptTokens ?? 0
         const completionTokens = call.completionTokens ?? 0
+        const costNum = computeCostUsd(
+          call.model,
+          promptTokens,
+          completionTokens,
+          call.cachedTokens ?? 0,
+          call.images ?? 0,
+        )
+        // Live usage (spec 2026-06-15): accumulate + chain the cumulative snapshot SYNCHRONOUSLY
+        // before the await, same ordering guarantee as the loop's TracingProvider callback.
+        runUsage.promptTokens += promptTokens
+        runUsage.completionTokens += completionTokens
+        runUsage.costUsd += costNum
+        emitUsage()
         await db.insert(llmCalls).values({
           agentRunId: runId,
           toolCallId: toolCallRowIds.get(callId) ?? null,
@@ -368,13 +413,7 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
           responseToolCalls: null,
           promptTokens,
           completionTokens,
-          costUsd: computeCostUsd(
-            call.model,
-            promptTokens,
-            completionTokens,
-            call.cachedTokens ?? 0,
-            call.images ?? 0,
-          ).toFixed(6),
+          costUsd: costNum.toFixed(6),
           finishReason: call.finishReason ?? null,
           latencyMs: call.latencyMs ?? 0,
           error: null,
@@ -512,6 +551,10 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       await rollupUsageOnly(db, runId)
       return
     }
+    // Drain any queued NOTIFYs (incl. a pending `usage` snapshot) before the error event so a
+    // straggler can't land after {type:'error'} — symmetric with the success path's drain before
+    // `done`. Best-effort: a notify failure must not mask the run's real error.
+    await notifyChain.catch(() => {})
     const message = err instanceof Error ? err.message : String(err)
     // Roll up usage on failure too: llm_calls rows are written per call (even when the
     // run later throws), so a run that made paid calls before failing still reports its

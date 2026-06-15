@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { fmtTokens, usd } from './format'
 
 type ContentPart = {
   type: string
@@ -49,6 +50,10 @@ type RunEvent =
   // only in the native app, §9.3), so it carries the type for completeness but ignores the
   // event — the handler's if/else chain has no branch for it, so it falls through.
   | { type: 'tts_audio'; seq: number; path: string; mimeType: string }
+  // Cumulative token/cost snapshot for the CURRENT run (a full snapshot per emit, not a delta —
+  // a missed event self-corrects, last-wins). Unlike tts_audio above, this IS handled: it drives
+  // the live overlay in the cost footer (spec 2026-06-15).
+  | { type: 'usage'; promptTokens: number; completionTokens: number; costUsd: number }
 
 // One ordered segment per thing the in-flight run has produced, in the order things actually
 // happened: a 'text' segment grows as tokens stream; a 'tool' segment is a chip that accumulates
@@ -134,6 +139,17 @@ export default function Chat({
   // chips, in real order). Cleared when history reloads (it then carries the turn durably) or
   // on error. See LiveSegment.
   const [liveSegments, setLiveSegments] = useState<LiveSegment[]>([])
+  // Cost footer (spec 2026-06-15): baseUsage is the cumulative total across the conversation's
+  // already-rolled-up runs (from GET /api/conversations/:id meta); runUsage is the in-flight
+  // run's live overlay (from the `usage` SSE event). Footer total = base + overlay; on any
+  // terminal event the overlay clears and the baseline re-fetches (now incl. the finished run),
+  // so the two never double-count.
+  const [baseUsage, setBaseUsage] = useState<{ tokens: number; costUsd: number }>({
+    tokens: 0,
+    costUsd: 0,
+  })
+  // The footer renders only the combined token total, so the overlay stores the sum (not the split).
+  const [runUsage, setRunUsage] = useState<{ tokens: number; costUsd: number } | null>(null)
   // Images uploaded for the message being composed; cleared once sent.
   const [pending, setPending] = useState<PendingAttachment[]>([])
   const [uploading, setUploading] = useState(false)
@@ -189,6 +205,37 @@ export default function Chat({
       // mounted until liveSegments clears), else it lingers visibly with no durable turn.
       .catch(() => setLiveSegments([]))
 
+  // Fetch GET /api/conversations/:id meta: the cumulative token/cost baseline for the footer,
+  // plus the refresh-proof busy restore (set busy only if a run is active AND this stream hasn't
+  // already seen its terminal event — terminalSeenRef gates a stale "active" snapshot). Called on
+  // mount and again after each terminal event to reconcile the just-finished run's rollup.
+  const loadMeta = useCallback(
+    (signal?: AbortSignal) =>
+      fetch(`/api/conversations/${conversationId}`, { signal })
+        .then(
+          (r) =>
+            r.json() as Promise<{ activeRun?: boolean; tokens?: number; costUsd?: string }>,
+        )
+        .then((d) => {
+          // Race guard: a fetch still in flight when the conversation switched (the mount caller
+          // aborts on unmount) must not seed this conversation's footer with the previous one's.
+          if (signal?.aborted) return
+          setBaseUsage({ tokens: d.tokens ?? 0, costUsd: Number(d.costUsd ?? 0) })
+          if (d.activeRun && !terminalSeenRef.current) setBusy(true)
+        })
+        .catch(() => {}),
+    [conversationId],
+  )
+
+  // On a terminal event the finished run's cost has moved into the agent_runs rollup: drop the
+  // live overlay and re-fetch the baseline (now incl. the finished run). The overlay clear is
+  // synchronous ON PURPOSE — a brief footer dip until meta lands is preferable to clearing it
+  // only after the async fetch, which would clobber the overlay of a run started in the meantime.
+  const reconcileUsage = useCallback(() => {
+    setRunUsage(null)
+    void loadMeta()
+  }, [loadMeta])
+
   useEffect(() => {
     void loadHistory()
     const es = new EventSource(`/api/conversations/${conversationId}/stream`)
@@ -205,7 +252,9 @@ export default function Chat({
           ev.type === 'tool_call_start' ||
           ev.type === 'tool_call_end' ||
           ev.type === 'interaction_required' ||
-          ev.type === 'title')
+          ev.type === 'title' ||
+          // usage included so a straggler can't bump the footer past the reconciled total.
+          ev.type === 'usage')
       ) {
         return
       }
@@ -229,6 +278,9 @@ export default function Chat({
         setLiveSegments((segs) =>
           segs.map((s) => (s.kind === 'tool' && s.id === ev.id ? { ...s, done: true } : s)),
         )
+      } else if (ev.type === 'usage') {
+        // Cumulative snapshot for the in-flight run — overlay the climbing total on the baseline.
+        setRunUsage({ tokens: ev.promptTokens + ev.completionTokens, costUsd: ev.costUsd })
       } else if (ev.type === 'done' || ev.type === 'cancelled') {
         terminalSeenRef.current = true
         if (ev.type === 'cancelled') {
@@ -253,6 +305,7 @@ export default function Chat({
           setBusy(false)
           void loadHistory()
         }
+        reconcileUsage()
       } else if (ev.type === 'title') {
         // The worker's auto-generated title (sent after the first run names an untitled
         // conversation) — same path /rename uses: updates the header + bumps the sidebar reload.
@@ -265,6 +318,8 @@ export default function Chat({
           ...h,
           { role: 'assistant', content: [{ type: 'text', text: `⚠️ ${ev.message}` }] },
         ])
+        // A failed run may still have made (and rolled up) paid calls before erroring.
+        reconcileUsage()
       } else if (ev.type === 'interaction_required') {
         // Same fetch for both kinds (the row carries the prompt); branch only on what state
         // the resolved prompt populates — approval card vs question card.
@@ -302,27 +357,18 @@ export default function Chat({
     return () => es.close()
   }, [conversationId])
 
-  // Refresh-proof busy: if the conversation already has an active run (the page was refreshed
-  // mid-run), restore the busy state — the disabled composer, the thinking placeholder, and
-  // crucially the Stop button, the owner's only way to free a conversation stuck behind the
-  // one-active-run index. Mount-time is enough (the component remounts per conversation via
-  // key); a run that finished between this fetch and the EventSource opening (a missed 'done')
-  // self-heals via Stop's 409 path.
+  // Refresh-proof busy + footer baseline: if the conversation already has an active run (the page
+  // was refreshed mid-run), restore the busy state — the disabled composer, the thinking
+  // placeholder, and crucially the Stop button, the owner's only way to free a conversation stuck
+  // behind the one-active-run index. The same meta fetch seeds baseUsage. Mount-time is enough
+  // (the component remounts per conversation via key); a run that finished between this fetch and
+  // the EventSource opening (a missed 'done') self-heals via Stop's 409 path. loadMeta's busy
+  // restore is itself terminalSeenRef-guarded so a stale "active" snapshot can't re-set busy.
   useEffect(() => {
-    let ignore = false
-    fetch(`/api/conversations/${conversationId}`)
-      .then((r) => r.json() as Promise<{ activeRun?: boolean }>)
-      .then((d) => {
-        // terminalSeenRef: this GET can resolve after the SSE already delivered the run's
-        // done/cancelled/error — a stale "active" snapshot must not re-set busy and stick
-        // the composer in Stop.
-        if (!ignore && d.activeRun && !terminalSeenRef.current) setBusy(true)
-      })
-      .catch(() => {})
-    return () => {
-      ignore = true
-    }
-  }, [conversationId])
+    const ac = new AbortController()
+    void loadMeta(ac.signal)
+    return () => ac.abort()
+  }, [loadMeta])
 
   // Keep the latest turn in view as messages arrive and tokens stream in. Instant (not smooth)
   // so it reliably tracks fast token updates; only pins when the user is already at the bottom,
@@ -550,6 +596,11 @@ export default function Chat({
   }
 
   const empty = history.length === 0 && liveSegments.length === 0
+
+  // Footer total = the rolled-up baseline (completed runs) + the in-flight run's live overlay.
+  // Hidden when both are 0 (a brand-new conversation shows nothing).
+  const totalTokens = baseUsage.tokens + (runUsage?.tokens ?? 0)
+  const totalCost = baseUsage.costUsd + (runUsage?.costUsd ?? 0)
 
   // The "Alfred" label appears only on the first assistant bubble in a contiguous
   // run of Alfred output, so a sequence of tool-call + text turns isn't labeled
@@ -819,6 +870,16 @@ export default function Chat({
             </form>
           )
         })()}
+
+      {/* Persistent cost footer: a thin muted status line showing the conversation's cumulative
+          token + USD total, climbing live during a run. Hidden until there's something to show. */}
+      {(totalTokens > 0 || totalCost > 0) && (
+        <div className="px-5">
+          <div className="mx-auto max-w-xl text-right text-xs text-muted tabular-nums">
+            {fmtTokens(totalTokens)} tokens · {usd(totalCost)}
+          </div>
+        </div>
+      )}
 
       <form
         className="border-t border-line px-5 py-4"

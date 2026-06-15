@@ -140,6 +140,12 @@ nonisolated struct ConversationMeta: Decodable {
     let id: String
     let title: String?
     let activeRun: Bool
+    /// Cumulative token total over the conversation's runs (prompt + completion). Optional so a
+    /// slightly-older server that omits it still decodes; the view model coalesces nil to 0.
+    let tokens: Int?
+    /// Cumulative USD cost over the conversation's runs, kept as a string like every other costUsd
+    /// field in the codebase. Optional for the same backwards-compat reason; coalesced to 0.
+    let costUsd: String?
 }
 
 /// The `{ runId, transcript }` returned by `POST /api/conversations/:id/audio` — the run created
@@ -243,6 +249,10 @@ nonisolated enum RunEvent: Decodable {
     /// `/media`); `seq` is a per-run 0-based playback index. Consumed by the voice player; the
     /// transcript view ignores it.
     case ttsAudio(seq: Int, path: String, mimeType: String)
+    /// A cumulative usage snapshot for the CURRENT run (a full total, not a delta — so a missed
+    /// event self-corrects, last-wins). Drives the live token/cost footer; the baseline (completed
+    /// runs) comes from the meta endpoint. `costUsd` arrives as a JSON number.
+    case usage(promptTokens: Int, completionTokens: Int, costUsd: Double)
     case unknown
 
     private enum CodingKeys: String, CodingKey {
@@ -258,6 +268,9 @@ nonisolated enum RunEvent: Decodable {
         case seq
         case path
         case mimeType
+        case promptTokens
+        case completionTokens
+        case costUsd
     }
 
     init(from decoder: Decoder) throws {
@@ -295,6 +308,12 @@ nonisolated enum RunEvent: Decodable {
                 seq: (try? c.decode(Int.self, forKey: .seq)) ?? 0,
                 path: (try? c.decode(String.self, forKey: .path)) ?? "",
                 mimeType: (try? c.decode(String.self, forKey: .mimeType)) ?? "audio/wav"
+            )
+        case "usage":
+            self = .usage(
+                promptTokens: (try? c.decode(Int.self, forKey: .promptTokens)) ?? 0,
+                completionTokens: (try? c.decode(Int.self, forKey: .completionTokens)) ?? 0,
+                costUsd: (try? c.decode(Double.self, forKey: .costUsd)) ?? 0
             )
         default:
             self = .unknown

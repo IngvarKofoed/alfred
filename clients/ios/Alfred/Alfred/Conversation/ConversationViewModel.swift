@@ -71,6 +71,15 @@ final class ConversationViewModel {
     var question: ActiveQuestion?
     /// A transient error to surface as a banner (e.g. "Alfred is already working…").
     var errorBanner: String?
+    /// The token/cost footer's baseline — the sum across the conversation's COMPLETED runs, read
+    /// from the meta endpoint (excludes the in-flight run, whose rollup is 0 until it finishes).
+    var baseTokens: Int = 0
+    var baseCostUsd: Double = 0
+    /// The live overlay — the current run's cumulative total from the latest `usage` event. Added
+    /// on top of the baseline so the footer climbs during a run, then cleared (and the baseline
+    /// re-fetched) on the terminal event so the two never double-count.
+    var runTokens: Int = 0
+    var runCostUsd: Double = 0
     /// Called when the title changes, so the parent (list/header) can update + reload the list.
     var onTitleChange: ((String) -> Void)?
     /// The voice layer, set while hands-free is active. `tts_audio` events are forwarded to it for
@@ -143,9 +152,13 @@ final class ConversationViewModel {
 
         errorBanner = nil
         // A fresh local run: its live events count again, and a later activeRun snapshot may
-        // legitimately restore busy (clear the gates the previous run set).
+        // legitimately restore busy (clear the gates the previous run set). Reset the live usage
+        // overlay too — defensive: every terminal path already clears it, so this only matters if
+        // a future terminal path forgets to (then the new run's first `usage` event overwrites it).
         cancelledStraggler = false
         terminalSeen = false
+        runTokens = 0
+        runCostUsd = 0
         let messageText = trimmed.isEmpty ? nil : trimmed
         let optimistic = ChatMessage.optimisticUser(text: messageText, attachments: attachments)
         messages.append(optimistic)
@@ -239,7 +252,7 @@ final class ConversationViewModel {
         // (done/cancelled/error) and interaction_resolved still flow through.
         if cancelledStraggler {
             switch event {
-            case .token, .toolCallStart, .toolCallEnd, .interactionRequired, .title, .ttsAudio:
+            case .token, .toolCallStart, .toolCallEnd, .interactionRequired, .title, .ttsAudio, .usage:
                 return
             default:
                 break
@@ -286,8 +299,13 @@ final class ConversationViewModel {
             // the same tick as the cancel NOTIFY, so by then they're gone) — and a run started
             // afterwards from another ingress must stream normally, hence the time-bounded clear.
             if didCancel { cancelledStraggler = true }
+            // Clear the live footer overlay and re-fetch the baseline: meta now includes this
+            // run's rollup, so base+0 equals the value the overlay was showing — no double-count.
+            runTokens = 0
+            runCostUsd = 0
             Task { [weak self] in
                 await self?.loadHistory()
+                await self?.loadMeta()
                 self?.cancelledStraggler = false
             }
 
@@ -300,6 +318,13 @@ final class ConversationViewModel {
             // reply) and resume listening (no-op when voice is off).
             voice?.runCompleted(cancelled: true)
             appendWarning(message)
+            // Clear the live footer overlay and re-fetch the baseline (it captures whatever the
+            // run billed before failing — rollupUsage runs on the failed path too).
+            runTokens = 0
+            runCostUsd = 0
+            Task { [weak self] in
+                await self?.loadMeta()
+            }
 
         case .ttsAudio(let seq, let path, let mimeType):
             // A server-synthesized TTS clip is ready. Forward it to the voice layer for ordered
@@ -307,6 +332,13 @@ final class ConversationViewModel {
             // current run, so keep the run-tracking flags honest.
             observedLiveEvent()
             voice?.enqueueClip(seq: seq, path: path, mimeType: mimeType)
+
+        case .usage(let p, let cc, let cost):
+            // A cumulative snapshot for the current run (a full total, not a delta) — overlay it on
+            // the baseline so the footer climbs live. Last-wins, so a missed event self-corrects.
+            observedLiveEvent()
+            runTokens = p + cc
+            runCostUsd = cost
 
         case .title(let newTitle):
             title = newTitle
@@ -400,6 +432,9 @@ final class ConversationViewModel {
     private func loadMeta() async {
         guard let meta = try? await client.conversation(conversationId) else { return }
         if let t = meta.title { title = t }
+        // The footer baseline — completed runs only (coalesced from the optional wire fields).
+        baseTokens = meta.tokens ?? 0
+        baseCostUsd = Double(meta.costUsd ?? "0") ?? 0
         // `activeRun == false` is authoritative: clear any stale busy (e.g. a run that finished
         // while the app was backgrounded, so the stream was stopped and the terminal event never
         // arrived). Only the set-true direction is gated by `terminalSeen` so a stale snapshot

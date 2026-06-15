@@ -44,6 +44,7 @@ struct ConversationView: View {
                 cards(vm)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)
+                usageFooter(vm)
                 composer(vm)
             } else {
                 ProgressView()
@@ -183,6 +184,25 @@ struct ConversationView: View {
                 Task { await vm.resolveQuestion(selectedLabels: labels, freeformText: freeform) }
             }
             .id(active.interactionId)
+        }
+    }
+
+    // MARK: - Usage footer
+
+    /// A thin, right-aligned running tab of the conversation's cumulative tokens + cost: the
+    /// baseline (completed runs, from meta) plus the in-flight run's live overlay. Hidden until
+    /// there's something to show (a brand-new conversation shows nothing). Mirrors the web client.
+    @ViewBuilder
+    private func usageFooter(_ vm: ConversationViewModel) -> some View {
+        let tokens = vm.baseTokens + vm.runTokens
+        let cost = vm.baseCostUsd + vm.runCostUsd
+        if tokens > 0 || cost > 0 {
+            Text("\(Self.formatTokens(tokens)) tokens · \(Self.formatCost(cost))")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 4)
         }
     }
 
@@ -444,4 +464,23 @@ struct ConversationView: View {
     }
 
     private static let bottomAnchor = "alfred.transcript.bottom"
+
+    /// Compact token count: ≥1000 → one-decimal "k" (e.g. 12_400 → "12.4k"), else the bare number.
+    private static func formatTokens(_ tokens: Int) -> String {
+        if tokens >= 1000 {
+            return String(format: "%.1fk", Double(tokens) / 1000)
+        }
+        return "\(tokens)"
+    }
+
+    /// Trailing-zero-trimmed USD, kept sub-cent legible (e.g. $0.0042) — mirrors the /debug cost
+    /// formatting. Render enough places to show sub-cent values, then strip trailing zeros.
+    private static func formatCost(_ cost: Double) -> String {
+        var s = String(format: "%.4f", cost)
+        if s.contains(".") {
+            while s.hasSuffix("0") { s.removeLast() }
+            if s.hasSuffix(".") { s.removeLast() }
+        }
+        return "$\(s)"
+    }
 }

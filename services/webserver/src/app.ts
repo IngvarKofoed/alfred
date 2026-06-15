@@ -316,7 +316,7 @@ app.get('/api/conversations/:id', async (c) => {
     .select({ id: conversations.id, title: conversations.title })
     .from(conversations)
     .where(eq(conversations.id, conversationId))
-  if (!row) return c.json({ id: conversationId, title: null, activeRun: false })
+  if (!row) return c.json({ id: conversationId, title: null, activeRun: false, tokens: 0, costUsd: '0' })
   const [active] = await db
     .select({ id: agentRuns.id })
     .from(agentRuns)
@@ -327,7 +327,20 @@ app.get('/api/conversations/:id', async (c) => {
       ),
     )
     .limit(1)
-  return c.json({ ...row, activeRun: active !== undefined })
+  // Cumulative tokens/cost over the conversation's runs — the baseline the client footer
+  // shows, overlaid live by the worker's `usage` SSE events (spec 2026-06-15). sum() yields
+  // string|null; costUsd stays a string like every other costUsd field in this codebase.
+  const [agg] = await db
+    .select({
+      promptTokens: sum(agentRuns.promptTokens),
+      completionTokens: sum(agentRuns.completionTokens),
+      costUsd: sum(agentRuns.costUsd),
+    })
+    .from(agentRuns)
+    .where(eq(agentRuns.conversationId, conversationId))
+  const tokens = Number(agg?.promptTokens ?? 0) + Number(agg?.completionTokens ?? 0)
+  const costUsd = agg?.costUsd ?? '0'
+  return c.json({ ...row, activeRun: active !== undefined, tokens, costUsd })
 })
 
 // Conversation history, so a page refresh restores the thread.
