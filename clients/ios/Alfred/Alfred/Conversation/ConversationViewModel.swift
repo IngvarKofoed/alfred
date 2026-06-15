@@ -276,14 +276,16 @@ final class ConversationViewModel {
             busy = false
             approval = nil
             question = nil
-            // Tell the voice layer the run finished so it can drain its playback queue and resume
-            // listening (no-op when voice is off — it's nil). Voice is additive: text chat is
-            // unchanged.
-            voice?.runCompleted()
+            // Tell the voice layer the run finished (no-op when voice is off — it's nil). A cancel
+            // (the Stop button) must STOP playback immediately; a natural `done` lets the queue
+            // drain. Passing the distinction is what makes Stop actually interrupt (BUGS.md bug 1).
+            let didCancel: Bool
+            if case .cancelled = event { didCancel = true } else { didCancel = false }
+            voice?.runCompleted(cancelled: didCancel)
             // On cancel, drop stragglers until the post-cancel reload settles (they flush within
             // the same tick as the cancel NOTIFY, so by then they're gone) — and a run started
             // afterwards from another ingress must stream normally, hence the time-bounded clear.
-            if case .cancelled = event { cancelledStraggler = true }
+            if didCancel { cancelledStraggler = true }
             Task { [weak self] in
                 await self?.loadHistory()
                 self?.cancelledStraggler = false
@@ -294,8 +296,9 @@ final class ConversationViewModel {
             liveSegments = []
             liveTick += 1
             busy = false
-            // An error is terminal too — let the voice layer resume listening (no-op when off).
-            voice?.runCompleted()
+            // An error is terminal too — stop any in-flight playback (don't drain a half-spoken
+            // reply) and resume listening (no-op when voice is off).
+            voice?.runCompleted(cancelled: true)
             appendWarning(message)
 
         case .ttsAudio(let seq, let path, let mimeType):

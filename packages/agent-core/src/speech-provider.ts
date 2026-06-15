@@ -74,6 +74,20 @@ const DEFAULT_ELEVENLABS_VOICE = '21m00Tcm4TlvDq8ikWAM'
 const ELEVENLABS_TTS_MODEL = 'eleven_flash_v2_5'
 const ELEVENLABS_STT_MODEL = 'scribe_v1'
 
+// Resolve the TTS voice, treating an empty / whitespace-only TTS_VOICE the SAME as unset. Without
+// this, a blank `TTS_VOICE=` in .env (`?? DEFAULT` only guards null/undefined) would send an empty
+// voiceName to the provider, which makes the model pick an arbitrary voice per call — exactly the
+// "voice keeps changing" symptom. An explicit opts.voice (tests) always wins.
+function resolveVoice(
+  optsVoice: string | undefined,
+  configVoice: string | undefined,
+  fallback: string,
+): string {
+  if (optsVoice && optsVoice.trim().length > 0) return optsVoice
+  const trimmed = configVoice?.trim()
+  return trimmed && trimmed.length > 0 ? trimmed : fallback
+}
+
 // ---- Google (Gemini-native) ----
 
 // GoogleSttProvider — transcription via @google/genai generateContent with the audio as
@@ -155,7 +169,7 @@ export class GoogleTtsProvider implements TtsProvider {
     const config = speechConfig()
     this.ai = googleAi(opts?.apiKey ?? config.GEMINI_API_KEY, 'Google TTS provider')
     this.model = opts?.model ?? DEFAULT_TTS_MODEL
-    this.voice = opts?.voice ?? config.TTS_VOICE ?? DEFAULT_GEMINI_VOICE
+    this.voice = resolveVoice(opts?.voice, config.TTS_VOICE, DEFAULT_GEMINI_VOICE)
   }
 
   async synthesize(
@@ -245,7 +259,7 @@ export class ElevenLabsTtsProvider implements TtsProvider {
       throw new Error('ELEVENLABS_API_KEY is not set — required for the ElevenLabs TTS provider')
     }
     this.apiKey = apiKey
-    this.voice = opts?.voice ?? config.TTS_VOICE ?? DEFAULT_ELEVENLABS_VOICE
+    this.voice = resolveVoice(opts?.voice, config.TTS_VOICE, DEFAULT_ELEVENLABS_VOICE)
   }
 
   async synthesize(

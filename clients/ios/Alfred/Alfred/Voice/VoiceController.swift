@@ -106,6 +106,30 @@ final class VoiceController {
     private let minUtterance: TimeInterval = 0.3         // ignore blips shorter than this.
     private let maxUtterance: TimeInterval = 30.0        // hard cap on a single capture.
 
+    // Barge-in (interrupting Alfred by talking while he plays) must clear a HIGHER bar than a
+    // normal speech onset: Alfred's own playback leaks past the AEC, and a SINGLE low-threshold
+    // frame of that residual echo would (and did — BUGS.md bug 3) false-trigger and cut him off
+    // mid-sentence. So during `.speaking` we require energy over `bargeInThreshold` SUSTAINED for
+    // `bargeInSustain`, and ignore the first `bargeInStartGrace` of audio after a speaking phase
+    // begins (the loudest playback onset). These are device/route-dependent — calibrate against
+    // the live mic-level meter (ConversationView.micLevelBar): high enough that Alfred's own
+    // playback never reaches them, low enough that the user's voice does. Conservative by design:
+    // barge-in only stops LOCAL playback (the run finishes server-side) and the Stop button is the
+    // reliable interrupt, so a missed soft barge-in is cheap.
+    // (Durable follow-up: derive a "playback active" state from clipsPending and gate the VAD on
+    // it, rather than out-discriminating echo with a magic threshold.)
+    private let bargeInThreshold: Float = 0.03
+    private let bargeInSustain: TimeInterval = 0.25
+    /// Grace at the START of a speaking phase only — NOT re-armed per clip, so the onset of a
+    /// mid-reply clip relies on the threshold + sustain, not this window. Covers the loud onset
+    /// when playback first engages.
+    private let bargeInStartGrace: TimeInterval = 0.2
+    /// Contiguous over-`bargeInThreshold` audio time accrued in `.speaking` (reset by any
+    /// sub-threshold frame); a barge-in fires once it reaches `bargeInSustain`.
+    private var voicedWhileSpeaking: TimeInterval = 0
+    /// Audio time elapsed since entering `.speaking`, for the post-playback-start grace window.
+    private var speakingElapsed: TimeInterval = 0
+
     // MARK: - Run coordination
 
     /// True while a run we kicked off (or barged into) is still in flight server-side. We must
@@ -195,6 +219,11 @@ final class VoiceController {
         // can barge in (AEC removes Alfred's own voice from the input).
         if phase == .thinking || phase == .listening {
             phase = .speaking
+            // Start of a speaking phase: arm the start-of-speech grace and clear any stale barge-in
+            // accumulation so the loud playback onset can't false-trigger. (Not re-armed for the
+            // later clips of the same reply — those rely on the threshold + sustain.)
+            speakingElapsed = 0
+            voicedWhileSpeaking = 0
         }
         clipsPending += 1
         let epoch = playbackEpoch
@@ -231,12 +260,26 @@ final class VoiceController {
         }
     }
 
-    /// The run reached a terminal event (`done` / `cancelled`). If clips are still draining we
-    /// wait for the queue to empty; if none were produced (a silent or cancelled run) we return
-    /// to listening immediately and flush any utterance captured during barge-in.
-    func runCompleted() {
+    /// The run reached a terminal event. On `cancelled: true` (the user pressed Stop, or the run
+    /// errored) we halt playback IMMEDIATELY and discard the queued/in-flight clips — otherwise
+    /// several seconds of already-buffered speech keep playing after Stop (BUGS.md bug 1). On a
+    /// natural completion, if clips are still draining we let the queue empty (the last clip's
+    /// completion returns to listening); if none were produced (a silent run) we return to
+    /// listening immediately and flush any utterance captured during barge-in.
+    func runCompleted(cancelled: Bool = false) {
         runActive = false
         guard isOn else { return }
+        if cancelled {
+            // stopPlayback() bumps the epoch so in-flight downloads / scheduled-buffer completions
+            // become no-ops. Clear any held barge-in utterance and any in-progress capture so an
+            // explicit Stop goes fully idle (no surprise fresh run, no stale capture state), then
+            // just resume listening.
+            stopPlayback()
+            pendingUtterance = nil
+            resetCapture()
+            phase = .listening
+            return
+        }
         if anyClipEnqueued && clipsPending > 0 {
             // Still speaking — let the queue drain; the last clip's completion returns to listening.
             runDoneWaitingForDrain = true
@@ -274,28 +317,49 @@ final class VoiceController {
         }
         inputLevel = rms
 
-        let voiced = rms >= energyThreshold
+        // Guard a degenerate buffer that reports a zero frame duration (e.g. a transient
+        // sampleRate==0 during an audio-route flip): derive it from the converted sample count
+        // (always at wireSampleRate) so the time-based VAD — grace window, barge-in sustain, and
+        // trailing-silence endpointing — can't freeze on a stream of zero-duration frames.
+        let dt = frameDuration > 0 ? frameDuration : Double(samples.count) / wireSampleRate
 
-        if voiced {
-            if phase == .speaking {
-                // Barge-in: the user is talking over Alfred → stop playback and start capturing.
-                // The interrupted run finishes server-side (spec: stop playback only).
-                stopPlayback()
-                phase = .capturing
-                resetCapture()
-            } else if phase == .listening {
-                phase = .capturing
-                resetCapture()
+        if phase == .speaking {
+            // Barge-in detection — STRICTER than a normal onset so Alfred's own playback (residual
+            // echo past the AEC) can't false-trigger and cut him off mid-sentence (BUGS.md bug 3).
+            // Ignore the grace window right after the speaking phase begins, then require energy
+            // over the raised threshold sustained for `bargeInSustain` before treating it as the
+            // user talking over him. Until that's confirmed, do nothing — keep playing.
+            speakingElapsed += dt
+            if speakingElapsed < bargeInStartGrace {
+                voicedWhileSpeaking = 0
+                return
             }
-            speechStarted = true
-            trailingSilence = 0
+            if rms >= bargeInThreshold {
+                voicedWhileSpeaking += dt
+            } else {
+                voicedWhileSpeaking = 0   // require a CONTIGUOUS run, not cumulative blips
+            }
+            guard voicedWhileSpeaking >= bargeInSustain else { return }
+            // Confirmed: the user is talking over Alfred → stop playback only (the run finishes
+            // server-side, spec) and start capturing. Fall through to the .capturing block to
+            // record this frame.
+            stopPlayback()
+            beginCapture()
+        } else if phase == .listening {
+            // Genuine speech onset uses the original sensitive threshold (no echo to reject here).
+            if rms >= energyThreshold {
+                beginCapture()
+            }
         }
 
         if phase == .capturing {
+            let voiced = rms >= energyThreshold
             captured.append(contentsOf: samples)
-            capturedDuration += frameDuration
-            if !voiced && speechStarted {
-                trailingSilence += frameDuration
+            capturedDuration += dt
+            if voiced {
+                trailingSilence = 0
+            } else if speechStarted {
+                trailingSilence += dt
             }
             if capturedDuration >= maxUtterance {
                 endUtterance()
@@ -303,6 +367,15 @@ final class VoiceController {
                 endUtterance()
             }
         }
+    }
+
+    /// Enter the capturing phase fresh, treating the current frame as speech onset. Shared by the
+    /// listening-onset and barge-in paths so "start capturing" is defined once.
+    private func beginCapture() {
+        phase = .capturing
+        resetCapture()
+        speechStarted = true
+        trailingSilence = 0
     }
 
     /// The VAD declared end-of-utterance. Encode the captured PCM to WAV and upload (or queue it
@@ -368,6 +441,11 @@ final class VoiceController {
     /// run, otherwise resume listening.
     private func returnToListeningAfterRun() {
         guard isOn else { return }
+        // If the user is mid-capture (barged in and still talking) when the interrupted run's
+        // terminal event lands, don't yank them back to listening — that would drop the in-flight
+        // utterance. The capture finishes on its own; with the run now over (runActive == false)
+        // endUtterance uploads it directly rather than holding it as pendingUtterance.
+        guard phase != .capturing else { return }
         if let wav = pendingUtterance {
             pendingUtterance = nil
             phase = .thinking
@@ -522,6 +600,8 @@ final class VoiceController {
         clipsPending = 0
         anyClipEnqueued = false
         runDoneWaitingForDrain = false
+        voicedWhileSpeaking = 0
+        speakingElapsed = 0
     }
 
     /// Decode encoded audio (the WAV/MP3 served from /media) into a PCM buffer in `format`. Writes
