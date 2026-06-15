@@ -29,9 +29,15 @@ final class AlfredClient {
     /// (e.g. a reverse-proxy mount) — `URL(string: "/api/…", relativeTo: base)` drops it. The
     /// `path` segments are already percent-encoded (via `encodePathSegment`), so we splice them
     /// onto the base's own (also percent-encoded) path rather than re-encoding. One helper, used
-    /// by every route.
+    /// by every route (resolving the active base) and by `health(for:)` (explicit base).
     private func url(_ path: String) throws -> URL {
-        let base = try baseURL()
+        try url(path, base: try baseURL())
+    }
+
+    /// The prefix-preserving splice against an **explicit** base — used by `url(_:)` (active base)
+    /// and by `health(for:)`, which probes a server before it's the active one (so it can't go
+    /// through `baseURLProvider`).
+    private func url(_ path: String, base: URL) throws -> URL {
         guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
             throw AlfredError.notConfigured
         }
@@ -90,6 +96,26 @@ final class AlfredClient {
         }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
+    }
+
+    // MARK: - Health
+
+    struct HealthResponse: Decodable { let ok: Bool; let version: String? }
+
+    /// Probe a **given** base URL's `GET /api/health`, bypassing `baseURLProvider` — used by the
+    /// Settings page to test a server before it's the active one. Builds the URL with the same
+    /// prefix-preserving splice as every other route. A transport error / non-2xx surfaces as the
+    /// usual `AlfredError` so the caller renders "unreachable".
+    func health(for baseURL: URL) async throws -> HealthResponse {
+        var request = URLRequest(url: try url("/api/health", base: baseURL))
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let data = try await perform(request)
+        do {
+            return try AlfredJSON.decoder.decode(HealthResponse.self, from: data)
+        } catch {
+            throw AlfredError.decoding
+        }
     }
 
     // MARK: - Conversations

@@ -1,7 +1,7 @@
 - [x] Show token and cost at the bottom of a conversation, update along the way — persistent footer (web + iOS) showing cumulative tokens + USD cost, climbing live via a new `usage` SSE event overlaid on the `GET /api/conversations/:id` baseline. (CHANGELOG 80)
 - [x] Prevent lock screen, because it stops the audio and mic — iOS VoiceController disables the system idle timer (`UIApplication.shared.isIdleTimerDisabled`) for the whole hands-free session (set on successful start, cleared in stop()). (CHANGELOG 79)
-- [ ] In the iOS app, I would like list of "servers" and an option for testing in the configuration.
-- [ ] In the iOS app, I would like to see the SW version in the configuration page somewhere.
+- [x] In the iOS app, I would like list of "servers" and an option for testing in the configuration. — Settings now holds a list of saved servers (label + URL), tap-to-activate, swipe-delete, and a per-row connection test (GET /api/health). (CHANGELOG 81)
+- [x] In the iOS app, I would like to see the SW version in the configuration page somewhere. — Settings "About" shows AppInfo.version (CFBundleShortVersionString + build), plus the active server's last-tested version. (CHANGELOG 81)
 
 - [x] Auto update harnes
 - [x] Debug page should be per conversation — reworked into a Conversation → Run → LLM-call/tool ledger (rail with run-status sparkline + token/cost totals, lazy-loaded per-run detail). (CHANGELOG 49)
