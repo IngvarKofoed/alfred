@@ -127,7 +127,7 @@ struct SettingsView: View {
             case .idle, .testing:
                 EmptyView()
             case .ok(let version):
-                Label(version.map { "Reachable · v\($0)" } ?? "Reachable", systemImage: "checkmark.seal.fill")
+                Label(version.map { "Reachable · \($0)" } ?? "Reachable", systemImage: "checkmark.seal.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
             case .failed(let message):
@@ -224,7 +224,7 @@ struct SettingsView: View {
             LabeledContent("Version", value: "Alfred for iOS \(AppInfo.version)")
             if let active = app.settings.activeServer,
                case .ok(let version?) = testResults[active.id] {
-                LabeledContent("Active server (last test)", value: "v\(version)")
+                LabeledContent("Active server (last test)", value: version)
             }
         } header: {
             Text("About")
