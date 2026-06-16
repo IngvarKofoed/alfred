@@ -12,7 +12,7 @@ Status: Initial design, pre-implementation
 **Functional goals**
 
 - **One agent identity** (memory, personality, tools), reached via **many concurrent conversations** from any device — no forever-running agent process; the worker spins up a discrete run per job, state is shared.
-- Multiple **interactive ingresses** — web/PWA (chat), Discord (chat), native app (chat + **hands-free voice, native-app only**, no voice on the PWA in v1) — plus **autonomous triggers** (post-MVP): scheduled jobs / inbox watchers / webhooks, a fourth ingress category that enqueues jobs with no human at the other end.
+- Multiple **interactive ingresses** — web/PWA (chat), Discord (chat), native app (chat + **hands-free voice, native-app only**, no voice on the PWA in v1) — plus **autonomous triggers** (built): scheduled jobs / inbox watchers / webhooks, a fourth ingress category that enqueues jobs with no human at the other end.
 - Many integrations over time (email, messaging, calendar, browser, …). The agent uses a **real browser with the owner's real logins** — automation must be undetectable to modern bot defenses.
 
 **Non-functional constraints** — single user (no multi-tenant); self-hosted on a home server (no cloud VPS for the core); **OS-agnostic** (Linux/macOS/Windows native, no OS-specific core deps); **pluggable LLM provider** (default **Google Gemini** via `@google/genai`, swappable by config to OpenRouter / Anthropic / OpenAI / local Ollama); minimal moving parts.
@@ -50,7 +50,7 @@ External clients
 │  ├─ Hono webserver (PWA chat, SSE)                  bridge (WS server) │
 │  ├─ Discord bot                                       ▲                │
 │  ├─ Voice orchestrator (native app, post-MVP)         │ extension      │
-│  └─ Triggers (cron/inbox/webhook, post-MVP)           connects here    │
+│  └─ Triggers (cron/inbox/webhook, built)              connects here    │
 └──────────────────────────────────────────────────────────────────────┘
                                                        │
                                                        ▼
@@ -76,7 +76,7 @@ External clients
 
 ## 5. Process Topology
 
-**Moved to `docs/DEPLOYMENT.md`** (§5). In brief: **pm2** supervises native Node processes from one `ecosystem.config.cjs`. Built today: `alfred-webserver` + `alfred-worker` (the browser bridge is embedded in the worker, §8) + `alfred-updater` (auto-deploy, inert unless `DEPLOY_ENABLED=true`); `alfred-discord`/`alfred-voice`/`alfred-triggers` are the reserved post-MVP shape.
+**Moved to `docs/DEPLOYMENT.md`** (§5). In brief: **pm2** supervises native Node processes from one `ecosystem.config.cjs`. Built today: `alfred-webserver` + `alfred-worker` (the browser bridge is embedded in the worker, §8) + `alfred-updater` (auto-deploy, inert unless `DEPLOY_ENABLED=true`) + `alfred-triggers` (the autonomous-watcher scheduler, §9.4); `alfred-discord`/`alfred-voice` are the reserved post-MVP shape.
 
 ---
 
@@ -121,6 +121,8 @@ type RunEvent =
 ```
 
 `NOTIFY` payloads have an **8000-byte limit**, so events reference IDs and consumers `SELECT` the rows for full payloads (DB is the source of truth). Hence: `tool_call_start` includes `args` only when their JSON is ≤1024 chars (a large `evaluate_javascript` script can't breach the cap; full args always persist on `tool_calls`); `tool_call_end` carries only the `id` (result lives on the row / `/debug`); `title` carries the worker's auto-generated conversation title (§7.5 auto-name), applied to the chat header + history sidebar; `tts_audio` carries a workspace-relative `path` to a synthesized speech clip (served by `/media`) plus a per-run, 0-based `seq` for playback order — audio bytes never ride NOTIFY; emitted only for `speak` runs (iOS voice, §7.2), ignored by the web client; `usage` carries the **cumulative** token/cost total for the current run (a full snapshot, not a delta — last-wins, so a missed event self-corrects), emitted after each in-loop `llm_calls` write — the live overlay for the conversation token/cost footer (§9.1, §11; CHANGELOG 80), reconciled at the terminal event against the `agent_runs` rollup; `interaction_required.kind` is `'approval'` or `'question'` (the `ask_user` question path, CHANGELOG 59); `cancelled` is distinct from `done` and is the one event the worker doesn't emit — the webserver's cancel route (§9.1) NOTIFYs it after writing the run terminal + cascade, and the worker reacts by aborting (§10.6, built).
+
+A second, separate channel **`notifications`** is **not** a conversation `RunEvent` — it's the durable push outbox (autonomous triggers, §9.4): a run writes a `notifications` row and NOTIFYs `notifications`; a worker-side dispatcher LISTENs, loads the row, and delivers it via Web Push (§7.2 `Notifier`). It rides this channel rather than `conversation:<id>` because its consumer is the dispatcher, not an ingress, and its whole point is reaching a *disconnected* owner (DATABASE.md `notifications`).
 
 ### 6.3 Job queue (pg-boss)
 
@@ -180,6 +182,8 @@ interface LlmProvider {
 
 **Speech is another parallel pair.** Voice (iOS, §9.3/INGRESSES) rides the text pipeline as an I/O modality, fronted by sibling **`SttProvider`** (audio→text) and **`TtsProvider`** (text→audio) interfaces (`packages/agent-core/src/speech-provider.ts`). Google (`@google/genai` + `GEMINI_API_KEY`, Gemini-native audio; PCM TTS wrapped in a WAV container, no transcode dep) and ElevenLabs (`fetch` + `ELEVENLABS_API_KEY`) impls are selected by `makeSttProvider()`/`makeTtsProvider()` on the `STT_PROVIDER`/`TTS_PROVIDER` config (default `google`); a missing key for the selected provider errors at call time, never at boot. The webserver uses STT (its first `@alfred/agent-core` dependency), the worker uses TTS. Both providers report token usage (`SpeechUsage` from Gemini's `usageMetadata`); `computeSpeechCostUsd` (audio rates kept separate from `computeCostUsd`, since the STT model id is shared with the chat loop) prices it, and the cost is attributed via the same out-of-loop tool-call seam as `generate_image` — a synthetic `tool_calls` row + a linked `llm_calls` row (§6.5), so it rolls into the run without mislabeling its model.
 
+**Out-of-band notification is a fifth sibling.** Reaching a disconnected owner (autonomous triggers, §9.4) lives behind a **`Notifier`** interface (`packages/agent-core/src/notifier.ts`) alongside `LlmProvider`/`ImageProvider`/`SttProvider`/`TtsProvider`. The built impl is `WebPushNotifier` (the `web-push` lib + VAPID keys); `makeNotifier()` returns it only when all three `VAPID_*` keys are set, else `null` — Web Push is **inert** unless configured (like the email keys). It carries a thin payload (title + body + a `deepLink` into `/conversation/:id`) and `send` returns a structured result so the dispatcher can prune a subscription the push service reports `410 Gone` (§6.2 `notifications` channel; DATABASE.md `push_subscriptions`). Future transports (ntfy, Discord DM) plug in behind the same interface.
+
 ### 7.3 Tool interface
 
 All tools, regardless of origin, look the same to the agent loop:
@@ -238,7 +242,7 @@ A run's context is assembled fresh every invocation. The agent has no in-process
 
 ### 7.6 Concurrency, serialization & resource ownership · 7.7 Autonomous & long-horizon runs
 
-**Moved to `docs/RUNTIME.md`** (§7.6, §7.7). In brief: the **run, not the worker, is the unit of serialized execution** — one active run per conversation (partial unique index), the browser a single shared resource, crashes **fail-and-restart** rather than durably resume. Autonomous runs (§9.4) reserve three seams now (presence-dependent overflow, a durable objective scratchpad, layered run/objective/daily budgets) so adding triggers is wiring, not a redesign — none built in MVP.
+**Moved to `docs/RUNTIME.md`** (§7.6, §7.7). In brief: the **run, not the worker, is the unit of serialized execution** — one active run per conversation (partial unique index), the browser a single shared resource, crashes **fail-and-restart** rather than durably resume. Autonomous triggers (§9.4) are now **built**: three of the §7.7 seams are realized — `agent_runs.human_in_loop` (derived from ingress), the durable objective scratchpad (`memory_facts` scope `trigger:<id>`), and self-scheduling (the `schedule_self` tool). The fourth, the layered run/objective/daily budget, remains reserved (the per-run cost cap is still unbuilt, §10.7 / RUNTIME.md).
 
 ---
 
@@ -280,7 +284,7 @@ All ingresses follow the same shape: receive input → look up/create the conver
 **Hono** (small, fast, no SSR — the UI is a single-page chat behind auth). Actual routes (`services/webserver/src/app.ts`):
 
 - `GET /*` — serve the built PWA (static, fallback `index.html`); `GET /api/health` — liveness + the build's `version` (the git-describe stamp, DEPLOYMENT §5).
-- `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `POST …/cancel` — cancel the conversation's active run: terminal `cancelled` write + the §10.9 invariant-4 cascade in one transaction (the shared `terminateRuns`), then a `{type:'cancelled'}` NOTIFY; 409 when nothing is active (§10.6); `GET /api/conversations/:id` — `{ id, title, activeRun, tokens, costUsd }` for the chat header, the refresh-proof busy/Stop state, and the cumulative token/cost footer (§11) — `tokens`/`costUsd` summed over the conversation's `agent_runs` (null title + `activeRun: false` + `tokens: 0` + `costUsd: '0'` for a never-created conversation, not 404); `GET /api/conversations` — the owner's recent `web` conversations (`{ id, title, lastActiveAt }`, newest-active first, ≤100) backing the history sidebar.
+- `POST /api/conversations/:id/messages` — user message (text and/or `attachments`) → create run + job; `GET …/messages` — history; `GET …/stream` — **SSE** (LISTENs `conversation:<id>`, forwards each NOTIFY raw); `POST …/cancel` — cancel the conversation's active run: terminal `cancelled` write + the §10.9 invariant-4 cascade in one transaction (the shared `terminateRuns`), then a `{type:'cancelled'}` NOTIFY; 409 when nothing is active (§10.6); `GET /api/conversations/:id` — `{ id, title, activeRun, tokens, costUsd }` for the chat header, the refresh-proof busy/Stop state, and the cumulative token/cost footer (§11) — `tokens`/`costUsd` summed over the conversation's `agent_runs` (null title + `activeRun: false` + `tokens: 0` + `costUsd: '0'` for a never-created conversation, not 404); `GET /api/conversations` — the owner's recent conversations across **all** ingresses (`{ id, title, ingress, lastActiveAt }`, newest-active first, ≤100) backing the history sidebar shared by web + iOS (one Alfred, one continuous history — incl. `ingress='trigger'` watcher threads and future Discord/voice; `ingress` lets clients badge non-web rows and keep the `/` redirect off a watcher thread).
 - `POST /api/conversations/:id/commands` — run a backend-owned slash command (`/rename`, `/help`) instead of messaging the agent: no message row, no run, no LLM cost; `GET /api/commands` — the command catalog driving the web autocomplete palette. Spec: `docs/specs/2026-06-09-chat-commands.md`.
 - `POST /api/conversations/:id/files` — multipart image upload into the conversation workspace (§6.5); `GET /media/:conversationId/:filename` — serve a workspace file (path-confined; audio Content-Types too). Together they underpin vision input + in-chat image rendering.
 - `POST /api/conversations/:id/audio` — multipart audio upload (iOS voice, §7.2): STT-transcribes, then in the same transaction shape as `/messages` inserts the user message (text = transcript) + a `speak` run and returns `{ runId, transcript }`; 422 on an empty transcript (silence), 409 on an active run.
@@ -289,9 +293,9 @@ All ingresses follow the same shape: receive input → look up/create the conver
 
 The client routes each conversation at `/conversation/:id` (deep-linkable, refresh-stable; `/` redirects to the last-opened or newest conversation), and `GET /api/conversations` backs a history sidebar (§11). Ordering uses `conversations.last_active_at`, bumped on each posted user message via `ensureConversation({ touch: true })` (spec `docs/specs/2026-06-11-conversation-list-history.md`).
 
-### 9.2 Discord · 9.3 Voice · 9.4 Autonomous triggers — all post-MVP
+### 9.2 Discord · 9.3 Voice · 9.4 Autonomous triggers — Discord post-MVP; voice + triggers built
 
-**Moved to `docs/INGRESSES.md`** (§9.2–9.4). All three reuse the §9 ingress contract above; in brief: **Discord** (`alfred-discord`, discord.js — owner-ID-filtered, streaming reply edits, reactions as approval UI); **Voice** (`alfred-voice`, native-app-only, cloud STT/TTS with server-side keys, on-device wake word — the agent core stays the brain); **Autonomous triggers** (`alfred-triggers`, no human at the other end — scheduled / event-driven / agent-initiated, same enqueue+LISTEN+notify transport, different execution lifecycle per §7.7 / RUNTIME.md). Full detail in `INGRESSES.md`.
+**Moved to `docs/INGRESSES.md`** (§9.2–9.4). All three reuse the §9 ingress contract above; in brief: **Discord** (`alfred-discord`, discord.js — owner-ID-filtered, streaming reply edits, reactions as approval UI; **post-MVP**); **Voice** (`alfred-voice`, native-app-only, cloud STT/TTS with server-side keys, on-device wake word — the agent core stays the brain; **built as an I/O modality, not a WS orchestrator**); **Autonomous triggers** (`alfred-triggers`, no human at the other end — scheduled / event-driven / agent-initiated, same enqueue+LISTEN+notify transport, different execution lifecycle per §7.7 / RUNTIME.md; **now built** — the pure scheduler + the tiered detection ladder + the Web-Push notifications outbox). Full detail in `INGRESSES.md`.
 
 ---
 
@@ -324,7 +328,7 @@ The client routes each conversation at `/conversation/:id` (deep-linkable, refre
 
 ## 13. Configuration & Secrets
 
-**Moved to `docs/DEPLOYMENT.md`** (§13, incl. §13.1–§13.4). In brief: three layers (code defaults → `.env` zod-validated at boot → post-MVP DB runtime config). Secrets live in `.env` at the repo root (mode `0600`, gitignored), never in the DB; the built keys are `WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR` (§13.1).
+**Moved to `docs/DEPLOYMENT.md`** (§13, incl. §13.1–§13.4). In brief: three layers (code defaults → `.env` zod-validated at boot → post-MVP DB runtime config). Secrets live in `.env` at the repo root (mode `0600`, gitignored), never in the DB; the built keys include `WEBSERVER_PORT`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, and (autonomous triggers, §9.4) `DETECTION_MODEL`, `AUTONOMOUS_APPROVAL_TIMEOUT_MS`, `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`/`VAPID_SUBJECT`, plus `TRIGGER_TZ` (read via `process.env` in the triggers scheduler, not the zod schema) (§13.1).
 
 ---
 
@@ -345,7 +349,7 @@ Each step is independently verifiable; the seams (Postgres queue, SSE, MCP) don'
 5. ✅ **Browser bridge + Chrome extension** — Option C (§8: embedded bridge, built-in tools, no MCP; ported from `chrome-mcp`). Plus **vision + image support** — per-conversation workspaces (§6.5), an `image` content part + Gemini `inlineData`, screenshots + web upload, `generate_image`, and a workspace-confined `list_files`/`read_file`/`write_file` trio (spec `docs/specs/2026-06-05-conversation-workspace-and-images.md`).
 6. **Discord bot** — second ingress, same conversation shape, shared memory.
 
-**End of MVP.** Post-MVP, rough priority: **7.** more MCP integrations (Gmail, Calendar, …) one at a time; **8.** voice orchestrator + native iOS app (hands-free, on-device wake-word, cloud STT/TTS); **9.** autonomous triggers (scheduler + first watcher, likely inbox); **10.** long-term memory — the plain-rows foundation is **built** (`memory_facts` + the `memory` tool family + automatic recall, §6.4); pgvector semantic recall remains the phase-2 upgrade (§17); **11.** backup strategy (§17).
+**End of MVP.** Post-MVP, rough priority: **7.** more MCP integrations (Gmail, Calendar, …) one at a time; **8.** voice orchestrator + native iOS app (hands-free, on-device wake-word, cloud STT/TTS); **9.** autonomous triggers — **built** (`alfred-triggers` scheduler + the tiered detection ladder — free deterministic gate → cheap-model triage → full action run — and a durable Web-Push notifications outbox, §9.4 / INGRESSES.md; spec `docs/specs/2026-06-16-autonomous-watchers.md`); **10.** long-term memory — the plain-rows foundation is **built** (`memory_facts` + the `memory` tool family + automatic recall, §6.4); pgvector semantic recall remains the phase-2 upgrade (§17); **11.** backup strategy (§17).
 
 ---
 

@@ -52,6 +52,7 @@ agent_runs
   completion_tokens   int    default 0
   cost_usd            numeric(10, 6) default 0
   speak               boolean not null default false  -- run should synthesize TTS (set only by the /audio route)
+  human_in_loop       boolean not null default true  -- derived from ingress (trigger ⇒ false); selects overflow + approval-timeout behaviour
   started_at          timestamptz
   finished_at         timestamptz
   error               text   -- nullable; set on failure
@@ -132,6 +133,55 @@ memory_facts                          -- BUILT (migration 0009) as plain rows �
   created_at      timestamptz default now()
   updated_at      timestamptz default now()
   index (user_id, scope)             -- recall reads by (user_id, scope); the pgvector index lands with the embedding column (phase 2)
+
+triggers                             -- BUILT (migration 0010) — the watcher definitions, one row
+                                     -- per watcher (autonomous triggers, ARCHITECTURE §9.4 / RUNTIME
+                                     -- §7.7; spec docs/specs/2026-06-16-autonomous-watchers.md)
+  id                 uuid pk
+  user_id            uuid fk → users.id
+  name               text                  -- human label
+  kind               text not null         -- 'schedule' | 'inbox' | 'webhook' | 'self'
+  enabled            boolean not null default true
+  conversation_id    uuid fk → conversations.id, nullable  -- persistent watcher conversation (recurring); null for 'self' (carries the originating conv instead)
+  schedule           text                  -- nullable; cron expr / poll cadence; null for webhook/self
+  gate               jsonb                 -- nullable; Tier-0 gate { tool, args, signal }; null ⇒ always-fire
+  triage             jsonb                 -- nullable; Tier-1 triage { enabled, model?, prompt? }; null ⇒ skip to action
+  objective          text not null         -- Tier-2 seed prompt
+  notify_policy      text not null         -- 'always' | 'on_change' | 'on_threshold' | 'digest'
+  last_seen_signal   jsonb                 -- nullable; Tier-0 gate diff state
+  next_fire_at       timestamptz           -- nullable
+  last_fired_at      timestamptz           -- nullable
+  detection_cost_usd numeric(10, 6) default 0  -- cumulative dismissed-detection cost
+  source_run_id      uuid fk → agent_runs.id, nullable  -- provenance for agent-scheduled triggers
+  created_at         timestamptz default now()
+  updated_at         timestamptz default now()
+  index (enabled, next_fire_at)
+
+notifications                        -- BUILT (migration 0010) — the durable push outbox
+                                     -- (autonomous triggers; spec as above)
+  id                 uuid pk
+  user_id            uuid fk → users.id
+  conversation_id    uuid fk → conversations.id, nullable  -- deep-link target
+  agent_run_id       uuid fk → agent_runs.id, nullable
+  interaction_id     uuid fk → user_interactions.id, nullable  -- set for approval/question notifications
+  kind               text not null         -- 'result' | 'approval' | 'question' | 'error'
+  title              text not null
+  body               text not null default ''  -- thin; the full content lives in the conversation
+  deep_link          text not null         -- e.g. '/conversation/<id>'
+  status             text not null         -- 'pending' | 'sent' | 'failed' | 'read'
+  created_at         timestamptz default now()
+  sent_at            timestamptz           -- nullable
+  index (status) where status = 'pending'  -- fast "to-send" outbox lookup
+
+push_subscriptions                   -- BUILT (migration 0010) — Web Push registrations, one row
+                                     -- per device/browser (autonomous triggers; spec as above)
+  id                 uuid pk
+  user_id            uuid fk → users.id
+  endpoint           text unique           -- the push service endpoint URL
+  keys               jsonb                 -- { p256dh, auth }
+  user_agent         text                  -- nullable
+  created_at         timestamptz default now()
+  unique (endpoint)
 ```
 
 ## Design notes
@@ -146,6 +196,9 @@ memory_facts                          -- BUILT (migration 0009) as plain rows �
 - **Token + cost accounting on `agent_runs`** (rolled up from `llm_calls`) so cost views don't have to walk per-call rows.
 - **`agent_runs.speak`** is set `true` only by the `POST /api/conversations/:id/audio` route (iOS voice, ARCHITECTURE §7.2/§9.1) — a second run-creating path alongside the `/messages` POST. The worker reads it at pickup to decide whether to synthesize TTS for the streamed reply; typed `/messages` runs leave it `false`, so text chat is unchanged.
 - **`memory_facts` is Alfred's one cross-conversation memory** (long-term memory v1, ARCHITECTURE §6.4; spec `docs/specs/2026-06-15-long-term-memory.md`). The table is the contract; v1 has one writer and one reader. **Write** = the agent-called `memory` tool family (`remember`/`forget`/`list_memories`, group `memory`) — every save is a `tool_calls` audit row, with `source_run_id` recording the run that wrote it. **Read** = `readMemoryFacts(db, userId, scope)` (`packages/db/queries.ts`), a plain `SELECT` the worker folds into the system prompt before the loop runs — recall is automatic, not a tool. v1 reads all `scope='global'` facts (`OWNER_USER_ID`, single-user); `readMemoryFacts` is the single seam phase-2 pgvector swaps (all facts → top-K by `embedding` distance), nothing else moving. `list_memories` reads via a deliberately-separate `listMemoryFacts` (management must keep seeing every fact when recall becomes top-K). A second writer (background auto-extraction) could land later into the same table with the read path untouched.
+- **`triggers` are the watcher definitions** (autonomous triggers, ARCHITECTURE §9.4 / RUNTIME §7.7; spec `docs/specs/2026-06-16-autonomous-watchers.md`) — one row per watcher. The thin `alfred-triggers` scheduler reads enabled rows and fires due ones via a pg-boss `trigger-detect` job; the worker's detect handler runs the **tiered detection ladder** (Tier 0 free deterministic gate → Tier 1 cheap-model triage → Tier 2 full action run). Detection writes **no `agent_runs` row** — only an *escalation* (Tier 2) creates the run + `boss.send('agent-run')`, so idle polls never litter the run log; dismissed-detection cost accrues on `detection_cost_usd`. `gate`/`triage`/`last_seen_signal` drive the ladder; `objective` seeds the Tier-2 prompt; `notify_policy` decides whether a finished detection writes a notification. A recurring watcher resolves to one persistent conversation (`channel_key = trigger id`), and its progress lives in the **objective scratchpad** — `memory_facts` with `scope='trigger:<id>'`, loaded into the run's `[system]` block instead of replaying history (RUNTIME §7.7). `source_run_id` records the run that called `schedule_self`.
+- **`notifications` is a durable push outbox** (autonomous triggers; spec as above). `LISTEN/NOTIFY` + SSE is fire-and-forget live streaming — dropped when no client is connected, which is exactly when a watcher fires. A worker run writes an outbox row (a notify-worthy result, or an `approval`/`question`/`error` while `human_in_loop=false`) and NOTIFYs the separate `notifications` channel (not a conversation `RunEvent` — ARCHITECTURE §6.2); a worker-side dispatcher LISTENs, loads the row, and delivers it via Web Push to every `push_subscriptions` row for the user, marking it `sent`/`failed`. The payload is thin (title + `deep_link` into `/conversation/:id`) because tapping opens the full result + approval card over the normal chat UI.
+- **`push_subscriptions` are Web Push registrations** (autonomous triggers; spec as above) — one row per device/browser, registered by the PWA after the owner enables notifications. The dispatcher prunes a row when the push service returns `410 Gone` (dead subscription).
 - **`llm_calls` is the observability trace** — one row per provider call capturing the full exchange: the request `Message[]`, the `tools` (function declarations) offered, the response text **and** any `response_tool_calls` the model returned, plus tokens, **cost**, latency, errors. Rolled up onto `agent_runs` and surfaced on the web `/debug` page (which also joins the run's `tool_calls` to show executed-tool results + approval outcomes). Per-call `cost_usd` is computed at insert from `tokens × model price` (the price map lives in `packages/agent-core/pricing.ts`, not the DB — see DEPLOYMENT.md §13); the run's `cost_usd` is the sum of its calls'. A non-NULL `tool_call_id` marks an LLM call made by a tool outside the agent loop (NULL = an agent-loop call), which powers the per-tool cost breakdown on `/debug`. The same synthetic-`tool_call` + non-NULL-`tool_call_id` attribution covers `generate_image`, `auto_title`, **and the voice STT/TTS speech legs** (a `'stt'`/`'tts'` synthetic `tool_calls` row + a linked `llm_calls` row, written by the shared `recordOutOfLoopLlmCall` helper) — so each speech-leg's cost rolls into the run via the usual all-calls sum while `agent_runs.model` (derived from `tool_call_id IS NULL` rows only) stays the chat model, never a speech model. It's the in-Postgres alternative to Langfuse (ARCHITECTURE §17).
 - **No `audit_log` table** — `agent_runs` + `tool_calls` + `user_interactions` form the audit log. Every action the agent took is a row with args, result, and (if applicable) the owner's response.
 - **No `attachments` table yet** — file references go inline in `messages.content` as `{type: 'attachment', path: '...'}`. Promote to a real table the first time multiple messages need to share a file.

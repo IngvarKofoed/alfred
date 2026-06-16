@@ -1,7 +1,18 @@
-import { and, asc, eq, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
 import { type Db } from './client.js'
-import { agentRuns, conversations, llmCalls, memoryFacts, messages, toolCalls, users } from './schema.js'
+import {
+  agentRuns,
+  conversations,
+  llmCalls,
+  memoryFacts,
+  messages,
+  notifications,
+  pushSubscriptions,
+  toolCalls,
+  triggers,
+  users,
+} from './schema.js'
 
 // A Db handle or a transaction handle — so helpers can run standalone or inside a caller's
 // transaction (e.g. the message ingress, which seeds the conversation in the same tx as the
@@ -194,5 +205,255 @@ export async function deleteMemoryFact(
     .delete(memoryFacts)
     .where(and(eq(memoryFacts.id, params.id), eq(memoryFacts.userId, params.userId)))
     .returning({ id: memoryFacts.id })
+  return { deleted: deleted.length > 0 }
+}
+
+// ---- Triggers (autonomous watchers, spec 2026-06-16) ----
+
+// Insert a watcher row (used by the `schedule_self` tool in the worker). `notifyPolicy` defaults
+// 'on_change' (any escalation pushes). Returns the new id so the agent can reference it.
+export async function insertTrigger(
+  db: DbOrTx,
+  params: {
+    userId: string
+    name: string
+    kind: 'schedule' | 'inbox' | 'webhook' | 'self'
+    conversationId?: string | null
+    schedule?: string | null
+    gate?: unknown
+    triage?: unknown
+    objective: string
+    notifyPolicy?: string
+    nextFireAt?: Date | null
+    sourceRunId?: string | null
+  },
+): Promise<{ id: string }> {
+  const [row] = await db
+    .insert(triggers)
+    .values({
+      userId: params.userId,
+      name: params.name,
+      kind: params.kind,
+      conversationId: params.conversationId ?? null,
+      schedule: params.schedule ?? null,
+      gate: params.gate ?? null,
+      triage: params.triage ?? null,
+      objective: params.objective,
+      notifyPolicy: params.notifyPolicy ?? 'on_change',
+      nextFireAt: params.nextFireAt ?? null,
+      sourceRunId: params.sourceRunId ?? null,
+    })
+    .returning({ id: triggers.id })
+  return { id: row!.id }
+}
+
+// All enabled rows for a user — read by the triggers scheduler at boot to register schedules.
+// Full rows so the scheduler has kind / schedule / nextFireAt.
+export function listEnabledTriggers(db: DbOrTx, userId: string): Promise<(typeof triggers.$inferSelect)[]> {
+  return db.select().from(triggers).where(and(eq(triggers.userId, userId), eq(triggers.enabled, true)))
+}
+
+// Fetch one trigger by id — used by the worker's trigger-detect handler (the job payload carries
+// triggerId) and the webserver's webhook route.
+export async function getTrigger(
+  db: DbOrTx,
+  id: string,
+): Promise<(typeof triggers.$inferSelect) | undefined> {
+  const [row] = await db.select().from(triggers).where(eq(triggers.id, id)).limit(1)
+  return row
+}
+
+// All of a user's triggers (incl. disabled) newest-first — backs the `list_triggers` tool so the
+// agent can report what's scheduled and find the ids to disable/delete.
+export function listTriggers(db: DbOrTx, userId: string): Promise<(typeof triggers.$inferSelect)[]> {
+  return db.select().from(triggers).where(eq(triggers.userId, userId)).orderBy(desc(triggers.createdAt))
+}
+
+// Enable/disable a trigger, owner-scoped (a model-supplied id can't touch another user's row) and
+// UUID-guarded (a hallucinated non-UUID is a clean miss, not a thrown uuid cast — mirrors
+// deleteMemoryFact). Returns whether a row matched. Disabling stops it firing + frees the
+// schedule_self cap; the scheduler unregisters it on its next reconcile. Backs `disable_trigger`.
+export async function setTriggerEnabled(
+  db: DbOrTx,
+  params: { userId: string; id: string; enabled: boolean },
+): Promise<{ updated: boolean }> {
+  if (!UUID_RE.test(params.id)) return { updated: false }
+  const updated = await db
+    .update(triggers)
+    .set({ enabled: params.enabled, updatedAt: new Date() })
+    .where(and(eq(triggers.id, params.id), eq(triggers.userId, params.userId)))
+    .returning({ id: triggers.id })
+  return { updated: updated.length > 0 }
+}
+
+// Permanently delete a trigger, owner-scoped + UUID-guarded (mirrors deleteMemoryFact). Returns
+// whether a row was removed. Backs the `delete_trigger` tool.
+export async function deleteTrigger(
+  db: DbOrTx,
+  params: { userId: string; id: string },
+): Promise<{ deleted: boolean }> {
+  if (!UUID_RE.test(params.id)) return { deleted: false }
+  const deleted = await db
+    .delete(triggers)
+    .where(and(eq(triggers.id, params.id), eq(triggers.userId, params.userId)))
+    .returning({ id: triggers.id })
+  return { deleted: deleted.length > 0 }
+}
+
+// Persist the new Tier-0 gate signal after a change is detected (gate.ts).
+export async function updateTriggerSignal(db: DbOrTx, id: string, lastSeenSignal: unknown): Promise<void> {
+  await db
+    .update(triggers)
+    .set({ lastSeenSignal: lastSeenSignal ?? null, updatedAt: new Date() })
+    .where(eq(triggers.id, id))
+}
+
+// Increment triggers.detection_cost_usd by a dismissed Tier-1 call's cost (triage.ts, on dismiss).
+// The add is done in SQL so concurrent ticks don't read-modify-write stomp each other; the
+// numeric column accepts the text-cast addend.
+export async function bumpDetectionCost(db: DbOrTx, id: string, costUsd: number): Promise<void> {
+  await db
+    .update(triggers)
+    .set({ detectionCostUsd: sql`${triggers.detectionCostUsd} + ${costUsd.toFixed(6)}`, updatedAt: new Date() })
+    .where(eq(triggers.id, id))
+}
+
+// Set last_fired_at=now() and optionally update next_fire_at (a one-shot 'self' trigger sets
+// next_fire_at=null after firing). Called by the worker's detect handler on each tick.
+export async function markTriggerFired(
+  db: DbOrTx,
+  id: string,
+  opts: { nextFireAt?: Date | null } = {},
+): Promise<void> {
+  await db
+    .update(triggers)
+    .set({
+      lastFiredAt: sql`now()`,
+      ...(Object.prototype.hasOwnProperty.call(opts, 'nextFireAt') ? { nextFireAt: opts.nextFireAt } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(triggers.id, id))
+}
+
+// The autonomous sibling of createUserMessageRun: resolve (touching recency) the trigger's
+// persistent conversation, persist the objective as a user message, and create its pending run
+// with human_in_loop=false. Runs inside the caller's transaction so the one-active-run unique
+// index violation surfaces to the caller (the detect handler catches it → skip/coalesce per
+// spec §78). Returns the new run id. The conversation's ingress/channelKey are caller-controlled
+// (the detect handler resolves a recurring watcher via ensureConversation('trigger', '<id>')
+// before calling this with the same conversationId); here we only touch recency.
+export async function createTriggerRun(
+  db: DbOrTx,
+  params: { conversationId: string; objective: string },
+): Promise<string> {
+  await ensureConversation(db, params.conversationId, { touch: true })
+  const [msg] = await db
+    .insert(messages)
+    .values({ conversationId: params.conversationId, role: 'user', content: [{ type: 'text', text: params.objective }] })
+    .returning()
+  const [run] = await db
+    .insert(agentRuns)
+    .values({
+      conversationId: params.conversationId,
+      triggerMessageId: msg!.id,
+      status: 'pending',
+      humanInLoop: false,
+    })
+    .returning()
+  return run!.id
+}
+
+// ---- Notifications outbox + push subscriptions (autonomous-watchers spec) ----
+
+// Write a pending outbox row. The worker writes it then NOTIFY 'notifications'; the dispatcher
+// loads it and pushes. Returns the new id.
+export async function insertNotification(
+  db: DbOrTx,
+  params: {
+    userId: string
+    conversationId?: string | null
+    agentRunId?: string | null
+    interactionId?: string | null
+    kind: 'result' | 'approval' | 'question' | 'error'
+    title: string
+    body?: string
+    deepLink: string
+  },
+): Promise<{ id: string }> {
+  const [row] = await db
+    .insert(notifications)
+    .values({
+      userId: params.userId,
+      conversationId: params.conversationId ?? null,
+      agentRunId: params.agentRunId ?? null,
+      interactionId: params.interactionId ?? null,
+      kind: params.kind,
+      title: params.title,
+      body: params.body ?? '',
+      deepLink: params.deepLink,
+      status: 'pending',
+    })
+    .returning({ id: notifications.id })
+  return { id: row!.id }
+}
+
+// All status='pending' rows (uses the partial pending index). The dispatcher loads on each
+// 'notifications' NOTIFY and on boot (catch-up for anything written while it was down).
+export function listPendingNotifications(db: DbOrTx): Promise<(typeof notifications.$inferSelect)[]> {
+  return db.select().from(notifications).where(eq(notifications.status, 'pending'))
+}
+
+// Mark a notification delivered (dispatcher, on a successful send).
+export async function markNotificationSent(db: DbOrTx, id: string): Promise<void> {
+  await db.update(notifications).set({ status: 'sent', sentAt: sql`now()` }).where(eq(notifications.id, id))
+}
+
+// Mark a notification undeliverable (dispatcher, when every subscription failed).
+export async function markNotificationFailed(db: DbOrTx, id: string): Promise<void> {
+  await db.update(notifications).set({ status: 'failed' }).where(eq(notifications.id, id))
+}
+
+// All Web Push registrations for a user — the dispatcher fans a notification out to every device.
+export function listPushSubscriptions(
+  db: DbOrTx,
+  userId: string,
+): Promise<(typeof pushSubscriptions.$inferSelect)[]> {
+  return db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId))
+}
+
+// Insert-or-update a registration keyed on endpoint (the same browser re-subscribing refreshes
+// its keys/userAgent rather than duplicating). The webserver's POST /api/push/subscribe calls it.
+export async function upsertPushSubscription(
+  db: DbOrTx,
+  params: {
+    userId: string
+    endpoint: string
+    keys: { p256dh: string; auth: string }
+    userAgent?: string | null
+  },
+): Promise<{ id: string }> {
+  const [row] = await db
+    .insert(pushSubscriptions)
+    .values({
+      userId: params.userId,
+      endpoint: params.endpoint,
+      keys: params.keys,
+      userAgent: params.userAgent ?? null,
+    })
+    .onConflictDoUpdate({
+      target: pushSubscriptions.endpoint,
+      set: { userId: params.userId, keys: params.keys, userAgent: params.userAgent ?? null },
+    })
+    .returning({ id: pushSubscriptions.id })
+  return { id: row!.id }
+}
+
+// Remove a registration by endpoint. The dispatcher calls it on a 410 Gone (prune a dead
+// subscription); the webserver's POST /api/push/unsubscribe calls it on an explicit opt-out.
+export async function deletePushSubscription(db: DbOrTx, endpoint: string): Promise<{ deleted: boolean }> {
+  const deleted = await db
+    .delete(pushSubscriptions)
+    .where(eq(pushSubscriptions.endpoint, endpoint))
+    .returning({ id: pushSubscriptions.id })
   return { deleted: deleted.length > 0 }
 }

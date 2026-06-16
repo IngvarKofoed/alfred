@@ -96,6 +96,21 @@ const schema = z.object({
   SMTP_SECURE: z.string().default('true').transform((v) => v.toLowerCase() === 'true'),
   // From address for outgoing mail; defaults to SMTP_USER in the email module when unset.
   EMAIL_FROM: z.string().optional(),
+  // Autonomous watchers (spec docs/specs/2026-06-16-autonomous-watchers.md).
+  // Cheap Tier-1 triage model (the §7.4 cost/latency-routing seam, e.g. gemini-2.5-flash-lite).
+  // Optional with NO schema default — the worker's triage code falls back to GEMINI_MODEL when
+  // unset, keeping the schema simple (a default here would mask that fallback intent).
+  DETECTION_MODEL: z.string().optional(),
+  // Approval timeout for unattended (human_in_loop=false) runs — longer than the 1h interactive
+  // APPROVAL_TIMEOUT_MS in run.ts, since no one is watching to answer promptly. Default 24h (ms).
+  AUTONOMOUS_APPROVAL_TIMEOUT_MS: z.coerce.number().int().positive().default(86400000),
+  // Web Push VAPID material (autonomous-watchers spec). All optional so Web Push is inert if
+  // unset (like IMAP_* / GEMINI_API_KEY): the worker's makeNotifier() returns null when any is
+  // missing, and the webserver serves the public key only when present. Not paths — no repo-root
+  // anchoring. Generate a keypair with `npx web-push generate-vapid-keys`.
+  VAPID_PUBLIC_KEY: z.string().optional(),
+  VAPID_PRIVATE_KEY: z.string().optional(),
+  VAPID_SUBJECT: z.string().optional(), // a mailto: or https: contact, required by the Web Push spec
 })
 
 export type Config = z.infer<typeof schema>

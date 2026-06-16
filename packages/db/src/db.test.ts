@@ -2,7 +2,17 @@ import { and, eq, inArray } from 'drizzle-orm'
 import { describe, expect, it } from 'vitest'
 import { terminateRuns } from './boss.js'
 import { createDb } from './client.js'
-import { deleteMemoryFact, insertMemoryFact, listMemoryFacts, readMemoryFacts } from './queries.js'
+import {
+  deleteMemoryFact,
+  deleteTrigger,
+  insertMemoryFact,
+  insertTrigger,
+  listEnabledTriggers,
+  listMemoryFacts,
+  listTriggers,
+  readMemoryFacts,
+  setTriggerEnabled,
+} from './queries.js'
 import { agentRuns, conversations, messages, toolCalls, userInteractions, users } from './schema.js'
 
 const url = process.env.POSTGRES_URL
@@ -214,6 +224,88 @@ describe.skipIf(!url)('memory facts', () => {
     expect(observed!.firstDelete).toEqual({ deleted: true })
     expect(observed!.secondDelete).toEqual({ deleted: false }) // owner-scoped delete is idempotent on a missing row
     expect(observed!.malformedDelete).toEqual({ deleted: false }) // non-UUID id → clean miss, never a uuid-cast throw
+    expect(observed!.after).toEqual([])
+  })
+})
+
+// Integration test for the trigger-management helpers (autonomous-watchers: list_triggers /
+// disable_trigger / delete_trigger): insert a trigger, list it, disable it (drops out of the
+// enabled list), then delete it — asserting owner-scoping (another user can't touch it) and the
+// UUID guard. Same rollback pattern, so the DB stays pristine.
+describe.skipIf(!url)('trigger management', () => {
+  it('round-trips insert -> list -> disable -> delete (owner-scoped + UUID-guarded)', async () => {
+    const db = createDb(url!)
+    const ROLLBACK = Symbol('rollback')
+    let observed:
+      | {
+          listed: { id: string; name: string; enabled: boolean }[]
+          enabledBefore: { id: string }[]
+          foreignDisable: { updated: boolean }
+          disabled: { updated: boolean }
+          enabledAfter: { id: string }[]
+          malformedDelete: { deleted: boolean }
+          foreignDelete: { deleted: boolean }
+          firstDelete: { deleted: boolean }
+          secondDelete: { deleted: boolean }
+          after: { id: string }[]
+        }
+      | undefined
+
+    try {
+      await db.transaction(async (tx) => {
+        const [user] = await tx.insert(users).values({ displayName: 'Owner' }).returning()
+        const [other] = await tx.insert(users).values({ displayName: 'Other' }).returning()
+        const { id } = await insertTrigger(tx, {
+          userId: user!.id,
+          name: 'Inbox watcher',
+          kind: 'inbox',
+          schedule: '*/10 * * * *',
+          objective: 'Check for urgent unread mail',
+          notifyPolicy: 'on_change',
+        })
+
+        const listed = await listTriggers(tx, user!.id)
+        const enabledBefore = await listEnabledTriggers(tx, user!.id)
+        // Owner-scoping: another user can neither disable nor delete it.
+        const foreignDisable = await setTriggerEnabled(tx, { userId: other!.id, id, enabled: false })
+        const disabled = await setTriggerEnabled(tx, { userId: user!.id, id, enabled: false })
+        const enabledAfter = await listEnabledTriggers(tx, user!.id)
+        // A non-UUID id is a clean miss (never a uuid-cast throw); a foreign owner can't delete.
+        const malformedDelete = await deleteTrigger(tx, { userId: user!.id, id: 'not-a-uuid' })
+        const foreignDelete = await deleteTrigger(tx, { userId: other!.id, id })
+        const firstDelete = await deleteTrigger(tx, { userId: user!.id, id })
+        const secondDelete = await deleteTrigger(tx, { userId: user!.id, id }) // already gone
+        const after = await listTriggers(tx, user!.id)
+
+        observed = {
+          listed,
+          enabledBefore,
+          foreignDisable,
+          disabled,
+          enabledAfter,
+          malformedDelete,
+          foreignDelete,
+          firstDelete,
+          secondDelete,
+          after,
+        }
+        throw ROLLBACK // abort the transaction so the DB stays pristine
+      })
+    } catch (err) {
+      if (err !== ROLLBACK) throw err
+    }
+
+    expect(observed).toBeDefined()
+    expect(observed!.listed).toHaveLength(1)
+    expect(observed!.listed[0]!.name).toBe('Inbox watcher')
+    expect(observed!.enabledBefore).toHaveLength(1)
+    expect(observed!.foreignDisable).toEqual({ updated: false }) // owner-scoped
+    expect(observed!.disabled).toEqual({ updated: true })
+    expect(observed!.enabledAfter).toEqual([]) // disabled ⇒ no longer in the enabled list
+    expect(observed!.malformedDelete).toEqual({ deleted: false }) // non-UUID ⇒ clean miss
+    expect(observed!.foreignDelete).toEqual({ deleted: false }) // owner-scoped
+    expect(observed!.firstDelete).toEqual({ deleted: true })
+    expect(observed!.secondDelete).toEqual({ deleted: false }) // idempotent on a missing row
     expect(observed!.after).toEqual([])
   })
 })

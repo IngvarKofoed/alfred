@@ -12,6 +12,17 @@ export interface AgentJob {
   runId: string
 }
 
+// The second job type (autonomous-watchers spec): a due trigger enqueues a trigger-detect job
+// that the worker runs through Tier 0 → Tier 1, only escalating to a real agent-run on signal.
+// The detect handler creates NO agent_runs row (no row-litter on idle polls).
+export const TRIGGER_DETECT_QUEUE = 'trigger-detect'
+export interface TriggerDetectJob {
+  triggerId: string
+  // Manual "run now" (the run_trigger tool): skip the Tier-0 gate + Tier-1 triage and escalate
+  // immediately. Absent/false on scheduled, webhook, and self-sweep fires (the normal ladder).
+  force?: boolean
+}
+
 let boss: PgBoss | null = null
 let starting: Promise<PgBoss> | null = null
 
@@ -24,6 +35,7 @@ async function getBoss(): Promise<PgBoss> {
     starting = (async () => {
       await instance.start()
       await instance.createQueue(AGENT_RUN_QUEUE).catch(() => {}) // idempotent
+      await instance.createQueue(TRIGGER_DETECT_QUEUE).catch(() => {}) // idempotent
       boss = instance
       return instance
     })()
@@ -46,6 +58,49 @@ export async function workAgentRuns(handler: (runId: string) => Promise<void>): 
   await b.work<AgentJob>(AGENT_RUN_QUEUE, async (jobs) => {
     for (const job of jobs) await handler(job.data.runId)
   })
+}
+
+// Enqueue a trigger-detect job (a due trigger / a webhook hit). Same delivery shape as an
+// agent-run: retryLimit:0 + a long expiration, so a crashed worker never re-runs detection.
+export async function enqueueTriggerDetect(
+  triggerId: string,
+  opts: { force?: boolean } = {},
+): Promise<void> {
+  const b = await getBoss()
+  await b.send(TRIGGER_DETECT_QUEUE, { triggerId, force: opts.force } satisfies TriggerDetectJob, {
+    retryLimit: 0,
+    expireInSeconds: 4500,
+  })
+}
+
+export async function workTriggerDetects(handler: (job: TriggerDetectJob) => Promise<void>): Promise<void> {
+  const b = await getBoss()
+  await b.work<TriggerDetectJob>(TRIGGER_DETECT_QUEUE, async (jobs) => {
+    for (const job of jobs) await handler(job.data)
+  })
+}
+
+// Register a recurring trigger-detect via pg-boss cron scheduling (first use of boss.schedule in
+// the codebase). Kept inside @alfred/db so the triggers slice never touches PgBoss directly,
+// matching the "consumers never touch PgBoss" rule. pg-boss keys a schedule by queue name, so the
+// triggers slice carries the trigger id in `data` (the detect handler reads job.data.triggerId).
+export async function scheduleTrigger(
+  name: string,
+  cron: string,
+  data: TriggerDetectJob,
+  tz?: string,
+): Promise<void> {
+  const b = await getBoss()
+  // pg-boss evaluates cron in `tz` (an IANA zone) when given, else UTC — so the owner's "8am" means
+  // 8am in their zone. The triggers scheduler passes TRIGGER_TZ.
+  await b.schedule(name, cron, data, { retryLimit: 0, expireInSeconds: 4500, ...(tz ? { tz } : {}) })
+}
+
+// Clear the trigger-detect schedule on boot so the triggers scheduler can re-register from the
+// current enabled rows (fail-and-restart: re-read truth, don't trust prior state).
+export async function unscheduleAll(): Promise<void> {
+  const b = await getBoss()
+  await b.unschedule(TRIGGER_DETECT_QUEUE).catch(() => {}) // no-op if nothing scheduled
 }
 
 // §10.9 invariant 4 in one implementation: flip the runs matched by `where` to a terminal

@@ -6,7 +6,17 @@ import { makeBrowserTools } from './browser/tools.js'
 import { makeEmailTools } from './email/tools.js'
 import { makeMemoryTools } from './memory/tools.js'
 import { makePythonTools } from './python/tools.js'
-import { makeAskUserTool, makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
+import {
+  deleteTriggerTool,
+  disableTriggerTool,
+  listTriggersTool,
+  makeAskUserTool,
+  makeFileTools,
+  makeGenerateImageTool,
+  makeScheduleSelfTool,
+  makeSetTitleTool,
+  runTriggerTool,
+} from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
 // state), so build them once at module load rather than per run.
@@ -22,21 +32,30 @@ const askUserPauseStub = () => Promise.reject(new Error('ask_user pause not boun
 
 // The full toolset for a run. The conversation-bound tools (title, file, python, ask_user) are
 // rebuilt per call; the memory tools close over runId so a saved fact records its source_run_id
-// (spec docs/specs/2026-06-15-long-term-memory.md); echo, generate_image, and the browser tools
-// carry no per-conversation state.
+// (spec docs/specs/2026-06-15-long-term-memory.md) AND over the memory scope so a watcher run's
+// remember/list/forget operate on its own scratchpad scope (`trigger:<id>`, autonomous-watchers
+// spec §7.7) rather than the owner's global memory; echo, generate_image, and the browser tools
+// carry no per-conversation state. `memoryScope` defaults 'global' so an interactive run is
+// byte-for-byte unchanged.
 export function buildRunTools(
   conversationId: string,
   askUserPause?: (callId: string, prompt: unknown) => Promise<unknown>,
   runId?: string,
+  memoryScope = 'global',
 ): Tool[] {
   return [
     echoTool,
     makeSetTitleTool(conversationId),
     makeGenerateImageTool(),
     makeAskUserTool(askUserPause ?? askUserPauseStub),
+    makeScheduleSelfTool(conversationId, runId),
+    listTriggersTool,
+    disableTriggerTool,
+    deleteTriggerTool,
+    runTriggerTool,
     ...makeFileTools(conversationId),
     ...makePythonTools(conversationId),
-    ...makeMemoryTools(runId),
+    ...makeMemoryTools(runId, memoryScope),
     ...EMAIL_TOOLS,
     ...BROWSER_TOOLS,
   ]

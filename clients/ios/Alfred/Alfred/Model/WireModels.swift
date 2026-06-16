@@ -133,6 +133,9 @@ nonisolated struct WireMessage: Decodable {
 nonisolated struct ConversationSummary: Decodable, Identifiable, Hashable {
     let id: String
     let title: String?
+    // Ingress: "web" (web/iOS chat + voice), "trigger" (autonomous watcher), future "discord".
+    // Optional for backward-compat; the client badges non-web rows. Absent ⇒ treated as web.
+    let ingress: String?
     let lastActiveAt: String?
 }
 

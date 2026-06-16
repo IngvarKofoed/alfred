@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# vite-plugin-pwa dev-mode service-worker artifact (clients/web/dev-dist) — generated, never committed.
+dev-dist/
 .env
 *.log
 .DS_Store

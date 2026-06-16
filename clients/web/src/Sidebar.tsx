@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 type ConversationRow = {
   id: string
   title: string | null
+  ingress: string | null
   lastActiveAt: string | null
 }
 
@@ -50,7 +51,7 @@ export default function Sidebar({
   const activeInList = conversations.some((c) => c.id === activeId)
   const transient: ConversationRow | null = activeInList
     ? null
-    : { id: activeId, title: activeTitle, lastActiveAt: null }
+    : { id: activeId, title: activeTitle, ingress: 'web', lastActiveAt: null }
 
   const rows = (
     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -142,8 +143,28 @@ function Row({
         </span>
         <span className="shrink-0 text-xs text-muted">{relTime(conversation.lastActiveAt)}</span>
       </div>
+      {badgeLabel(conversation.ingress) && (
+        <span className="mt-1 inline-block rounded-sm bg-surface px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-brass">
+          {badgeLabel(conversation.ingress)}
+        </span>
+      )}
     </Link>
   )
+}
+
+// Non-web ingresses get a small tag so a watcher / Discord / voice thread is distinguishable in
+// the unified list. 'web' (and the transient new-chat row) shows none.
+function badgeLabel(ingress: string | null): string | null {
+  switch (ingress) {
+    case 'trigger':
+      return 'watcher'
+    case 'discord':
+      return 'discord'
+    case 'voice':
+      return 'voice'
+    default:
+      return null
+  }
 }
 
 // Compact relative time ("3m", "2h", "5d"), falling back to a date. Mirrors Debug's relTime

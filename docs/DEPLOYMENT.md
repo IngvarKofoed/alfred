@@ -44,9 +44,9 @@ All processes are native (no Docker). Managed by **pm2** — the same process su
 | `alfred-updater` | Node/TS | Auto-deploy: polls git, rebuilds + restarts the managed apps; opt-in via `DEPLOY_ENABLED` | Restart on failure |
 | `alfred-discord` | Node/TS | Discord ingress (post-MVP) | Restart on failure |
 | `alfred-voice` | Node/TS | Voice orchestrator (native-app surface, post-MVP) | Restart on failure |
-| `alfred-triggers` | Node/TS | Scheduler / event-source ingress (post-MVP) | Restart on failure |
+| `alfred-triggers` | Node/TS | Autonomous-watcher scheduler — computes due triggers + enqueues `trigger-detect` jobs (timing only; all tool execution stays in the worker, §9.4) | Restart on failure |
 
-**Built today:** `alfred-webserver`, `alfred-worker`, and `alfred-updater` are in `ecosystem.config.cjs`; the `discord`/`voice`/`triggers` rows are the reserved post-MVP shape (so the topology is whole, not because they exist — §15). The updater is **inert unless `DEPLOY_ENABLED=true`** (a plain `pm2 start ecosystem.config.cjs` boots it idle); `pnpm deploy:up` (`pm2 start ecosystem.config.cjs --env deploy`) brings the stack up with it enabled. Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
+**Built today:** `alfred-webserver`, `alfred-worker`, `alfred-updater`, and now `alfred-triggers` (the autonomous-watcher scheduler, §9.4) are in `ecosystem.config.cjs`; the `discord`/`voice` rows are the reserved post-MVP shape (so the topology is whole, not because they exist — §15). `alfred-triggers` is a **pure scheduler** — it owns timing only (cron via pg-boss `schedule()` + a periodic sweep for one-shot `self` triggers) and never imports the tool layer. The updater is **inert unless `DEPLOY_ENABLED=true`** (a plain `pm2 start ecosystem.config.cjs` boots it idle); `pnpm deploy:up` (`pm2 start ecosystem.config.cjs --env deploy`) brings the stack up with it enabled. Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
 
 Deploy: automated by `alfred-updater` — the authoritative sequence is stop-first: `pm2 stop <apps>` → `git checkout -f <branch>` + `git reset --hard origin/<branch>` → `pnpm install --frozen-lockfile` → `pnpm -r build` → `pnpm db:migrate` → `pm2 start <apps>` (with a `finally` that always brings the apps back up). Deploying by hand means running that same sequence manually. Postgres is installed via the host's package manager and managed by the OS, not pm2. **Alternative** if pm2 ever stops fitting: each target's native supervisor (systemd/launchd), which is what pm2 delegates to anyway.
 
@@ -60,7 +60,7 @@ Three layers, increasing specificity: **(1) defaults in code** (`packages/shared
 
 ### 13.1 .env layout
 
-The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`, `STT_PROVIDER`/`TTS_PROVIDER`/`GOOGLE_SPEECH_API_KEY`/`ELEVENLABS_API_KEY`/`TTS_VOICE`); the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
+The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`, `STT_PROVIDER`/`TTS_PROVIDER`/`GOOGLE_SPEECH_API_KEY`/`ELEVENLABS_API_KEY`/`TTS_VOICE`, `DETECTION_MODEL`, `AUTONOMOUS_APPROVAL_TIMEOUT_MS`, `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`/`VAPID_SUBJECT`); `TRIGGER_TZ` is built too but read via `process.env` in the triggers scheduler, **not** the zod schema; the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
 
 ```
 # Built
@@ -93,6 +93,12 @@ TTS_PROVIDER=google              # text-to-speech provider for iOS voice: 'googl
 GOOGLE_SPEECH_API_KEY=...        # optional; Google Cloud Speech REST fallback if Gemini-native audio is unavailable
 ELEVENLABS_API_KEY=...           # optional; required only when STT_PROVIDER/TTS_PROVIDER=elevenlabs
 TTS_VOICE=...                    # optional; provider-specific default voice id
+DETECTION_MODEL=gemini-2.5-flash-lite  # optional; cheap Tier-1 triage model for autonomous watchers (§9.4 / §7.4 routing seam); unset ⇒ falls back to GEMINI_MODEL
+AUTONOMOUS_APPROVAL_TIMEOUT_MS=86400000  # approval timeout for unattended (human_in_loop=false) runs; default 24h (longer than the 1h interactive APPROVAL_TIMEOUT_MS)
+VAPID_PUBLIC_KEY=...             # Web Push VAPID public key (§9.4); optional — Web Push inert if any VAPID_* is unset (makeNotifier() → null)
+VAPID_PRIVATE_KEY=...            # Web Push VAPID private key
+VAPID_SUBJECT=mailto:you@example.com  # VAPID contact (mailto:/https:), required by the Web Push spec
+TRIGGER_TZ=Europe/Copenhagen     # optional; IANA zone cron triggers evaluate in (so "8am" is local). Read via process.env in the triggers scheduler, NOT the zod schema; defaults to the host's resolved zone
 # Observability is in-Postgres (llm_calls + /debug) — no keys.
 
 # Reserved (post-MVP)
@@ -127,9 +133,9 @@ alfred/
 │  ├─ webserver/            ← Hono (API + static serving)
 │  ├─ worker/               ← agent worker (+ embedded browser bridge: src/browser/)
 │  ├─ updater/              ← auto-deploy: git poll → rebuild → restart
+│  ├─ triggers/             ← autonomous-watcher scheduler (built; §9.4)
 │  ├─ discord-bot/          ← Discord ingress (post-MVP)
-│  ├─ voice/                ← voice orchestrator (post-MVP)
-│  └─ triggers/             ← scheduler / event-source ingress (post-MVP)
+│  └─ voice/                ← voice orchestrator (post-MVP)
 ├─ clients/                 ← user-facing apps
 │  ├─ web/                  ← Vite + React PWA (chat-only; pnpm workspace member)
 │  └─ ios/                  ← native iOS app (Swift + Xcode, post-MVP; NOT in pnpm workspace)

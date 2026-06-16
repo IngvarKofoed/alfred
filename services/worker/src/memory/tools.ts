@@ -14,7 +14,15 @@ const MAX_FACT_CHARS = 500
 // approval prompt per run via the group); list_memories is read-tier. These are Alfred's ONE
 // memory across all conversations — the read side (automatic recall into the system prompt) is in
 // run.ts, not a tool. `runId` is optional so toolCatalog()'s metadata build can pass none.
-export function makeMemoryTools(runId?: string): Tool[] {
+//
+// `scope` (default 'global') selects which memory scope these tools read/write. An interactive
+// run uses 'global' (Alfred's one cross-conversation memory). An autonomous watcher run passes
+// its scratchpad scope (`trigger:<id>`, autonomous-watchers spec §7.7) so remember/list_memories
+// operate on the watcher's own progress notes — kept out of the owner's global memory — and a
+// future run of the same watcher recalls them (run.ts folds the same scope into the system block).
+// `forget` is by-id+owner (deleteMemoryFact), so it needs no scope: ids come from list_memories,
+// which is already scope-bound.
+export function makeMemoryTools(runId?: string, scope = 'global'): Tool[] {
   return [
     {
       name: 'remember',
@@ -37,6 +45,7 @@ export function makeMemoryTools(runId?: string): Tool[] {
         const text = Array.from(raw).slice(0, MAX_FACT_CHARS).join('')
         const { id } = await insertMemoryFact(getDb(), {
           userId: OWNER_USER_ID,
+          scope,
           text,
           sourceRunId: runId ?? null,
         })
@@ -71,7 +80,7 @@ export function makeMemoryTools(runId?: string): Tool[] {
       trustTier: 'read',
       group: 'memory',
       async invoke(): Promise<unknown> {
-        const facts = await listMemoryFacts(getDb(), OWNER_USER_ID)
+        const facts = await listMemoryFacts(getDb(), OWNER_USER_ID, scope)
         // Named array (never a bare array — the Gemini function-response Struct, CHANGELOG 34);
         // capped like every other tool result in case the fact set has grown large.
         return capResult({ facts })

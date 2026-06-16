@@ -17,6 +17,13 @@ module.exports = {
       autorestart: true,
     },
     {
+      name: 'alfred-triggers',
+      cwd: __dirname,
+      script: 'services/triggers/dist/index.js',
+      env: { NODE_ENV: 'production' },
+      autorestart: true,
+    },
+    {
       name: 'alfred-updater',
       cwd: __dirname,
       script: 'services/updater/dist/index.js',

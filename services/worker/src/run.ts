@@ -15,9 +15,9 @@ import {
   TracingProvider,
   type TtsProvider,
 } from '@alfred/agent-core'
-import { agentRuns, conversations, getDb, llmCalls, messages, OWNER_USER_ID, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
+import { agentRuns, conversations, getDb, getTrigger, insertNotification, llmCalls, messages, OWNER_USER_ID, pgNotify, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
-import { and, asc, eq, inArray, isNull } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
 import { writeAudioToWorkspace } from './audio.js'
 import { buildRunTools } from './catalog.js'
@@ -65,18 +65,70 @@ const SYSTEM_PROMPT =
   'You have a long-term memory across conversations: save durable facts about the owner with remember; ' +
   "recall is automatic, so don't re-save what you already know. Use forget to remove a fact."
 
-// Render the run's [system] text: the static persona prompt plus, when the owner has any
-// remembered facts, a recall block (long-term memory spec). Kept a named seam rather than
-// inlined so the deferred §7.5 work (identity block + persona file) has one place to compose
-// the system message instead of having to untangle a concatenation.
-function systemTextWithMemory(facts: { text: string }[]): string {
-  if (facts.length === 0) return SYSTEM_PROMPT
-  const block = facts.map((f) => `- ${f.text}`).join('\n')
-  return `${SYSTEM_PROMPT}\n\nWhat you remember about the owner:\n${block}`
+// Render the run's [system] text: the static persona prompt plus, when present, a global-recall
+// block (long-term memory spec) and — for a recurring watcher run — the watcher scratchpad block
+// (the objective scratchpad, §7.7). Kept a named seam rather than inlined so the deferred §7.5 work
+// (identity block + persona file) has one place to compose the system message instead of having
+// to untangle a concatenation. `scratchpad` is empty for an interactive (and 'self' one-shot) run.
+//
+// `isTrigger` frames any unattended run (no human live); `watcherId` is set ONLY for a recurring
+// watcher (which owns a `trigger:<id>` scratchpad scope) — its remember/forget already write that
+// scope (the tools are scope-bound), so we tell the model to record progress with remember WITHOUT
+// naming the scope (a one-shot 'self' run has no scratchpad, so it never gets that instruction).
+function systemTextWithMemory(
+  facts: { text: string }[],
+  scratchpad: { text: string }[] = [],
+  opts: { isTrigger?: boolean; watcherId?: string } = {},
+): string {
+  let text = SYSTEM_PROMPT
+  if (opts.isTrigger) {
+    // Frame the autonomous run: no human is watching live, be decisive, actions still gate.
+    text +=
+      '\n\nThis is an autonomous background run with no human watching live. Be decisive; ' +
+      "any action that sends, deletes, or changes things still pauses for the owner's approval."
+    if (opts.watcherId) {
+      // A recurring watcher: the scratchpad is the continuity mechanism, and remember/forget on
+      // this run carry progress forward (no full-history replay). The tools are already scoped to
+      // this watcher, so don't name a scope the model would otherwise mis-type.
+      text +=
+        ' Record progress and next steps with remember so future runs of this watcher continue ' +
+        'where you left off.'
+    }
+  }
+  if (facts.length > 0) {
+    text += `\n\nWhat you remember about the owner:\n${facts.map((f) => `- ${f.text}`).join('\n')}`
+  }
+  if (scratchpad.length > 0) {
+    text += `\n\nYour notes on this watcher so far:\n${scratchpad.map((f) => `- ${f.text}`).join('\n')}`
+  }
+  return text
 }
 
 export interface RunDeps {
   provider?: LlmProvider
+}
+
+// Sentinel thrown by awaitInteraction when an approval pause times out (vs. resolves to a
+// rejection). An interactive run never sees this — its caller maps a timeout to the same
+// not-approved verdict as today. An UNATTENDED (trigger) run lets it propagate so the run takes
+// the failed path and emits an 'error' notification (spec line 153 / §7.7 "fail loudly"), rather
+// than silently feeding { approved:false } to a model with no human behind it.
+class ApprovalTimeoutError extends Error {
+  constructor() {
+    super('approval timed out')
+    this.name = 'ApprovalTimeoutError'
+  }
+}
+
+// One place the notifications-outbox write + its NOTIFY 'notifications' doorbell live, so the
+// write+notify coupling can't drift across the ~4 call sites (pause / result / error). The
+// dispatcher LISTENs 'notifications', loads the pending row, and pushes it (spec "Notifications").
+async function notifyOutbox(
+  db: ReturnType<typeof getDb>,
+  params: Parameters<typeof insertNotification>[1],
+): Promise<void> {
+  await insertNotification(db, params)
+  await pgNotify('notifications', '')
 }
 
 // Advance one run to completion: load history, run the loop streaming tokens over NOTIFY,
@@ -88,6 +140,39 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
 
   const [run] = await db.select().from(agentRuns).where(eq(agentRuns.id, runId))
   if (!run || run.status !== 'pending') return // already handled / cancelled
+
+  // The conversation backs the autonomous-watcher decisions (spec): its `ingress` distinguishes a
+  // trigger run (alongside run.humanInLoop, set false only by createTriggerRun), and — for a
+  // RECURRING watcher only — its `channelKey` is the trigger id (so we can look the trigger up for
+  // the scratchpad scope + notify policy).
+  const [conv] = await db
+    .select({ ingress: conversations.ingress, channelKey: conversations.channelKey })
+    .from(conversations)
+    .where(eq(conversations.id, run.conversationId))
+  // Trigger run: no human is watching (run.humanInLoop=false, or a 'trigger'-ingress conversation).
+  // Selects bounded context, a longer approval timeout, deferred ask_user, and out-of-band push (§7.7).
+  const isTrigger = !run.humanInLoop || conv?.ingress === 'trigger'
+
+  // Robustly derive watcher-ness for the scratchpad (spec §7.7). A RECURRING watcher's conversation
+  // IS the watcher: getTrigger(conv.channelKey) resolves a 'schedule'|'inbox'|'webhook' row, so it
+  // owns a scratchpad scope `trigger:<id>` and uses the trigger's notify policy. A one-shot 'self'
+  // run is unattended too, but runs on the ORIGINATING (web) conversation — channelKey is not a
+  // trigger id, getTrigger returns undefined — so it gets NO scratchpad scope (the agent must not be
+  // told to remember to a `trigger:<uuid>` scope nothing can resolve) and notifies on result with
+  // an implicit 'always' policy. Resolved up front so the scratchpad recall + the memory tools'
+  // scope + the result-notify policy all key off the same, correct fact.
+  const watcher =
+    isTrigger && conv?.channelKey ? await getTrigger(db, conv.channelKey).catch(() => undefined) : undefined
+  // Only a recurring watcher (not a 'self' one-shot) keeps a durable scratchpad.
+  const watcherId = watcher && watcher.kind !== 'self' ? watcher.id : undefined
+  // The memory scope the run's remember/list_memories operate on: the watcher's scratchpad for a
+  // recurring watcher, the owner's global memory otherwise (interactive AND 'self' runs).
+  const memoryScope = watcherId ? `trigger:${watcherId}` : 'global'
+
+  // Autonomous runs pause for approval far longer than the 1h interactive window — the owner may
+  // be asleep when a watcher fires (§7.7 / spec "Approval & questions while unattended").
+  const { AUTONOMOUS_APPROVAL_TIMEOUT_MS } = loadConfig()
+  const approvalTimeoutMs = isTrigger ? AUTONOMOUS_APPROVAL_TIMEOUT_MS : APPROVAL_TIMEOUT_MS
 
   // One AbortController per run (§10.6). The cancel ROUTE owns the terminal write + cascade
   // and NOTIFYs {type:'cancelled'}; the worker's only cancellation job is to abort the
@@ -125,21 +210,48 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // path — and BEST-EFFORT: a recall failure degrades to no-recall rather than failing the run
     // (history is essential, memory an enhancement). Injecting into the system message is safe for
     // maybeAutoTitle, which builds its own titleMessages and only reads history via find(role==='user').
-    const [rows, facts] = await Promise.all([
-      db
-        .select({ role: messages.role, content: messages.content })
-        .from(messages)
-        .where(eq(messages.conversationId, run.conversationId))
-        .orderBy(asc(messages.createdAt)),
+    //
+    // For a TRIGGER run (autonomous-watchers spec §7.7 "Continuity via an objective scratchpad,
+    // not history replay") we ALSO read the watcher's scratchpad scope (`trigger:<id>`, recurring
+    // watchers only) — folded into the system block — and deliberately do NOT replay the full
+    // conversation history: a year of daily fires must not replay a year of messages, and the DB
+    // read must not grow with the watcher's lifetime. The history query is BOUNDED to the latest
+    // user message (the objective for this fire); an interactive run still selects the full
+    // history. Global recall applies to both.
+    const historyQuery = isTrigger
+      ? db
+          .select({ role: messages.role, content: messages.content })
+          .from(messages)
+          .where(and(eq(messages.conversationId, run.conversationId), eq(messages.role, 'user')))
+          .orderBy(desc(messages.createdAt))
+          .limit(1)
+      : db
+          .select({ role: messages.role, content: messages.content })
+          .from(messages)
+          .where(eq(messages.conversationId, run.conversationId))
+          .orderBy(asc(messages.createdAt))
+    const [rows, facts, scratchpad] = await Promise.all([
+      historyQuery,
       readMemoryFacts(db, OWNER_USER_ID, 'global').catch((err) => {
         console.error(`[run ${runId}] memory recall failed; proceeding without it:`, err)
         return [] as { id: string; text: string }[]
       }),
+      watcherId
+        ? readMemoryFacts(db, OWNER_USER_ID, memoryScope).catch((err) => {
+            console.error(`[run ${runId}] scratchpad recall failed; proceeding without it:`, err)
+            return [] as { id: string; text: string }[]
+          })
+        : Promise.resolve([] as { id: string; text: string }[]),
     ])
 
+    const conversationMessages = await rowsToMessages(run.conversationId, rows)
+
     const history: Message[] = [
-      { role: 'system', content: [{ type: 'text', text: systemTextWithMemory(facts) }] },
-      ...(await rowsToMessages(run.conversationId, rows)),
+      {
+        role: 'system',
+        content: [{ type: 'text', text: systemTextWithMemory(facts, scratchpad, { isTrigger, watcherId }) }],
+      },
+      ...conversationMessages,
     ]
 
     // Live "along the way" usage (spec 2026-06-15): accumulate the run's IN-LOOP token/cost as
@@ -253,10 +365,40 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // ask_user's pause can resolve its own row from the call id (invariant 2, §10.9).
     const toolCallRowIds = new Map<string, string>()
 
+    // Out-of-band push when an unattended (trigger) run pauses (§7.7 / spec "Approval & questions
+    // while unattended"). For an interactive run this is undefined (no push — the owner is on SSE).
+    // For a trigger run it writes a notifications row (kind 'approval'|'question') deep-linking the
+    // conversation + NOTIFYs the SEPARATE 'notifications' channel so the dispatcher pushes it.
+    const pauseNotifier = isTrigger
+      ? (interactionId: string, kind: 'approval' | 'question'): Promise<void> =>
+          notifyOutbox(db, {
+            userId: OWNER_USER_ID,
+            conversationId: run.conversationId,
+            agentRunId: runId,
+            interactionId,
+            kind,
+            title: kind === 'approval' ? 'Alfred needs your approval' : 'Alfred has a question',
+            body: 'A background task is waiting for your input.',
+            deepLink: `/conversation/${run.conversationId}`,
+          })
+      : undefined
+
     // ask_user's run-bound pause (§7.3, §10.2): the agent calls ask_user, which calls this to
     // raise a question interaction and block until the owner answers (or it times out). Maps
     // the resolved user_interactions.response to the tool result the model sees.
+    //
+    // UNATTENDED runs (§7.7 / spec line 153): an open-ended ask_user has no synchronous human, so
+    // it must DEFER the objective — not block for the full autonomous timeout window holding the
+    // one-active-run slot. Skip the interaction entirely and hand back a structured "no human"
+    // result so the model records what it needs (remember) and ends the run promptly. Only ask_user
+    // defers; write/destructive APPROVAL pauses still block (they're the owner's safety gate).
     const askUserPause = async (callId: string, prompt: unknown): Promise<unknown> => {
+      if (isTrigger) {
+        return {
+          error: 'no_synchronous_user',
+          note: 'No human is available; record what you need with remember and end the run.',
+        }
+      }
       const response = (await awaitInteraction(db, {
         conversationId: run.conversationId,
         runId,
@@ -264,6 +406,8 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         kind: 'question',
         prompt,
         signal: controller.signal,
+        timeoutMs: approvalTimeoutMs,
+        onPause: pauseNotifier,
       })) as { selected_labels?: string[]; freeform_text?: string } | null
       // null/timeout ⇒ an error-shaped result so the model sees the question went unanswered
       // rather than mistaking it for an empty selection.
@@ -273,8 +417,10 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
 
     // The full toolset for this run (echo + the context-bound title tool + the browser
     // tools), assembled in one place so the boot catalog publish can't drift from it. run.id
-    // threads through so a remember'd fact records its source_run_id (memory spec).
-    const tools = buildRunTools(run.conversationId, askUserPause, run.id)
+    // threads through so a remember'd fact records its source_run_id (memory spec); memoryScope
+    // binds remember/list_memories to the watcher's scratchpad scope for a recurring watcher
+    // (else 'global', so an interactive run is unchanged).
+    const tools = buildRunTools(run.conversationId, askUserPause, run.id, memoryScope)
 
     // The owner's per-tool approval overrides (the tools page, §16), loaded once per run.
     // require_approval is a tri-state: null/absent ⇒ fall back to the trust-tier default.
@@ -462,6 +608,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
           toolCallRowIds,
           call,
           controller.signal,
+          // An unattended run fails loudly on approval timeout (§7.7) instead of continuing
+          // as-if-rejected; an interactive run keeps today's rejection-on-timeout behaviour.
+          { timeoutMs: approvalTimeoutMs, onPause: pauseNotifier, failOnTimeout: isTrigger },
         )
         if (verdict.approved && call.group) approvedGroups.add(call.group)
         return verdict
@@ -566,6 +715,18 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       .returning({ id: agentRuns.id })
     if (doneRows.length > 0) {
       await notifyRun(run.conversationId, { type: 'done' })
+      // Out-of-band push for a finished UNATTENDED run (autonomous-watchers spec, "Notifications"):
+      // write a notifications row + NOTIFY 'notifications', so the dispatcher pushes it. Only when
+      // the done write actually won (a cancel at the finish line already told the client).
+      // Best-effort — a notify failure must not fail the successful run. A recurring watcher uses
+      // its notify_policy; a one-shot 'self' run (no resolvable watcher) notifies with an implicit
+      // 'always' policy (its result is what the owner asked to be reminded of).
+      if (isTrigger) {
+        const finalText = lastAssistantText(finalMessages)
+        await maybeNotifyResult(db, run, watcher, finalText).catch((notifyErr) =>
+          console.error(`[run ${runId}] result notification failed:`, notifyErr),
+        )
+      }
     } else {
       await rollupUsageOnly(db, runId)
     }
@@ -606,6 +767,25 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       .returning({ id: agentRuns.id })
     if (failedRows.length > 0) {
       await notifyRun(run.conversationId, { type: 'error', message })
+      // Fail loudly out-of-band for an unattended run (§7.7): the owner isn't on SSE, so a watcher
+      // failure (incl. an approval timeout, ApprovalTimeoutError) would otherwise be silent. Write
+      // an 'error' notification + NOTIFY 'notifications'. Best-effort — never let the notification
+      // mask the run's real failure.
+      if (isTrigger) {
+        try {
+          await notifyOutbox(db, {
+            userId: OWNER_USER_ID,
+            conversationId: run.conversationId,
+            agentRunId: runId,
+            kind: 'error',
+            title: 'A background task failed',
+            body: message.slice(0, 300),
+            deepLink: `/conversation/${run.conversationId}`,
+          })
+        } catch (notifyErr) {
+          console.error(`[run ${runId}] error notification failed:`, notifyErr)
+        }
+      }
     } else {
       await rollupUsageOnly(db, runId)
     }
@@ -855,6 +1035,50 @@ async function maybeAutoTitle(
   }
 }
 
+// The final assistant turn's prose (the result body for a trigger-result notification). Walks
+// back over the run's appended messages to the last assistant message and returns its text.
+function lastAssistantText(finalMessages: Message[]): string {
+  for (let i = finalMessages.length - 1; i >= 0; i--) {
+    const m = finalMessages[i]!
+    if (m.role === 'assistant') {
+      const t = textOf(m.content).trim()
+      if (t) return t
+    }
+  }
+  return ''
+}
+
+// Out-of-band push for a finished unattended run (autonomous-watchers spec, "Notifications" +
+// "Noise control"). Takes the run's already-resolved watcher row (or undefined for a one-shot
+// 'self' run, whose conversation is not a watcher) — no re-fetch — reads its notify_policy, and,
+// when the policy says push, writes a notifications row + NOTIFY 'notifications' so the dispatcher
+// delivers it. A recurring watcher: 'always'/'on_change' push every finished run (the gate already
+// ensured "something changed" for on_change before this run was created); 'on_threshold' lacks a
+// structured urgency signal in the MVP classifier, so it behaves like on_change for now; 'digest'
+// emits no per-run push (the agent accrues to the scratchpad and a scheduled digest run
+// summarizes). A 'self' one-shot run (no watcher) notifies with an implicit 'always' policy — its
+// result is exactly what the owner asked to be reminded of.
+async function maybeNotifyResult(
+  db: ReturnType<typeof getDb>,
+  run: typeof agentRuns.$inferSelect,
+  watcher: Awaited<ReturnType<typeof getTrigger>>,
+  resultText: string,
+): Promise<void> {
+  // A 'digest' watcher emits no per-run push; every other case (recurring non-digest watcher, or a
+  // 'self' run with no watcher row) pushes.
+  if (watcher?.notifyPolicy === 'digest') return
+
+  await notifyOutbox(db, {
+    userId: OWNER_USER_ID,
+    conversationId: run.conversationId,
+    agentRunId: run.id,
+    kind: 'result',
+    title: watcher?.name || 'Alfred finished a task',
+    body: resultText.slice(0, 300),
+    deepLink: `/conversation/${run.conversationId}`,
+  })
+}
+
 // Sum token usage + cost (and pick the model) from a run's llm_calls, shaped for an
 // agent_runs update. costUsd is numeric → string in JS; summed as floats and stored at
 // 6-decimal scale. Used on both the done and failed paths so cost accounting is honest
@@ -886,8 +1110,12 @@ async function rollupUsage(db: ReturnType<typeof getDb>, runId: string) {
 // The generic pause-for-user mechanism (§10.2–§10.4): persist a user_interactions row of the
 // given kind/prompt, surface it over NOTIFY, and BLOCK on a dedicated LISTEN until the owner
 // resolves it (or a 1h timeout flips it to timed_out). Returns the resolved row's `response`
-// (raw — null on timeout). No durable resume — a crash sweeps the run to failed on startup
-// (§7.6). Both the approval gate and ask_user's question pause are thin callers of this.
+// (raw — null on timeout/cancel), UNLESS `failOnTimeout` is set and the timeout won the race, in
+// which case it throws ApprovalTimeoutError so the caller can distinguish a timeout from a
+// rejection (an unattended approval timeout must fail loudly, §7.7 / spec line 153 — never feed a
+// silent { approved:false } to a model with no human behind it). No durable resume — a crash
+// sweeps the run to failed on startup (§7.6). Both the approval gate and ask_user's question pause
+// are thin callers of this.
 async function awaitInteraction(
   db: ReturnType<typeof getDb>,
   args: {
@@ -897,9 +1125,22 @@ async function awaitInteraction(
     kind: 'approval' | 'question'
     prompt: unknown
     signal?: AbortSignal
+    // The approval/question pause window. Interactive runs use the 1h APPROVAL_TIMEOUT_MS; an
+    // autonomous (trigger) run uses the much longer AUTONOMOUS_APPROVAL_TIMEOUT_MS (§7.7).
+    timeoutMs?: number
+    // Fired AFTER the pending interaction is recorded + the client NOTIFY, so a caller can push
+    // it out-of-band (autonomous runs write a notifications row — the owner isn't watching SSE).
+    // Best-effort: a throw here must not derail the pause.
+    onPause?: (interactionId: string, kind: 'approval' | 'question') => Promise<void>
+    // When set, a timeout (this call's timer flipped a still-pending row to timed_out) throws
+    // ApprovalTimeoutError instead of returning the null response — so the unattended approval
+    // gate fails the run loudly rather than continuing as-if-rejected (§7.7). A cancel/resolution
+    // wake never throws. Off by default ⇒ today's return-null-on-timeout behaviour, unchanged.
+    failOnTimeout?: boolean
   },
 ): Promise<unknown> {
-  const { conversationId, runId, toolCallId, kind, prompt, signal } = args
+  const { conversationId, runId, toolCallId, kind, prompt, signal, onPause } = args
+  const timeoutMs = args.timeoutMs ?? APPROVAL_TIMEOUT_MS
 
   // An already-cancelled run never opens a pause: bail before any writes. The loop's next
   // checkpoint will throw, and the cancel route's cascade already handled the tool_call row —
@@ -950,6 +1191,17 @@ async function awaitInteraction(
   // (d) tell the client.
   await notifyRun(conversationId, { type: 'interaction_required', interactionId, kind })
 
+  // (d′) out-of-band push for an unattended run (§7.7 / spec "Approval & questions while
+  // unattended"): the owner isn't on SSE, so write a notifications row + push. Best-effort — a
+  // failure here must not derail the pause (the interaction is already recorded + NOTIFY'd).
+  if (onPause) {
+    try {
+      await onPause(interactionId, kind)
+    } catch (err) {
+      console.error(`[interaction ${interactionId}] pause notification failed:`, err)
+    }
+  }
+
   // (e) block until resolved on a dedicated LISTEN connection.
   const { POSTGRES_URL } = loadConfig()
   if (!POSTGRES_URL) throw new Error('POSTGRES_URL is not set — required to await interaction')
@@ -962,6 +1214,9 @@ async function awaitInteraction(
 
   let timeout: ReturnType<typeof setTimeout> | undefined
   let onAbort: (() => void) | undefined
+  // Set true only when THIS call's timer flipped a still-pending row to timed_out (won the race) —
+  // distinguishes a timeout wake from a resolution/cancel wake for the failOnTimeout caller.
+  let timedOut = false
   try {
     await new Promise<void>((resolve) => {
       let done = false
@@ -990,14 +1245,21 @@ async function awaitInteraction(
         }
       })
 
-      // 1h timeout: conditionally flip a still-pending interaction to timed_out, then wake.
+      // Timeout (1h interactive / longer for autonomous): conditionally flip a still-pending
+      // interaction to timed_out, then wake. `.returning()` reports whether we actually won the
+      // race (a response/cancel that landed first leaves no pending row) — only then is it a true
+      // timeout for the failOnTimeout caller.
       timeout = setTimeout(() => {
         void db
           .update(userInteractions)
           .set({ status: 'timed_out', resolvedAt: new Date() })
           .where(and(eq(userInteractions.id, interactionId), eq(userInteractions.status, 'pending')))
-          .then(() => finish())
-      }, APPROVAL_TIMEOUT_MS)
+          .returning({ id: userInteractions.id })
+          .then((flipped) => {
+            if (flipped.length > 0) timedOut = true
+            finish()
+          })
+      }, timeoutMs)
 
       // Wake on abort too: this pause's own LISTEN can subscribe AFTER the cancel NOTIFY
       // fired, in which case it's never delivered on this connection. The run-level watcher
@@ -1022,6 +1284,14 @@ async function awaitInteraction(
     await client.query(`UNLISTEN "conversation:${conversationId}"`).catch(() => {})
     await client.end().catch(() => {})
   }
+
+  // Unattended approval timeout (§7.7 / spec line 153): fail the run loudly rather than continue
+  // as-if-rejected. Throw BEFORE resuming to running, so the run stays 'awaiting_approval' and the
+  // runJob catch path's guarded failed-write (which includes 'awaiting_approval') flips it to
+  // 'failed' and emits the 'error' notification. An interactive run never sets failOnTimeout, so it
+  // falls through to the unchanged return-null path below (mapped to a rejection verdict). A cancel
+  // wake is not a timeout (timedOut stays false), so it never throws here.
+  if (timedOut && args.failOnTimeout) throw new ApprovalTimeoutError()
 
   // (f) read the response, resume the run, return it (null on timeout).
   const [resolved] = await db
@@ -1050,6 +1320,13 @@ async function requestApproval(
   toolCallRowIds: Map<string, string>,
   call: ApprovalRequest,
   signal?: AbortSignal,
+  opts: {
+    timeoutMs?: number
+    onPause?: (interactionId: string, kind: 'approval' | 'question') => Promise<void>
+    // Unattended run: a timeout fails the run loudly (ApprovalTimeoutError, surfaced as a failed
+    // run + 'error' notification) instead of continuing as-if-rejected (§7.7 / spec line 153).
+    failOnTimeout?: boolean
+  } = {},
 ): Promise<ApprovalVerdict> {
   const prompt = {
     // Group calls render a task-scoped card: approving covers every action in the
@@ -1069,6 +1346,9 @@ async function requestApproval(
     kind: 'approval',
     prompt,
     signal,
+    timeoutMs: opts.timeoutMs,
+    onPause: opts.onPause,
+    failOnTimeout: opts.failOnTimeout,
   })) as { approved?: boolean; note?: string } | null
   return response?.approved
     ? { approved: true, note: response.note }

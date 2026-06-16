@@ -86,6 +86,11 @@ export const agentRuns = pgTable(
     completionTokens: integer('completion_tokens').notNull().default(0),
     costUsd: numeric('cost_usd', { precision: 10, scale: 6 }).notNull().default('0'),
     speak: boolean('speak').notNull().default(false), // voice runs (POST .../audio) set this true; the worker reads it to gate TTS (spec 2026-06-14)
+    // Whether a human is watching this run (ARCHITECTURE §7.7, autonomous-watchers spec).
+    // Derived from ingress: interactive ingresses (web/voice) → true; 'trigger' → false. The
+    // worker reads it to select overflow + approval-timeout behaviour at the edges. Defaults
+    // true so every existing interactive run is unchanged; only createTriggerRun sets it false.
+    humanInLoop: boolean('human_in_loop').notNull().default(true),
     startedAt: timestamp('started_at', { withTimezone: true }),
     finishedAt: timestamp('finished_at', { withTimezone: true }),
     error: text('error'),
@@ -221,4 +226,92 @@ export const memoryFacts = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('memory_facts_user_scope_idx').on(t.userId, t.scope)],
+)
+
+// triggers: the watcher definitions, one row per watcher (autonomous-watchers spec, the
+// fourth ingress — ARCHITECTURE §9.4 / RUNTIME §7.7). The thin `alfred-triggers` scheduler
+// reads enabled rows at boot and registers schedules; the worker's trigger-detect handler
+// reads gate/triage/objective and updates last_seen_signal / detection_cost_usd. A recurring
+// watcher resolves to one persistent conversation (`conversationId`); a one-shot 'self' trigger
+// carries the originating conversation instead.
+export const triggers = pgTable(
+  'triggers',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    name: text('name').notNull(), // human label
+    kind: text('kind').notNull(), // 'schedule' | 'inbox' | 'webhook' | 'self'
+    enabled: boolean('enabled').notNull().default(true),
+    conversationId: uuid('conversation_id').references(() => conversations.id), // persistent watcher conversation; null for 'self'
+    schedule: text('schedule'), // cron expr / poll cadence; null for webhook/self
+    gate: jsonb('gate'), // Tier-0: { tool, args, signal }; null ⇒ always-fire
+    triage: jsonb('triage'), // Tier-1: { enabled, model?, prompt? }; null ⇒ skip to action
+    objective: text('objective').notNull(), // Tier-2 seed prompt
+    notifyPolicy: text('notify_policy').notNull(), // 'always' | 'on_change' | 'on_threshold' | 'digest'
+    lastSeenSignal: jsonb('last_seen_signal'), // gate diff state
+    nextFireAt: timestamp('next_fire_at', { withTimezone: true }),
+    lastFiredAt: timestamp('last_fired_at', { withTimezone: true }),
+    detectionCostUsd: numeric('detection_cost_usd', { precision: 10, scale: 6 }).notNull().default('0'), // cumulative dismissed-detection cost
+    sourceRunId: uuid('source_run_id').references(() => agentRuns.id), // nullable; provenance for agent-scheduled triggers
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('triggers_enabled_next_fire_idx').on(t.enabled, t.nextFireAt)],
+)
+
+// notifications: the durable push outbox (autonomous-watchers spec). SSE is fire-and-forget and
+// dropped when no client is connected — exactly when a watcher fires — so a notify-worthy event
+// (a finished trigger result, or an approval/question raised in an unattended run) writes a row
+// here and NOTIFYs the 'notifications' channel; the worker's dispatcher loads it and pushes via
+// Web Push. The payload is thin (title + body + deep_link); the full content lives in the
+// conversation behind the deep link.
+export const notifications = pgTable(
+  'notifications',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    conversationId: uuid('conversation_id').references(() => conversations.id), // deep-link target (nullable)
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id), // nullable
+    interactionId: uuid('interaction_id').references(() => userInteractions.id), // nullable (approval/question notifications)
+    kind: text('kind').notNull(), // 'result' | 'approval' | 'question' | 'error'
+    title: text('title').notNull(),
+    body: text('body').notNull().default(''), // thin; the full content lives in the conversation
+    deepLink: text('deep_link').notNull(), // e.g. '/conversation/<id>'
+    status: text('status').notNull(), // 'pending' | 'sent' | 'failed' | 'read'
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    sentAt: timestamp('sent_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('notifications_pending_idx')
+      .on(t.status)
+      .where(sql`status = 'pending'`),
+  ],
+)
+
+// push_subscriptions: Web Push registrations, one row per device/browser (autonomous-watchers
+// spec). The webserver inserts on /api/push/subscribe (keyed on endpoint); the dispatcher reads
+// all rows for a user to fan a notification out to every device, and prunes a row on a 410 Gone.
+export const pushSubscriptions = pgTable(
+  'push_subscriptions',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    endpoint: text('endpoint').notNull(),
+    keys: jsonb('keys').notNull(), // { p256dh, auth }
+    userAgent: text('user_agent'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [unique('push_subscriptions_endpoint_unique').on(t.endpoint)],
 )

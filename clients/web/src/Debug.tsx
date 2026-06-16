@@ -59,9 +59,26 @@ type ToolCallRow = {
 
 type RunDetail = { run: RunRow; calls: LlmCall[]; toolCalls?: ToolCallRow[] }
 
+type TriggerCostRow = {
+  id: string
+  name: string
+  kind: string
+  enabled: boolean
+  schedule: string | null
+  notifyPolicy: string
+  lastFiredAt: string | null
+  nextFireAt: string | null
+  detectionCostUsd: string
+  actionRunCount: number
+  actionCostUsd: string
+  totalCostUsd: string
+}
+
 export default function Debug() {
   const [conversations, setConversations] = useState<ConversationRow[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [triggers, setTriggers] = useState<TriggerCostRow[]>([])
+  const [showWatchers, setShowWatchers] = useState(true)
 
   const loadConversations = () =>
     fetch('/api/debug/conversations')
@@ -69,8 +86,15 @@ export default function Debug() {
       .then((d) => setConversations(d.conversations ?? []))
       .catch(() => {})
 
+  const loadTriggers = () =>
+    fetch('/api/debug/triggers')
+      .then((r) => r.json() as Promise<{ triggers: TriggerCostRow[] }>)
+      .then((d) => setTriggers(d.triggers ?? []))
+      .catch(() => {})
+
   useEffect(() => {
     void loadConversations()
+    void loadTriggers()
   }, [])
 
   // Responsive master-detail: on md+ the rail and ledger sit side by side; on a phone
@@ -87,6 +111,12 @@ export default function Debug() {
       <aside
         className={`${hasSelection ? 'hidden md:flex' : 'flex'} w-full min-h-0 shrink-0 flex-col border-r border-line md:w-80`}
       >
+        <WatchersPanel
+          triggers={triggers}
+          open={showWatchers}
+          onToggle={() => setShowWatchers((v) => !v)}
+          onRefresh={() => void loadTriggers()}
+        />
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-brass">
             Conversations
@@ -128,6 +158,78 @@ export default function Debug() {
           />
         )}
       </section>
+    </div>
+  )
+}
+
+// --- Watchers: per-trigger cost (dismissed-detection counter + escalated action-run spend) ---
+
+function WatchersPanel({
+  triggers,
+  open,
+  onToggle,
+  onRefresh,
+}: {
+  triggers: TriggerCostRow[]
+  open: boolean
+  onToggle: () => void
+  onRefresh: () => void
+}) {
+  return (
+    <div className="border-b border-line">
+      <div className="flex items-center justify-between px-4 py-3">
+        <button
+          onClick={onToggle}
+          className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.18em] text-brass"
+        >
+          <span className={`transition-transform ${open ? 'rotate-90' : ''}`}>▸</span>
+          Watchers{triggers.length ? ` (${triggers.length})` : ''}
+        </button>
+        <button onClick={onRefresh} className="text-xs text-muted transition-colors hover:text-ink">
+          Refresh
+        </button>
+      </div>
+      {open && (
+        <div className="max-h-64 overflow-y-auto px-2 pb-2">
+          {triggers.length === 0 ? (
+            <p className="px-2 py-3 text-center text-muted">No watchers scheduled.</p>
+          ) : (
+            triggers.map((t) => <WatcherCard key={t.id} t={t} />)
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function WatcherCard({ t }: { t: TriggerCostRow }) {
+  return (
+    <div className="rounded-md px-2 py-2 hover:bg-surface">
+      <div className="flex items-center gap-2">
+        <span
+          className={`h-1.5 w-1.5 shrink-0 rounded-full ${t.enabled ? 'bg-emerald-400' : 'bg-line'}`}
+          title={t.enabled ? 'enabled' : 'disabled'}
+        />
+        <span className="truncate font-medium text-ink" title={t.name}>
+          {t.name}
+        </span>
+      </div>
+      <div className="mt-0.5 truncate pl-3.5 text-xs text-muted">
+        {t.kind}
+        {t.schedule ? ` · ${t.schedule}` : ''}
+      </div>
+      <div className="mt-1 pl-3.5 text-xs text-muted">
+        <span title="dismissed-detection spend (Tier-1 triage that did not escalate)">
+          detect {usd(t.detectionCostUsd)}
+        </span>
+        {' · '}
+        <span title={`${t.actionRunCount} escalated action run(s)`}>act {usd(t.actionCostUsd)}</span>
+        {' · '}
+        <span className="text-ink" title="detection + action">total {usd(t.totalCostUsd)}</span>
+      </div>
+      {t.lastFiredAt && (
+        <div className="mt-0.5 pl-3.5 text-xs text-muted">fired {relTime(t.lastFiredAt)}</div>
+      )}
     </div>
   )
 }

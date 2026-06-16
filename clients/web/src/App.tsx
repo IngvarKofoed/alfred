@@ -10,6 +10,7 @@ import {
 } from 'react-router-dom'
 import Chat from './Chat'
 import Debug from './Debug'
+import Settings from './Settings'
 import Sidebar from './Sidebar'
 import Tools from './Tools'
 
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="/conversation/:id" element={<ChatPage />} />
         <Route path="/tools" element={<Shell nav="tools" body={<Tools />} />} />
         <Route path="/debug" element={<Shell nav="debug" body={<Debug />} />} />
+        <Route path="/settings" element={<Shell nav="settings" body={<Settings />} />} />
         {/* Catch-all behaves like `/`: redirect to a resolved conversation. */}
         <Route path="*" element={<RootRedirect />} />
       </Routes>
@@ -47,10 +49,13 @@ function RootRedirect() {
     if (target) return
     let ignore = false
     fetch('/api/conversations')
-      .then((r) => r.json() as Promise<{ conversations: { id: string }[] }>)
+      .then((r) => r.json() as Promise<{ conversations: { id: string; ingress: string | null }[] }>)
       .then((d) => {
         if (ignore) return
-        setTarget(d.conversations?.[0]?.id ?? crypto.randomUUID())
+        // Don't land "/" in a watcher (ingress='trigger') thread — pick the newest INTERACTIVE
+        // conversation, else a fresh uuid.
+        const interactive = (d.conversations ?? []).find((c) => c.ingress !== 'trigger')
+        setTarget(interactive?.id ?? crypto.randomUUID())
       })
       .catch(() => {
         if (!ignore) setTarget(crypto.randomUUID())
@@ -150,7 +155,7 @@ function Shell({ nav, body }: { nav: NavKey; body: React.ReactNode }) {
   )
 }
 
-type NavKey = 'chat' | 'tools' | 'debug'
+type NavKey = 'chat' | 'tools' | 'debug' | 'settings'
 
 function Header({
   nav,
@@ -194,6 +199,9 @@ function Header({
         </NavLink>
         <NavLink to="/debug" className={linkClass(nav === 'debug')}>
           Debug
+        </NavLink>
+        <NavLink to="/settings" className={linkClass(nav === 'settings')}>
+          Settings
         </NavLink>
       </nav>
       {onChat && (

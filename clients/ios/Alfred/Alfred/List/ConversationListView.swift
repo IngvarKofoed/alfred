@@ -95,10 +95,21 @@ private struct ConversationRow: View {
                     .font(.body)
                     .foregroundStyle(conversation.title == nil ? .secondary : .primary)
                     .lineLimit(1)
-                if let relative = relativeTime(conversation.lastActiveAt) {
-                    Text(relative)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                HStack(spacing: 6) {
+                    if let badge = ingressBadge(conversation.ingress) {
+                        Text(badge)
+                            .font(.caption2)
+                            .textCase(.uppercase)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
+                    if let relative = relativeTime(conversation.lastActiveAt) {
+                        Text(relative)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
             Spacer(minLength: 8)
@@ -108,6 +119,17 @@ private struct ConversationRow: View {
         }
         .contentShape(Rectangle())
         .padding(.vertical, 4)
+    }
+}
+
+// A small tag for non-web ingresses so a watcher / Discord / voice thread is distinguishable in
+// the unified list. "web" (and absent) shows none.
+private func ingressBadge(_ ingress: String?) -> String? {
+    switch ingress {
+    case "trigger": return "watcher"
+    case "discord": return "discord"
+    case "voice": return "voice"
+    default: return nil
     }
 }
 

@@ -2,15 +2,21 @@ import {
   agentRuns,
   conversations,
   createUserMessageRun,
+  deletePushSubscription,
   enqueueAgentRun,
+  enqueueTriggerDetect,
   getDb,
+  getTrigger,
+  listTriggers,
   llmCalls,
   messages,
+  OWNER_USER_ID,
   pgNotify,
   recordOutOfLoopLlmCall,
   terminateRuns,
   toolCalls,
   tools as toolsTable,
+  upsertPushSubscription,
   userInteractions,
 } from '@alfred/db'
 import { makeSttProvider, speechLlmCallFields, type SpeechUsage } from '@alfred/agent-core'
@@ -285,19 +291,23 @@ app.get('/media/:conversationId/:filename', async (c) => {
   return c.body(Readable.toWeb(createReadStream(abs)) as ReadableStream)
 })
 
-// The owner's recent web conversations, for the chat-surface history sidebar. Newest-active
-// first (the resurrected last_active_at, bumped per message), capped at 100. Selects
-// (id, title, last_active_at) only — no message join; an untitled row (null title) is labelled
-// "New conversation" by the client. Scoped to ingress='web' (post-MVP ingresses excluded).
+// The owner's recent conversations, for the chat-surface history sidebar (web + iOS share this).
+// Newest-active first (the resurrected last_active_at, bumped per message), capped at 100. Selects
+// (id, title, ingress, last_active_at) only — no message join; an untitled row (null title) is
+// labelled "New conversation" by the client. ALL ingresses are included now (one Alfred, one
+// continuous history across surfaces — CONCEPT): web/iOS chat (ingress='web'), autonomous-watcher
+// threads (ingress='trigger'), and future Discord/voice. `ingress` lets the client badge non-web
+// rows and keep the "/" redirect from landing in a watcher thread.
 app.get('/api/conversations', async (c) => {
   const rows = await getDb()
     .select({
       id: conversations.id,
       title: conversations.title,
+      ingress: conversations.ingress,
       lastActiveAt: conversations.lastActiveAt,
     })
     .from(conversations)
-    .where(eq(conversations.ingress, 'web'))
+    .where(eq(conversations.userId, OWNER_USER_ID))
     .orderBy(desc(conversations.lastActiveAt))
     .limit(100)
   return c.json({ conversations: rows })
@@ -683,6 +693,53 @@ app.get('/api/debug/conversations', async (c) => {
   return c.json({ conversations: result })
 })
 
+// Per-watcher cost view (autonomous-watchers). Two cost paths: (1) DISMISSED detections accrue to
+// triggers.detection_cost_usd (a per-watcher counter — Tier-1 triage that didn't escalate, which
+// never creates an agent_runs row); (2) ESCALATED action runs of a recurring watcher live on its
+// dedicated conversation (ingress='trigger', channel_key = trigger.id), summed here. (One-shot
+// 'self' runs live on the originating conversation and show under the normal /debug ledger.)
+app.get('/api/debug/triggers', async (c) => {
+  const db = getDb()
+  const trigs = await listTriggers(db, OWNER_USER_ID)
+  if (trigs.length === 0) return c.json({ triggers: [] })
+  const ids = trigs.map((t) => t.id)
+  const agg = await db
+    .select({
+      channelKey: conversations.channelKey,
+      runCount: count(),
+      promptTokens: sum(agentRuns.promptTokens),
+      completionTokens: sum(agentRuns.completionTokens),
+      costUsd: sum(agentRuns.costUsd),
+    })
+    .from(agentRuns)
+    .innerJoin(conversations, eq(agentRuns.conversationId, conversations.id))
+    .where(and(eq(conversations.ingress, 'trigger'), inArray(conversations.channelKey, ids)))
+    .groupBy(conversations.channelKey)
+  const byKey = new Map(agg.map((a) => [a.channelKey, a]))
+  const result = trigs.map((t) => {
+    const a = byKey.get(t.id)
+    const detection = Number(t.detectionCostUsd ?? 0)
+    const action = Number(a?.costUsd ?? 0)
+    return {
+      id: t.id,
+      name: t.name,
+      kind: t.kind,
+      enabled: t.enabled,
+      schedule: t.schedule,
+      notifyPolicy: t.notifyPolicy,
+      lastFiredAt: t.lastFiredAt,
+      nextFireAt: t.nextFireAt,
+      detectionCostUsd: t.detectionCostUsd ?? '0',
+      actionRunCount: a ? Number(a.runCount) : 0,
+      actionPromptTokens: Number(a?.promptTokens ?? 0),
+      actionCompletionTokens: Number(a?.completionTokens ?? 0),
+      actionCostUsd: a?.costUsd ?? '0',
+      totalCostUsd: (detection + action).toFixed(6),
+    }
+  })
+  return c.json({ triggers: result })
+})
+
 app.get('/api/debug/runs/:id', async (c) => {
   const id = c.req.param('id')
   if (!UUID_RE.test(id)) return c.json({ error: 'invalid run id' }, 400)
@@ -701,6 +758,87 @@ app.get('/api/debug/runs/:id', async (c) => {
     .where(eq(toolCalls.agentRunId, id))
     .orderBy(asc(toolCalls.startedAt))
   return c.json({ run, calls, toolCalls: tools })
+})
+
+// --- Web Push subscriptions (autonomous-watcher notifications) ---
+
+// Register this browser's Web Push subscription so the worker's notification dispatcher can
+// reach the owner out-of-band (a watcher fires while no client is connected — the case SSE
+// can't serve). Keyed on endpoint (upsert): the same browser re-subscribing refreshes its keys
+// rather than duplicating. Single-user, so the subscription always belongs to OWNER_USER_ID.
+app.post('/api/push/subscribe', async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    endpoint?: unknown
+    keys?: unknown
+    userAgent?: unknown
+  }
+  const { endpoint } = body
+  const keys = body.keys as { p256dh?: unknown; auth?: unknown } | undefined
+  if (
+    typeof endpoint !== 'string' ||
+    endpoint === '' ||
+    typeof keys !== 'object' ||
+    keys === null ||
+    typeof keys.p256dh !== 'string' ||
+    typeof keys.auth !== 'string'
+  ) {
+    return c.json({ error: 'endpoint and keys { p256dh, auth } are required' }, 400)
+  }
+  const userAgent = typeof body.userAgent === 'string' ? body.userAgent : null
+
+  await upsertPushSubscription(getDb(), {
+    userId: OWNER_USER_ID,
+    endpoint,
+    keys: { p256dh: keys.p256dh, auth: keys.auth },
+    userAgent,
+  })
+  return c.json({ ok: true })
+})
+
+// Explicit opt-out: drop this browser's subscription (the owner disabling notifications). The
+// dispatcher also prunes on a 410 Gone, so a stale row self-heals even without this call.
+app.post('/api/push/unsubscribe', async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { endpoint?: unknown }
+  if (typeof body.endpoint !== 'string' || body.endpoint === '') {
+    return c.json({ error: 'endpoint is required' }, 400)
+  }
+  await deletePushSubscription(getDb(), body.endpoint)
+  return c.json({ ok: true })
+})
+
+// The VAPID public key the PWA needs to create a Web Push subscription. Null when VAPID isn't
+// configured (push inert, like the email keys) — the client then skips the subscribe flow.
+app.get('/api/push/vapid-public-key', (c) =>
+  c.json({ publicKey: loadConfig().VAPID_PUBLIC_KEY ?? null }),
+)
+
+// --- Webhook trigger ingress ---
+
+// Fire an event-driven webhook watcher (spec §9.4): enqueue a trigger-detect job for this
+// trigger, which the worker runs through the tiered detection ladder. Only an existing,
+// enabled, kind='webhook' trigger is fireable — anything else is 404 (don't leak whether a
+// non-webhook trigger exists, and never enqueue detect for the wrong kind). This route creates
+// NO agent_runs row; detection (Tier 0/1) runs row-free, only an escalation spawns a run.
+//
+// Auth: this route is intentionally UNAUTHENTICATED, like every other route here. Per
+// ARCHITECTURE §12 ("network position is the authentication"), the webserver has no public
+// exposure — only the owner's tailnet / LAN-behind-the-firewall can reach it, so being able to
+// connect is being the owner. The 404 guard above (unknown/disabled/non-webhook ids do not
+// enqueue) bounds the worst case to "amplify a detect-job the owner already configured." If this
+// box ever gains public exposure, a per-trigger webhook secret (a token in the path/header,
+// checked here) is the deferred hardening — out of scope for the single-user model. No schema
+// change is made for that here.
+app.post('/api/triggers/:id/webhook', async (c) => {
+  const id = c.req.param('id')
+  if (!UUID_RE.test(id)) return c.json({ error: 'invalid trigger id' }, 400)
+
+  const trigger = await getTrigger(getDb(), id)
+  if (!trigger || !trigger.enabled || trigger.kind !== 'webhook') {
+    return c.json({ error: 'not found' }, 404)
+  }
+
+  await enqueueTriggerDetect(id)
+  return c.json({ ok: true }, 202)
 })
 
 // Map a stored filename's extension to a content type. Uploads (images) and TTS clips (audio)

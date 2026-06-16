@@ -37,3 +37,10 @@ export {
   makeSttProvider,
   makeTtsProvider,
 } from './speech-provider.js'
+export {
+  type Notifier,
+  type NotificationPayload,
+  type PushSubscription,
+  WebPushNotifier,
+  makeNotifier,
+} from './notifier.js'
