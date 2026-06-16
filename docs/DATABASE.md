@@ -119,18 +119,19 @@ tools                                 -- the worker-published tool catalog + own
   created_at        timestamptz default now()
   index (tool_group)
 
-memory_facts                          -- PLANNED, NOT YET CREATED — in no Drizzle schema or
-                                      -- migration; design only (ARCHITECTURE §6.4)
+memory_facts                          -- BUILT (migration 0009) as plain rows — the long-term
+                                      -- memory v1 (ARCHITECTURE §6.4). No `embedding` column
+                                      -- yet: a real vector column needs the pgvector extension,
+                                      -- which phase 2 adds alongside the column + index in one
+                                      -- migration. The `vector(1536)` is DEFERRED, not omitted.
   id              uuid pk
   user_id         uuid fk → users.id
-  scope           text                -- 'global' | 'project:<name>' | etc.
-  text            text
-  embedding       vector(1536)        -- nullable until pgvector is enabled
-  source_run_id   uuid fk → agent_runs.id, nullable
+  scope           text not null default 'global'  -- 'global' | future 'project:<name>'/scratchpad scopes; v1 reads only 'global'
+  text            text not null
+  source_run_id   uuid fk → agent_runs.id, nullable  -- the run that saved the fact (provenance)
   created_at      timestamptz default now()
   updated_at      timestamptz default now()
-  -- Index on (user_id, scope) for retrieval. Vector index added when
-  -- pgvector arrives.
+  index (user_id, scope)             -- recall reads by (user_id, scope); the pgvector index lands with the embedding column (phase 2)
 ```
 
 ## Design notes
@@ -144,6 +145,7 @@ memory_facts                          -- PLANNED, NOT YET CREATED — in no Driz
 - **`messages.content` as JSONB**, not plain text. Lets a single message carry text, attachments, tool-use blocks, tool-result blocks — matches the structure the LLM API returns and avoids fan-out tables for every variant.
 - **Token + cost accounting on `agent_runs`** (rolled up from `llm_calls`) so cost views don't have to walk per-call rows.
 - **`agent_runs.speak`** is set `true` only by the `POST /api/conversations/:id/audio` route (iOS voice, ARCHITECTURE §7.2/§9.1) — a second run-creating path alongside the `/messages` POST. The worker reads it at pickup to decide whether to synthesize TTS for the streamed reply; typed `/messages` runs leave it `false`, so text chat is unchanged.
+- **`memory_facts` is Alfred's one cross-conversation memory** (long-term memory v1, ARCHITECTURE §6.4; spec `docs/specs/2026-06-15-long-term-memory.md`). The table is the contract; v1 has one writer and one reader. **Write** = the agent-called `memory` tool family (`remember`/`forget`/`list_memories`, group `memory`) — every save is a `tool_calls` audit row, with `source_run_id` recording the run that wrote it. **Read** = `readMemoryFacts(db, userId, scope)` (`packages/db/queries.ts`), a plain `SELECT` the worker folds into the system prompt before the loop runs — recall is automatic, not a tool. v1 reads all `scope='global'` facts (`OWNER_USER_ID`, single-user); `readMemoryFacts` is the single seam phase-2 pgvector swaps (all facts → top-K by `embedding` distance), nothing else moving. `list_memories` reads via a deliberately-separate `listMemoryFacts` (management must keep seeing every fact when recall becomes top-K). A second writer (background auto-extraction) could land later into the same table with the read path untouched.
 - **`llm_calls` is the observability trace** — one row per provider call capturing the full exchange: the request `Message[]`, the `tools` (function declarations) offered, the response text **and** any `response_tool_calls` the model returned, plus tokens, **cost**, latency, errors. Rolled up onto `agent_runs` and surfaced on the web `/debug` page (which also joins the run's `tool_calls` to show executed-tool results + approval outcomes). Per-call `cost_usd` is computed at insert from `tokens × model price` (the price map lives in `packages/agent-core/pricing.ts`, not the DB — see DEPLOYMENT.md §13); the run's `cost_usd` is the sum of its calls'. A non-NULL `tool_call_id` marks an LLM call made by a tool outside the agent loop (NULL = an agent-loop call), which powers the per-tool cost breakdown on `/debug`. The same synthetic-`tool_call` + non-NULL-`tool_call_id` attribution covers `generate_image`, `auto_title`, **and the voice STT/TTS speech legs** (a `'stt'`/`'tts'` synthetic `tool_calls` row + a linked `llm_calls` row, written by the shared `recordOutOfLoopLlmCall` helper) — so each speech-leg's cost rolls into the run via the usual all-calls sum while `agent_runs.model` (derived from `tool_call_id IS NULL` rows only) stays the chat model, never a speech model. It's the in-Postgres alternative to Langfuse (ARCHITECTURE §17).
 - **No `audit_log` table** — `agent_runs` + `tool_calls` + `user_interactions` form the audit log. Every action the agent took is a row with args, result, and (if applicable) the owner's response.
 - **No `attachments` table yet** — file references go inline in `messages.content` as `{type: 'attachment', path: '...'}`. Promote to a real table the first time multiple messages need to share a file.

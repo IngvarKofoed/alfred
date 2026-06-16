@@ -4,6 +4,7 @@ import { sql } from 'drizzle-orm'
 import { getBridge } from './browser/bridge.js'
 import { makeBrowserTools } from './browser/tools.js'
 import { makeEmailTools } from './email/tools.js'
+import { makeMemoryTools } from './memory/tools.js'
 import { makePythonTools } from './python/tools.js'
 import { makeAskUserTool, makeFileTools, makeGenerateImageTool, makeSetTitleTool } from './tools.js'
 
@@ -20,10 +21,13 @@ const EMAIL_TOOLS = makeEmailTools()
 const askUserPauseStub = () => Promise.reject(new Error('ask_user pause not bound'))
 
 // The full toolset for a run. The conversation-bound tools (title, file, python, ask_user) are
-// rebuilt per call; echo, generate_image, and the browser tools carry no per-conversation state.
+// rebuilt per call; the memory tools close over runId so a saved fact records its source_run_id
+// (spec docs/specs/2026-06-15-long-term-memory.md); echo, generate_image, and the browser tools
+// carry no per-conversation state.
 export function buildRunTools(
   conversationId: string,
   askUserPause?: (callId: string, prompt: unknown) => Promise<unknown>,
+  runId?: string,
 ): Tool[] {
   return [
     echoTool,
@@ -32,6 +36,7 @@ export function buildRunTools(
     makeAskUserTool(askUserPause ?? askUserPauseStub),
     ...makeFileTools(conversationId),
     ...makePythonTools(conversationId),
+    ...makeMemoryTools(runId),
     ...EMAIL_TOOLS,
     ...BROWSER_TOOLS,
   ]

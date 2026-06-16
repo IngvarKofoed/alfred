@@ -15,9 +15,10 @@ import {
 import { uuidv7 } from 'uuidv7'
 
 // First slice of the schema (build-order step 2). The authoritative, full column
-// model lives in docs/DATABASE.md; agent_runs / tool_calls / user_interactions /
-// memory_facts arrive with the worker (step 3). IDs are UUIDv7 generated in app so
-// they are time-ordered regardless of the Postgres version.
+// model lives in docs/DATABASE.md; agent_runs / tool_calls / user_interactions
+// arrive with the worker (step 3), memory_facts with long-term memory (step 10).
+// IDs are UUIDv7 generated in app so they are time-ordered regardless of the
+// Postgres version.
 
 export const users = pgTable('users', {
   id: uuid('id')
@@ -195,4 +196,29 @@ export const userInteractions = pgTable(
       .on(t.status)
       .where(sql`status = 'pending'`),
   ],
+)
+
+// memory_facts: durable owner facts that span conversations — the "one Alfred, one
+// memory" pillar (long-term memory spec, build-order step 10). v1 is plain rows: the
+// agent writes via the `remember`/`forget` tools, recall is an automatic SELECT folded
+// into the system prompt. `scope` defaults to 'global' (the only scope v1 reads), kept
+// for future project / objective-scratchpad scopes (§7.7). The DATABASE.md `embedding`
+// column is deliberately deferred — a real vector column needs the pgvector extension,
+// which phase 2 adds alongside the column + index in one migration (ARCHITECTURE §6.4).
+export const memoryFacts = pgTable(
+  'memory_facts',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    scope: text('scope').notNull().default('global'),
+    text: text('text').notNull(),
+    sourceRunId: uuid('source_run_id').references(() => agentRuns.id), // nullable; the run that saved it (provenance)
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('memory_facts_user_scope_idx').on(t.userId, t.scope)],
 )

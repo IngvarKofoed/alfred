@@ -5,6 +5,10 @@ export {
   createUserMessageRun,
   ensureConversation,
   recordOutOfLoopLlmCall,
+  readMemoryFacts,
+  listMemoryFacts,
+  insertMemoryFact,
+  deleteMemoryFact,
   type DbOrTx,
 } from './queries.js'
 export {

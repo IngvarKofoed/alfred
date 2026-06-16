@@ -97,7 +97,7 @@ The column-level data model — every table, column, index, and the interaction 
 - `tool_calls` — one per invoked tool (`trust_tier`, status).
 - `user_interactions` — generic pause-for-user (`approval`/`question`); the record of every owner decision.
 - `tools` — worker-published catalog + the owner's per-tool `require_approval`; read per run to gate (§16).
-- `memory_facts` — **planned, not yet created** (design only; no schema entry or migration yet, §6.4).
+- `memory_facts` — **built (migration 0009)** as plain rows: durable cross-conversation owner facts, written by the `memory` tool family, recalled into the system prompt; `embedding`/pgvector deferred to phase 2 (§6.4).
 
 `agent_runs` + `tool_calls` + `user_interactions` together are the audit log — no separate `audit_log` table.
 
@@ -126,9 +126,14 @@ type RunEvent =
 
 pg-boss owns its own schema (`pgboss`), treated as a black box. Job payloads are minimal — `type AgentJob = { runId: uuid }` — the `agent_runs` row carries everything else, so a pulled-but-unacked job reconstructs from the run row, migrations don't ripple through payloads, and retries are idempotent (the worker skips already-finished runs). The worker calls `boss.work('agent-run', handler)` with concurrency; because a handler blocks in place while paused for user input (§10.2), `agent-run` jobs use **`retryLimit: 0`** and a **job expiration longer than the max interaction timeout** (§10.4) — a parked worker is never redelivered (no duplicate execution, §7.6), a lost run just fails. Recurring jobs (post-MVP) use `schedule()`.
 
-### 6.4 Memory (planned, not yet created)
+### 6.4 Memory (built as plain rows; pgvector is phase 2)
 
-The design: a `memory_facts` table with an unused `embedding` column, defined early to force the *what gets remembered* question, give the loop a plain-rows `memory.read(scope)` before pgvector, and make pgvector activation a single migration + index, no schema change. **The "exists from day one" intent was never executed** — the table is in no Drizzle schema and no migration; only this doc and `DATABASE.md` describe it. It lands when memory becomes the active build target (§15 step 10). Open: extraction strategy (LLM-summarized vs. user-flagged), decided then.
+Long-term memory is **built** as the "one Alfred, one memory" pillar — durable owner facts saved in one conversation and recalled in every later one (build-order step 10, §15; spec `docs/specs/2026-06-15-long-term-memory.md`). v1 is deliberately plain rows on `memory_facts`, with the table as the contract and two halves:
+
+- **Write = the agent-called `memory` tool family** (`remember`/`forget`/`list_memories`, group `memory`, §7.3) — wired exactly like the file/python/email families. The agent decides to save a fact the way it decides to call any tool; "remember that I…" from the owner is just the agent obeying. Every save is a `tool_calls` audit row, with `source_run_id` recording the run that wrote it.
+- **Read = automatic recall injection** — `readMemoryFacts(db, userId, scope)` (a plain `SELECT` in `packages/db/queries.ts`) folded into the `[system]` block before the loop runs (§7.5), so the model starts every run already knowing the facts: no recall tool, no round-trip. v1 injects *all* `scope='global'` facts (`OWNER_USER_ID`, single-user); a per-fact ~500-char cap keeps one runaway save from bloating every prompt, and there's no count cap (recall-all is the point).
+
+This **resolves the old extraction open-question in favour of agent-tool-flagged** — the agent (driven by its own judgment or the owner's "remember that…") is the writer, which subsumes user-flagged. **Phase 2 = pgvector semantic recall**, the one swap point: add `CREATE EXTENSION vector` + an `embedding` column (one migration, no schema churn elsewhere) and swap the body of `readMemoryFacts` from "all global facts" to "top-K by embedding distance to the latest user turn" — the tool family, the injection site, and the management read (`list_memories`) are untouched. A background auto-extraction pass (rejected for v1) could land later as a *second* writer into the same table with the read path untouched.
 
 ### 6.5 What's NOT in the database
 
@@ -195,7 +200,7 @@ interface Tool {
 Tools come from two sources, both adapted to this interface:
 
 - **MCP-sourced tools** — the agent core opens MCP client connections (stdio for short-lived subprocess servers, HTTP+SSE for long-running ones) at startup and converts each `tools/list` into `Tool`s whose `invoke` proxies via `tools/call`. The loop never sees MCP. *None exist yet* — the browser is **not** MCP-sourced (it's built-in tools over the embedded bridge, §8).
-- **Built-in tools** — `Tool` directly inside `agent-core` or the worker: trivial utilities (`echo`, `set_conversation_title`), the browser tools (§8), the image/file tools — `generate_image` plus a workspace-confined `list_files`/`read_file`/`write_file` trio (§6.5) — the Python tools — `run_python`/`pip_install` over a shared lazily-created venv, cwd = the conversation workspace, group `python` (spec `docs/specs/2026-06-10-python-execution-sandbox.md`) — and the email tools — `list_emails`/`search_emails`/`read_email` (read-tier) plus `save_draft`/`send_email` (write-tier), connect-per-call over IMAP/SMTP, group `email` (spec `docs/specs/2026-06-10-email-tools.md`). *Planned, not yet built:* **`ask_user`**, whose `invoke()` *would* create a `user_interactions` row of kind `question`, pause the run, and resume on response (the agent would call it like any tool; §6.1 has the shape). The DB column allows `kind='question'`, but nothing references `ask_user` today — the `question` pause path is reserved, not wired (§6.2).
+- **Built-in tools** — `Tool` directly inside `agent-core` or the worker: trivial utilities (`echo`, `set_conversation_title`), the browser tools (§8), the image/file tools — `generate_image` plus a workspace-confined `list_files`/`read_file`/`write_file` trio (§6.5) — the Python tools — `run_python`/`pip_install` over a shared lazily-created venv, cwd = the conversation workspace, group `python` (spec `docs/specs/2026-06-10-python-execution-sandbox.md`) — and the email tools — `list_emails`/`search_emails`/`read_email` (read-tier) plus `save_draft`/`send_email` (write-tier), connect-per-call over IMAP/SMTP, group `email` (spec `docs/specs/2026-06-10-email-tools.md`) — and the memory tools — `remember`/`forget` (write-tier) plus `list_memories` (read-tier) over the plain-rows `memory_facts` table (§6.4), group `memory`, built per run so a saved fact records its `source_run_id` (spec `docs/specs/2026-06-15-long-term-memory.md`; the read side, automatic recall, is in `run.ts`, not a tool). *Planned, not yet built:* **`ask_user`**, whose `invoke()` *would* create a `user_interactions` row of kind `question`, pause the run, and resume on response (the agent would call it like any tool; §6.1 has the shape). The DB column allows `kind='question'`, but nothing references `ask_user` today — the `question` pause path is reserved, not wired (§6.2).
 
 So: a rich integration = spin up an MCP server (auto-discovered); a tiny utility = a built-in `Tool`; swapping one for the other is invisible to the loop.
 
@@ -340,7 +345,7 @@ Each step is independently verifiable; the seams (Postgres queue, SSE, MCP) don'
 5. ✅ **Browser bridge + Chrome extension** — Option C (§8: embedded bridge, built-in tools, no MCP; ported from `chrome-mcp`). Plus **vision + image support** — per-conversation workspaces (§6.5), an `image` content part + Gemini `inlineData`, screenshots + web upload, `generate_image`, and a workspace-confined `list_files`/`read_file`/`write_file` trio (spec `docs/specs/2026-06-05-conversation-workspace-and-images.md`).
 6. **Discord bot** — second ingress, same conversation shape, shared memory.
 
-**End of MVP.** Post-MVP, rough priority: **7.** more MCP integrations (Gmail, Calendar, …) one at a time; **8.** voice orchestrator + native iOS app (hands-free, on-device wake-word, cloud STT/TTS); **9.** autonomous triggers (scheduler + first watcher, likely inbox); **10.** long-term memory (pgvector, §17); **11.** backup strategy (§17).
+**End of MVP.** Post-MVP, rough priority: **7.** more MCP integrations (Gmail, Calendar, …) one at a time; **8.** voice orchestrator + native iOS app (hands-free, on-device wake-word, cloud STT/TTS); **9.** autonomous triggers (scheduler + first watcher, likely inbox); **10.** long-term memory — the plain-rows foundation is **built** (`memory_facts` + the `memory` tool family + automatic recall, §6.4); pgvector semantic recall remains the phase-2 upgrade (§17); **11.** backup strategy (§17).
 
 ---
 

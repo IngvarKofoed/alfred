@@ -1,7 +1,7 @@
-import { sql } from 'drizzle-orm'
+import { and, asc, eq, sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
 import { type Db } from './client.js'
-import { agentRuns, conversations, llmCalls, messages, toolCalls, users } from './schema.js'
+import { agentRuns, conversations, llmCalls, memoryFacts, messages, toolCalls, users } from './schema.js'
 
 // A Db handle or a transaction handle — so helpers can run standalone or inside a caller's
 // transaction (e.g. the message ingress, which seeds the conversation in the same tx as the
@@ -117,4 +117,82 @@ export async function recordOutOfLoopLlmCall(
     latencyMs: 0,
     error: null,
   })
+}
+
+// The thin shared SELECT behind both readMemoryFacts and listMemoryFacts: a fact's
+// (id, text) for a (userId, scope), oldest-first (created_at asc) so the order is
+// deterministic. The two callers stay separate exported functions on purpose (below).
+function selectMemoryFacts(
+  db: DbOrTx,
+  userId: string,
+  scope: string,
+): Promise<{ id: string; text: string }[]> {
+  return db
+    .select({ id: memoryFacts.id, text: memoryFacts.text })
+    .from(memoryFacts)
+    .where(and(eq(memoryFacts.userId, userId), eq(memoryFacts.scope, scope)))
+    .orderBy(asc(memoryFacts.createdAt))
+}
+
+// The recall seam folded into the system prompt by the worker (long-term memory spec).
+// v1 returns ALL facts for (userId, scope); phase-2 pgvector swaps THIS function's body
+// (all facts -> top-K by embedding distance to the latest user turn), and nothing else —
+// the tool family, the injection site, and listMemoryFacts are untouched (ARCHITECTURE §6.4).
+export function readMemoryFacts(
+  db: DbOrTx,
+  userId: string,
+  scope = 'global',
+): Promise<{ id: string; text: string }[]> {
+  return selectMemoryFacts(db, userId, scope)
+}
+
+// The management read behind the `list_memories` tool — the id source for `forget`.
+// Always all facts; deliberately separate from readMemoryFacts (which becomes top-K in
+// phase 2), since management must keep seeing every fact regardless of retrieval changes.
+export function listMemoryFacts(
+  db: DbOrTx,
+  userId: string,
+  scope = 'global',
+): Promise<{ id: string; text: string }[]> {
+  return selectMemoryFacts(db, userId, scope)
+}
+
+// Save a durable fact (the `remember` tool). Returns the new id so the agent can `forget`
+// it later in the same turn if needed; `sourceRunId` records the run that saved it.
+export async function insertMemoryFact(
+  db: DbOrTx,
+  params: { userId: string; scope?: string; text: string; sourceRunId?: string | null },
+): Promise<{ id: string }> {
+  const [row] = await db
+    .insert(memoryFacts)
+    .values({
+      userId: params.userId,
+      scope: params.scope ?? 'global',
+      text: params.text,
+      sourceRunId: params.sourceRunId ?? null,
+    })
+    .returning({ id: memoryFacts.id })
+  return { id: row!.id }
+}
+
+// A fact id is a UUID. The `forget` tool's id comes from the model, which can hallucinate a
+// non-UUID (a label, a guessed value); comparing that against the uuid-typed `id` column would
+// make Postgres throw `invalid input syntax for type uuid` instead of cleanly "not found". So
+// deleteMemoryFact short-circuits a malformed id to a clean miss, keeping the helper total.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Delete a fact (the `forget` tool), scoped to userId so a fact can only be deleted by its
+// owner (a stray/forged id from another owner deletes nothing). `deleted` reports whether a
+// row matched, so the tool can tell the agent "no such fact" instead of silently succeeding.
+export async function deleteMemoryFact(
+  db: DbOrTx,
+  params: { userId: string; id: string },
+): Promise<{ deleted: boolean }> {
+  // A non-UUID id can't match any row (and would make the uuid cast throw) — report a clean miss.
+  if (!UUID_RE.test(params.id)) return { deleted: false }
+  const deleted = await db
+    .delete(memoryFacts)
+    .where(and(eq(memoryFacts.id, params.id), eq(memoryFacts.userId, params.userId)))
+    .returning({ id: memoryFacts.id })
+  return { deleted: deleted.length > 0 }
 }

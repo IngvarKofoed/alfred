@@ -15,7 +15,7 @@ import {
   TracingProvider,
   type TtsProvider,
 } from '@alfred/agent-core'
-import { agentRuns, conversations, getDb, llmCalls, messages, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
+import { agentRuns, conversations, getDb, llmCalls, messages, OWNER_USER_ID, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
 import { and, asc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
@@ -61,7 +61,19 @@ const SYSTEM_PROMPT =
   "You can run Python in this conversation's working directory with run_python (the same directory " +
   'the file tools use) and install packages with pip_install. ' +
   'You can list/search/read the owner’s inbox (list_emails, search_emails, read_email), save drafts, ' +
-  'and send mail — sending asks the owner first.'
+  'and send mail — sending asks the owner first. ' +
+  'You have a long-term memory across conversations: save durable facts about the owner with remember; ' +
+  "recall is automatic, so don't re-save what you already know. Use forget to remove a fact."
+
+// Render the run's [system] text: the static persona prompt plus, when the owner has any
+// remembered facts, a recall block (long-term memory spec). Kept a named seam rather than
+// inlined so the deferred §7.5 work (identity block + persona file) has one place to compose
+// the system message instead of having to untangle a concatenation.
+function systemTextWithMemory(facts: { text: string }[]): string {
+  if (facts.length === 0) return SYSTEM_PROMPT
+  const block = facts.map((f) => `- ${f.text}`).join('\n')
+  return `${SYSTEM_PROMPT}\n\nWhat you remember about the owner:\n${block}`
+}
 
 export interface RunDeps {
   provider?: LlmProvider
@@ -105,14 +117,28 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       .returning({ id: agentRuns.id })
     if (flipped.length === 0) return // a cancel won the pre-pickup race
 
-    const rows = await db
-      .select({ role: messages.role, content: messages.content })
-      .from(messages)
-      .where(eq(messages.conversationId, run.conversationId))
-      .orderBy(asc(messages.createdAt))
+    // Memory recall (spec docs/specs/2026-06-15-long-term-memory.md): the memory.read(scope)
+    // seam — fold the owner's durable facts into the system block so the model starts every run
+    // already knowing them (no recall tool, no round-trip). readMemoryFacts is the SINGLE point
+    // phase-2 pgvector swaps (all facts -> top-K by embedding distance); nothing else here moves.
+    // Run CONCURRENTLY with the history load — independent queries, both on the pre-loop critical
+    // path — and BEST-EFFORT: a recall failure degrades to no-recall rather than failing the run
+    // (history is essential, memory an enhancement). Injecting into the system message is safe for
+    // maybeAutoTitle, which builds its own titleMessages and only reads history via find(role==='user').
+    const [rows, facts] = await Promise.all([
+      db
+        .select({ role: messages.role, content: messages.content })
+        .from(messages)
+        .where(eq(messages.conversationId, run.conversationId))
+        .orderBy(asc(messages.createdAt)),
+      readMemoryFacts(db, OWNER_USER_ID, 'global').catch((err) => {
+        console.error(`[run ${runId}] memory recall failed; proceeding without it:`, err)
+        return [] as { id: string; text: string }[]
+      }),
+    ])
 
     const history: Message[] = [
-      { role: 'system', content: [{ type: 'text', text: SYSTEM_PROMPT }] },
+      { role: 'system', content: [{ type: 'text', text: systemTextWithMemory(facts) }] },
       ...(await rowsToMessages(run.conversationId, rows)),
     ]
 
@@ -246,8 +272,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     }
 
     // The full toolset for this run (echo + the context-bound title tool + the browser
-    // tools), assembled in one place so the boot catalog publish can't drift from it.
-    const tools = buildRunTools(run.conversationId, askUserPause)
+    // tools), assembled in one place so the boot catalog publish can't drift from it. run.id
+    // threads through so a remember'd fact records its source_run_id (memory spec).
+    const tools = buildRunTools(run.conversationId, askUserPause, run.id)
 
     // The owner's per-tool approval overrides (the tools page, §16), loaded once per run.
     // require_approval is a tri-state: null/absent ⇒ fall back to the trust-tier default.
