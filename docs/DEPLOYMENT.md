@@ -42,11 +42,11 @@ All processes are native (no Docker). Managed by **pm2** — the same process su
 | `alfred-webserver` | Node/TS | Browser ingress, serves PWA, SSE | Restart on failure |
 | `alfred-worker` | Node/TS | Agent execution loop + **embedded browser bridge** (WS server for the Chrome extension) | Restart on failure |
 | `alfred-updater` | Node/TS | Auto-deploy: polls git, rebuilds + restarts the managed apps; opt-in via `DEPLOY_ENABLED` | Restart on failure |
-| `alfred-discord` | Node/TS | Discord ingress (post-MVP) | Restart on failure |
+| `alfred-discord` | Node/TS | Discord ingress (discord.js) — second interactive ingress; direct-to-Postgres, inert unless `DISCORD_BOT_TOKEN`/`ALLOWED_DISCORD_USER_ID` set (§9.2) | Restart on failure |
 | `alfred-voice` | Node/TS | Voice orchestrator (native-app surface, post-MVP) | Restart on failure |
 | `alfred-triggers` | Node/TS | Autonomous-watcher scheduler — computes due triggers + enqueues `trigger-detect` jobs (timing only; all tool execution stays in the worker, §9.4) | Restart on failure |
 
-**Built today:** `alfred-webserver`, `alfred-worker`, `alfred-updater`, and now `alfred-triggers` (the autonomous-watcher scheduler, §9.4) are in `ecosystem.config.cjs`; the `discord`/`voice` rows are the reserved post-MVP shape (so the topology is whole, not because they exist — §15). `alfred-triggers` is a **pure scheduler** — it owns timing only (cron via pg-boss `schedule()` + a periodic sweep for one-shot `self` triggers) and never imports the tool layer. The updater is **inert unless `DEPLOY_ENABLED=true`** (a plain `pm2 start ecosystem.config.cjs` boots it idle); `pnpm deploy:up` (`pm2 start ecosystem.config.cjs --env deploy`) brings the stack up with it enabled. Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
+**Built today:** `alfred-webserver`, `alfred-worker`, `alfred-updater`, `alfred-triggers` (the autonomous-watcher scheduler, §9.4), and now `alfred-discord` (the second interactive ingress, discord.js, §9.2 — inert unless its token + owner-id are set) are in `ecosystem.config.cjs`; the `voice` row is the reserved post-MVP shape (so the topology is whole, not because it exists — §15). `alfred-triggers` is a **pure scheduler** — it owns timing only (cron via pg-boss `schedule()` + a periodic sweep for one-shot `self` triggers) and never imports the tool layer. The updater is **inert unless `DEPLOY_ENABLED=true`** (a plain `pm2 start ecosystem.config.cjs` boots it idle); `pnpm deploy:up` (`pm2 start ecosystem.config.cjs --env deploy`) brings the stack up with it enabled. Each is its own pm2 process so one crash doesn't take down the others. The browser bridge was originally a separate `alfred-browser-bridge` process but is instead **embedded in `alfred-worker`** (§8) — the extension's own auto-reconnect covers restarts for one user.
 
 Deploy: automated by `alfred-updater` — the authoritative sequence is stop-first: `pm2 stop <apps>` → `git checkout -f <branch>` + `git reset --hard origin/<branch>` → `pnpm install --frozen-lockfile` → `pnpm -r build` → `pnpm db:migrate` → `pm2 start <apps>` (with a `finally` that always brings the apps back up). Deploying by hand means running that same sequence manually. Postgres is installed via the host's package manager and managed by the OS, not pm2. **Alternative** if pm2 ever stops fitting: each target's native supervisor (systemd/launchd), which is what pm2 delegates to anyway.
 
@@ -60,7 +60,7 @@ Three layers, increasing specificity: **(1) defaults in code** (`packages/shared
 
 ### 13.1 .env layout
 
-The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`, `STT_PROVIDER`/`TTS_PROVIDER`/`GOOGLE_SPEECH_API_KEY`/`ELEVENLABS_API_KEY`/`TTS_VOICE`, `DETECTION_MODEL`, `AUTONOMOUS_APPROVAL_TIMEOUT_MS`, `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`/`VAPID_SUBJECT`); `TRIGGER_TZ` is built too but read via `process.env` in the triggers scheduler, **not** the zod schema; the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
+The *target* layout. Only the built keys are in the zod schema today (`WEBSERVER_PORT`, `WEBSERVER_HOST`, `POSTGRES_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `BRIDGE_WS_PORT`, `WORKSPACE_ROOT`, `PYTHON_BIN`, `PYTHON_VENV_DIR`, `DEPLOY_ENABLED`, `DEPLOY_BRANCH`, `DEPLOY_POLL_INTERVAL_MS`, `DEPLOY_APPS`, `IMAP_*`/`SMTP_*`/`EMAIL_FROM`, `STT_PROVIDER`/`TTS_PROVIDER`/`GOOGLE_SPEECH_API_KEY`/`ELEVENLABS_API_KEY`/`TTS_VOICE`, `DETECTION_MODEL`, `AUTONOMOUS_APPROVAL_TIMEOUT_MS`, `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`/`VAPID_SUBJECT`, and (the Discord ingress, §9.2) `DISCORD_BOT_TOKEN`/`ALLOWED_DISCORD_USER_ID`/`DISCORD_GUILD_ID`); `TRIGGER_TZ` is built too but read via `process.env` in the triggers scheduler, **not** the zod schema; the rest are **reserved for post-MVP ingresses**, documented here so the layout is whole.
 
 ```
 # Built
@@ -76,7 +76,7 @@ PYTHON_VENV_DIR=./data/python-venv  # shared venv for the worker's Python tools;
 DEPLOY_ENABLED=false            # auto-deploy updater (alfred-updater, §5); default false — only the deploy box opts in
 DEPLOY_BRANCH=main              # branch the updater syncs to origin/<branch>
 DEPLOY_POLL_INTERVAL_MS=300000  # how often the updater checks origin (~5 min)
-DEPLOY_APPS=alfred-webserver,alfred-worker  # pm2 app names the updater stops/builds/restarts (never itself)
+DEPLOY_APPS=alfred-webserver,alfred-worker,alfred-triggers,alfred-discord  # pm2 app names the updater stops/builds/restarts (never itself); tracks ecosystem's long-running set
 IMAP_HOST=imap.example.com       # mailbox for the worker's email tools (§7.3); optional — tools return "email not configured" if unset
 IMAP_PORT=993                    # IMAP port (TLS)
 IMAP_USER=alfred@example.com     # IMAP login
@@ -99,12 +99,12 @@ VAPID_PUBLIC_KEY=...             # Web Push VAPID public key (§9.4); optional �
 VAPID_PRIVATE_KEY=...            # Web Push VAPID private key
 VAPID_SUBJECT=mailto:you@example.com  # VAPID contact (mailto:/https:), required by the Web Push spec
 TRIGGER_TZ=Europe/Copenhagen     # optional; IANA zone cron triggers evaluate in (so "8am" is local). Read via process.env in the triggers scheduler, NOT the zod schema; defaults to the host's resolved zone
+DISCORD_BOT_TOKEN=<from the Discord developer portal>  # optional; the bot idles (logs + stays alive) if this or ALLOWED_DISCORD_USER_ID is unset. Needs the privileged Message Content Intent enabled in the portal (§9.2)
+ALLOWED_DISCORD_USER_ID=<owner's Discord user id>      # owner-only: every message/interaction from anyone else is dropped (§12)
 # Observability is in-Postgres (llm_calls + /debug) — no keys.
 
 # Reserved (post-MVP)
 TAILSCALE_USER_HEADER=Tailscale-User-Login    # not read today (§12)
-ALLOWED_DISCORD_USER_ID=<owner's Discord ID>
-DISCORD_BOT_TOKEN=<from Discord developer portal>
 DEEPGRAM_API_KEY=...
 ELEVENLABS_API_KEY=...
 ```
@@ -134,7 +134,7 @@ alfred/
 │  ├─ worker/               ← agent worker (+ embedded browser bridge: src/browser/)
 │  ├─ updater/              ← auto-deploy: git poll → rebuild → restart
 │  ├─ triggers/             ← autonomous-watcher scheduler (built; §9.4)
-│  ├─ discord-bot/          ← Discord ingress (post-MVP)
+│  ├─ discord/              ← Discord ingress (built; discord.js, §9.2)
 │  └─ voice/                ← voice orchestrator (post-MVP)
 ├─ clients/                 ← user-facing apps
 │  ├─ web/                  ← Vite + React PWA (chat-only; pnpm workspace member)
@@ -142,7 +142,8 @@ alfred/
 ├─ packages/                ← shared TS libraries (pnpm workspace members)
 │  ├─ db/                   ← Drizzle schema + migrations, query helpers
 │  ├─ shared/               ← TS types shared between services and web client
-│  └─ agent-core/           ← agent loop, provider abstraction, tool interface
+│  ├─ agent-core/           ← agent loop, provider abstraction, tool interface
+│  └─ commands/             ← shared chat-command registry (rename/help); used by the webserver + Discord bot
 ├─ chrome-extension/        ← MV3 extension (pnpm workspace member; built with esbuild; talks to the worker's embedded bridge)
 ├─ ecosystem.config.cjs     ← pm2 process definitions for services/*
 ├─ pnpm-workspace.yaml      ← lists services/*, clients/web, packages/*, chrome-extension

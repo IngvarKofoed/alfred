@@ -15,7 +15,7 @@ import {
   TracingProvider,
   type TtsProvider,
 } from '@alfred/agent-core'
-import { agentRuns, conversations, getDb, getTrigger, insertNotification, llmCalls, messages, OWNER_USER_ID, pgNotify, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
+import { agentRuns, conversations, getDb, getTriggerByConversation, insertNotification, llmCalls, messages, OWNER_USER_ID, pgNotify, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig } from '@alfred/shared'
 import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
@@ -142,11 +142,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
   if (!run || run.status !== 'pending') return // already handled / cancelled
 
   // The conversation backs the autonomous-watcher decisions (spec): its `ingress` distinguishes a
-  // trigger run (alongside run.humanInLoop, set false only by createTriggerRun), and — for a
-  // RECURRING watcher only — its `channelKey` is the trigger id (so we can look the trigger up for
-  // the scratchpad scope + notify policy).
+  // trigger run (alongside run.humanInLoop, set false only by createTriggerRun).
   const [conv] = await db
-    .select({ ingress: conversations.ingress, channelKey: conversations.channelKey })
+    .select({ ingress: conversations.ingress })
     .from(conversations)
     .where(eq(conversations.id, run.conversationId))
   // Trigger run: no human is watching (run.humanInLoop=false, or a 'trigger'-ingress conversation).
@@ -154,17 +152,32 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
   const isTrigger = !run.humanInLoop || conv?.ingress === 'trigger'
 
   // Robustly derive watcher-ness for the scratchpad (spec §7.7). A RECURRING watcher's conversation
-  // IS the watcher: getTrigger(conv.channelKey) resolves a 'schedule'|'inbox'|'webhook' row, so it
-  // owns a scratchpad scope `trigger:<id>` and uses the trigger's notify policy. A one-shot 'self'
-  // run is unattended too, but runs on the ORIGINATING (web) conversation — channelKey is not a
-  // trigger id, getTrigger returns undefined — so it gets NO scratchpad scope (the agent must not be
-  // told to remember to a `trigger:<uuid>` scope nothing can resolve) and notifies on result with
-  // an implicit 'always' policy. Resolved up front so the scratchpad recall + the memory tools'
-  // scope + the result-notify policy all key off the same, correct fact.
-  const watcher =
-    isTrigger && conv?.channelKey ? await getTrigger(db, conv.channelKey).catch(() => undefined) : undefined
+  // IS the watcher: getTriggerByConversation(run.conversationId) resolves a 'schedule'|'inbox'|
+  // 'webhook' row by its triggers.conversation_id, so it owns a scratchpad scope `trigger:<id>` and
+  // uses the trigger's notify policy. Looking up by the conversation id (not channelKey) is what lets
+  // a watcher's conversation move to a Discord forum post (ingress='discord', spec
+  // 2026-06-17-discord-conversation-model) while still resolving its trigger; detect.ts backfills
+  // conversation_id=trigger.id on the legacy 'trigger'-ingress path, so existing watchers resolve too.
+  // A one-shot 'self' run is unattended but runs on the ORIGINATING (web) conversation, which no
+  // trigger.conversation_id points at, so getTriggerByConversation returns undefined → NO scratchpad
+  // scope (the agent must not be told to remember to a `trigger:<uuid>` scope nothing can resolve) and
+  // it notifies on result with an implicit 'always' policy. Resolved up front so the scratchpad recall
+  // + the memory tools' scope + the result-notify policy all key off the same, correct fact. Only
+  // resolved for a trigger run — an interactive run never resolves a watcher.
+  const watcher = isTrigger
+    ? await getTriggerByConversation(db, run.conversationId).catch(() => undefined)
+    : undefined
+  // A 'self' trigger stores conversation_id = its ORIGINATING (web) conversation, so
+  // getTriggerByConversation now MATCHES it (the old getTrigger(channelKey) returned undefined). But
+  // a 'self' run is a one-shot reminder that must keep the pre-watcher behavior: no scratchpad scope
+  // AND an always-push result notification with a generic title — NOT the self trigger's name or
+  // notify_policy (a 'digest' self reminder would otherwise be silently suppressed). So collapse the
+  // matched self trigger back to undefined: `recurringWatcher` is the watcher row ONLY for a
+  // recurring ('schedule'|'inbox'|'webhook') watcher, and it (not `watcher`) drives the scratchpad
+  // id and the result-notify policy below.
+  const recurringWatcher = watcher && watcher.kind !== 'self' ? watcher : undefined
   // Only a recurring watcher (not a 'self' one-shot) keeps a durable scratchpad.
-  const watcherId = watcher && watcher.kind !== 'self' ? watcher.id : undefined
+  const watcherId = recurringWatcher?.id
   // The memory scope the run's remember/list_memories operate on: the watcher's scratchpad for a
   // recurring watcher, the owner's global memory otherwise (interactive AND 'self' runs).
   const memoryScope = watcherId ? `trigger:${watcherId}` : 'global'
@@ -723,7 +736,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       // 'always' policy (its result is what the owner asked to be reminded of).
       if (isTrigger) {
         const finalText = lastAssistantText(finalMessages)
-        await maybeNotifyResult(db, run, watcher, finalText).catch((notifyErr) =>
+        // Pass recurringWatcher (undefined for a 'self' one-shot): a recurring watcher uses its
+        // notify_policy; a 'self' run notifies with an implicit 'always' policy + generic title.
+        await maybeNotifyResult(db, run, recurringWatcher, finalText).catch((notifyErr) =>
           console.error(`[run ${runId}] result notification failed:`, notifyErr),
         )
       }
@@ -1061,7 +1076,7 @@ function lastAssistantText(finalMessages: Message[]): string {
 async function maybeNotifyResult(
   db: ReturnType<typeof getDb>,
   run: typeof agentRuns.$inferSelect,
-  watcher: Awaited<ReturnType<typeof getTrigger>>,
+  watcher: Awaited<ReturnType<typeof getTriggerByConversation>>,
   resultText: string,
 ): Promise<void> {
   // A 'digest' watcher emits no per-run push; every other case (recurring non-digest watcher, or a

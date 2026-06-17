@@ -4,6 +4,8 @@ export { createDb, getDb, getPool, pgNotify, type Db } from './client.js'
 export {
   createUserMessageRun,
   ensureConversation,
+  getOrCreateConversationByChannel,
+  resolveInteraction,
   recordOutOfLoopLlmCall,
   readMemoryFacts,
   listMemoryFacts,
@@ -13,6 +15,8 @@ export {
   listEnabledTriggers,
   listTriggers,
   getTrigger,
+  getTriggerByConversation,
+  setTriggerConversation,
   setTriggerEnabled,
   deleteTrigger,
   updateTriggerSignal,

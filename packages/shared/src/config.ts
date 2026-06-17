@@ -78,7 +78,15 @@ const schema = z.object({
   DEPLOY_ENABLED: z.string().default('false').transform((v) => v.toLowerCase() === 'true'),
   DEPLOY_BRANCH: z.string().default('main'),
   DEPLOY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(300000),
-  DEPLOY_APPS: z.string().default('alfred-webserver,alfred-worker'),
+  // The long-running pm2 apps the updater stops → rebuilds → (re)starts on each deploy (via
+  // `pm2 start ecosystem.config.cjs --only <these>`, which also starts one not yet known to pm2).
+  // Must track ecosystem.config.cjs's long-running set so a new ingress is actually (re)deployed —
+  // alfred-triggers (CHANGELOG 86) and alfred-discord (CHANGELOG 95) were added there but the default
+  // lagged at webserver+worker, so neither was being redeployed. alfred-updater is auto-filtered out
+  // (it never restarts itself). Override in .env to deploy a subset.
+  DEPLOY_APPS: z
+    .string()
+    .default('alfred-webserver,alfred-worker,alfred-triggers,alfred-discord'),
   // Email tools (worker's IMAP/SMTP family — spec docs/specs/2026-06-10-email-tools.md).
   // All optional like GEMINI_API_KEY so non-email processes (and an email-less worker) still
   // boot; the tools validate the required subset lazily per invoke (a clear "email not
@@ -111,6 +119,20 @@ const schema = z.object({
   VAPID_PUBLIC_KEY: z.string().optional(),
   VAPID_PRIVATE_KEY: z.string().optional(),
   VAPID_SUBJECT: z.string().optional(), // a mailto: or https: contact, required by the Web Push spec
+  // Discord bot ingress (spec docs/specs/2026-06-16-discord-bot.md). Both optional like
+  // GEMINI_API_KEY so non-discord processes (the worker, the webserver) still boot; with either
+  // unset the alfred-discord process logs and idles rather than crash-looping (mirrors the
+  // updater's inert-unless-enabled shape). DISCORD_BOT_TOKEN is the gateway login (Discord
+  // developer portal); ALLOWED_DISCORD_USER_ID gates every event to the owner (§12 — being the
+  // owner IS the auth, single-user).
+  DISCORD_BOT_TOKEN: z.string().optional(),
+  ALLOWED_DISCORD_USER_ID: z.string().optional(),
+  // The owner's private Alfred guild (spec docs/specs/2026-06-17-discord-conversation-model.md).
+  // Optional — GATES all guild-home behavior: when set, the bot treats this guild as the home
+  // surface (forum post = conversation, mention-less replies inside it, watchers-as-threads) and
+  // redirects DMs to it. When UNSET, the bot is byte-for-byte today's DM-or-mention bot — additive,
+  // not a rewrite. Only the alfred-discord process reads it.
+  DISCORD_GUILD_ID: z.string().optional(),
 })
 
 export type Config = z.infer<typeof schema>

@@ -2,7 +2,7 @@
 
 Long-running Node/TypeScript backend processes, all supervised by pm2 and pulling shared code from `packages/`. See `docs/DEPLOYMENT.md` §5 (process topology), `docs/ARCHITECTURE.md` §9 (ingresses), and `docs/RUNTIME.md` §10 (runtime flows) + §7.6 (concurrency/crash model), for the broader context.
 
-Contents: `worker/` (agent execution loop; also hosts the **embedded browser bridge** in `worker/src/browser/` — the WebSocket server the Chrome extension connects to, §8 Option C; there is no separate `browser-bridge` process) and `webserver/` (Hono — PWA API + SSE). **Built today: only those two.** The post-MVP ingresses — `discord-bot/` (discord.js), `voice/` (orchestrator), `triggers/` (scheduler / event-source) — are reserved in the architecture (`docs/DEPLOYMENT.md` §5/§14, `docs/INGRESSES.md`) but **not yet created** as directories.
+Contents: `worker/` (agent execution loop; also hosts the **embedded browser bridge** in `worker/src/browser/` — the WebSocket server the Chrome extension connects to, §8 Option C; there is no separate `browser-bridge` process), `webserver/` (Hono — PWA API + SSE), `updater/` (auto-deploy: git poll → rebuild → restart), `triggers/` (the autonomous-watcher scheduler, §9.4), and `discord/` (the Discord ingress — discord.js, §9.2). **All of those are built.** Only `voice/` (the post-MVP voice orchestrator) remains reserved in the architecture (`docs/DEPLOYMENT.md` §5/§14, `docs/INGRESSES.md`) but **not yet created** as a directory.
 
 ## Required tools
 

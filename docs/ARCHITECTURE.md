@@ -48,7 +48,7 @@ External clients
 │        │                                        │   └─ MCP-sourced     │
 │  Ingresses (interchangeable):                   └─ embedded browser    │
 │  ├─ Hono webserver (PWA chat, SSE)                  bridge (WS server) │
-│  ├─ Discord bot                                       ▲                │
+│  ├─ Discord bot (chat, built)                         ▲                │
 │  ├─ Voice orchestrator (native app, post-MVP)         │ extension      │
 │  └─ Triggers (cron/inbox/webhook, built)              connects here    │
 └──────────────────────────────────────────────────────────────────────┘
@@ -76,7 +76,7 @@ External clients
 
 ## 5. Process Topology
 
-**Moved to `docs/DEPLOYMENT.md`** (§5). In brief: **pm2** supervises native Node processes from one `ecosystem.config.cjs`. Built today: `alfred-webserver` + `alfred-worker` (the browser bridge is embedded in the worker, §8) + `alfred-updater` (auto-deploy, inert unless `DEPLOY_ENABLED=true`) + `alfred-triggers` (the autonomous-watcher scheduler, §9.4); `alfred-discord`/`alfred-voice` are the reserved post-MVP shape.
+**Moved to `docs/DEPLOYMENT.md`** (§5). In brief: **pm2** supervises native Node processes from one `ecosystem.config.cjs`. Built today: `alfred-webserver` + `alfred-worker` (the browser bridge is embedded in the worker, §8) + `alfred-updater` (auto-deploy, inert unless `DEPLOY_ENABLED=true`) + `alfred-triggers` (the autonomous-watcher scheduler, §9.4) + `alfred-discord` (the second interactive ingress, §9.2, inert unless configured); `alfred-voice` is the reserved post-MVP shape.
 
 ---
 
@@ -293,9 +293,9 @@ All ingresses follow the same shape: receive input → look up/create the conver
 
 The client routes each conversation at `/conversation/:id` (deep-linkable, refresh-stable; `/` redirects to the last-opened or newest conversation), and `GET /api/conversations` backs a history sidebar (§11). Ordering uses `conversations.last_active_at`, bumped on each posted user message via `ensureConversation({ touch: true })` (spec `docs/specs/2026-06-11-conversation-list-history.md`).
 
-### 9.2 Discord · 9.3 Voice · 9.4 Autonomous triggers — Discord post-MVP; voice + triggers built
+### 9.2 Discord · 9.3 Voice · 9.4 Autonomous triggers — all built
 
-**Moved to `docs/INGRESSES.md`** (§9.2–9.4). All three reuse the §9 ingress contract above; in brief: **Discord** (`alfred-discord`, discord.js — owner-ID-filtered, streaming reply edits, reactions as approval UI; **post-MVP**); **Voice** (`alfred-voice`, native-app-only, cloud STT/TTS with server-side keys, on-device wake word — the agent core stays the brain; **built as an I/O modality, not a WS orchestrator**); **Autonomous triggers** (`alfred-triggers`, no human at the other end — scheduled / event-driven / agent-initiated, same enqueue+LISTEN+notify transport, different execution lifecycle per §7.7 / RUNTIME.md; **now built** — the pure scheduler + the tiered detection ladder + the Web-Push notifications outbox). Full detail in `INGRESSES.md`.
+**Moved to `docs/INGRESSES.md`** (§9.2–9.4). All three reuse the §9 ingress contract above; in brief: **Discord** (`alfred-discord`, discord.js — owner-ID-filtered, a **direct-to-Postgres peer ingress** like the webserver: streaming reply edits, Approve/Reject buttons for approvals, native StringSelectMenu + freeform Modal for `ask_user` questions, images both ways, and the chat-command registry surfaced as Discord slash commands via the new `@alfred/commands` package; **now built** — spec `docs/specs/2026-06-16-discord-bot.md`; the **guild-forum conversation model** (a forum post = a conversation, watchers as posts, gated on `DISCORD_GUILD_ID`) is also built — spec `docs/specs/2026-06-17-discord-conversation-model.md`); **Voice** (`alfred-voice`, native-app-only, cloud STT/TTS with server-side keys, on-device wake word — the agent core stays the brain; **built as an I/O modality, not a WS orchestrator**); **Autonomous triggers** (`alfred-triggers`, no human at the other end — scheduled / event-driven / agent-initiated, same enqueue+LISTEN+notify transport, different execution lifecycle per §7.7 / RUNTIME.md; **now built** — the pure scheduler + the tiered detection ladder + the Web-Push notifications outbox). Full detail in `INGRESSES.md`.
 
 ---
 
@@ -340,14 +340,14 @@ The client routes each conversation at `/conversation/:id` (deep-linkable, refre
 
 ## 15. Build Order
 
-Each step is independently verifiable; the seams (Postgres queue, SSE, MCP) don't change between steps. **Steps 1–5 (incl. tools+approval and vision) are built; step 6 and all post-MVP steps are planned.**
+Each step is independently verifiable; the seams (Postgres queue, SSE, MCP) don't change between steps. **Steps 1–6 (incl. tools+approval, vision, and the Discord ingress) are built — MVP is complete; several post-MVP steps (voice, autonomous triggers, plain-rows memory) are also built.**
 
 1. ✅ **Hono webserver + stub Vite+React over HTTPS** (Tailscale auth, verified from phone over tailnet).
 2. ✅ **Postgres + Drizzle schema** (`users`/`conversations`/`messages`/`agent_runs`/`llm_calls` + pg-boss tables).
 3. ✅ **Agent core** — provider abstraction + **Gemini** impl, hand-rolled loop, `Tool` interface.
 4. ✅ **Real model + observability end to end** — the loop talks to Gemini via `alfred-worker` (pg-boss), streaming tokens `NOTIFY`→SSE→web; every call traced to `llm_calls` + `/debug`. Plus **tools + approval** (trust-tier gate, §16) — turns Alfred from chat into action.
 5. ✅ **Browser bridge + Chrome extension** — Option C (§8: embedded bridge, built-in tools, no MCP; ported from `chrome-mcp`). Plus **vision + image support** — per-conversation workspaces (§6.5), an `image` content part + Gemini `inlineData`, screenshots + web upload, `generate_image`, and a workspace-confined `list_files`/`read_file`/`write_file` trio (spec `docs/specs/2026-06-05-conversation-workspace-and-images.md`).
-6. **Discord bot** — second ingress, same conversation shape, shared memory.
+6. ✅ **Discord bot** — second interactive ingress, same conversation shape, shared memory (`alfred-discord`, discord.js; direct-to-Postgres peer ingress with streamed message edits, button approvals, native question components, images both ways, and slash commands over the shared `@alfred/commands` registry; spec `docs/specs/2026-06-16-discord-bot.md`).
 
 **End of MVP.** Post-MVP, rough priority: **7.** more MCP integrations (Gmail, Calendar, …) one at a time; **8.** voice orchestrator + native iOS app (hands-free, on-device wake-word, cloud STT/TTS); **9.** autonomous triggers — **built** (`alfred-triggers` scheduler + the tiered detection ladder — free deterministic gate → cheap-model triage → full action run — and a durable Web-Push notifications outbox, §9.4 / INGRESSES.md; spec `docs/specs/2026-06-16-autonomous-watchers.md`); **10.** long-term memory — the plain-rows foundation is **built** (`memory_facts` + the `memory` tool family + automatic recall, §6.4); pgvector semantic recall remains the phase-2 upgrade (§17); **11.** backup strategy (§17).
 

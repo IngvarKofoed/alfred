@@ -152,14 +152,13 @@ function Row({
   )
 }
 
-// Non-web ingresses get a small tag so a watcher / Discord / voice thread is distinguishable in
-// the unified list. 'web' (and the transient new-chat row) shows none.
+// A small tag so a watcher / voice thread is distinguishable in the unified list. 'discord' shows
+// NO badge by owner request — Discord conversations belong in the list but don't need a "discord"
+// tag. 'web' (and the transient new-chat row) shows none either.
 function badgeLabel(ingress: string | null): string | null {
   switch (ingress) {
     case 'trigger':
       return 'watcher'
-    case 'discord':
-      return 'discord'
     case 'voice':
       return 'voice'
     default:

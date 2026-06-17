@@ -1,6 +1,6 @@
-import { and, asc, desc, eq, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
-import { type Db } from './client.js'
+import { pgNotify, type Db } from './client.js'
 import {
   agentRuns,
   conversations,
@@ -11,6 +11,7 @@ import {
   pushSubscriptions,
   toolCalls,
   triggers,
+  userInteractions,
   users,
 } from './schema.js'
 
@@ -53,6 +54,41 @@ export async function ensureConversation(
     : insert.onConflictDoNothing())
 }
 
+// Resolve a conversation by its ingress-natural key, returning the (generated) PK. ensureConversation
+// is keyed BY the PK — it can't help an ingress whose natural identifier isn't the conversation uuid.
+// Discord's natural key is the channel id, so the bot maps a DM/guild channel to one long-lived
+// conversation via the unique(ingress, channel_key) index: a channel is a continuous thread across
+// days, not a new conversation per message. Seed the owner (like ensureConversation), then insert the
+// row letting the schema mint a fresh uuidv7 PK; .onConflictDoNothing().returning() yields the new id
+// on first sight and nothing on a re-visit, so on the empty case we SELECT the existing id by the
+// natural key. Returns the conversation id either way.
+export async function getOrCreateConversationByChannel(
+  db: DbOrTx,
+  params: { ingress: string; channelKey: string; title?: string },
+): Promise<string> {
+  await db.insert(users).values({ id: OWNER_USER_ID, displayName: 'Owner' }).onConflictDoNothing()
+  // `title` is set on INSERT only (the creation case); the onConflictDoNothing path never touches it,
+  // so a re-visit keeps the existing title (and a later /rename or auto-title isn't clobbered). The
+  // Discord ingress passes the forum post's own name so a post-backed conversation is named by the
+  // owner's post title — and the worker's auto-title is skipped (title is already non-null).
+  const [inserted] = await db
+    .insert(conversations)
+    .values({
+      userId: OWNER_USER_ID,
+      ingress: params.ingress,
+      channelKey: params.channelKey,
+      ...(params.title ? { title: params.title } : {}),
+    })
+    .onConflictDoNothing()
+    .returning({ id: conversations.id })
+  if (inserted) return inserted.id
+  const [existing] = await db
+    .select({ id: conversations.id })
+    .from(conversations)
+    .where(and(eq(conversations.ingress, params.ingress), eq(conversations.channelKey, params.channelKey)))
+  return existing!.id
+}
+
 // Seed the conversation (touching recency), persist a user message, and create its pending run —
 // the one place this "new user turn" shape lives, shared by the text ingress (POST /messages)
 // and the voice ingress (POST /audio, speak=true). Runs inside the caller's transaction so the
@@ -75,6 +111,44 @@ export async function createUserMessageRun(
     })
     .returning()
   return run!.id
+}
+
+// First-writer-wins interaction resolve (RUNTIME §10.2/§10.3, invariant 5), shared by every
+// ingress that can answer an approval/question. The conditional UPDATE ... WHERE status='pending'
+// IS the race guard: a second resolver, the timeout sweeper, or a cancel cascade all lose against
+// the first writer, which is exactly what keeps a single exit from a pending interaction. On a win
+// it looks up the run's conversation and NOTIFYs `conversation:<id> { interaction_resolved }` so the
+// parked worker wakes and every other surface tears down its prompt UI. Kind-agnostic: it writes
+// whatever `response` jsonb, serving both approvals ({ approved, note }) and questions
+// ({ selected_labels, freeform_text }) — one writer, no drift across ingresses. Returns false (the
+// caller's 409 / "already resolved") when the row was already terminal (no match). resolvedVia is
+// the answering ingress. The NOTIFY uses pgNotify (process-wide pool, like the webserver did
+// inline) — kept after the UPDATE so any woken listener reads the committed terminal row.
+export async function resolveInteraction(
+  db: DbOrTx,
+  id: string,
+  params: { response: unknown; resolvedVia: 'web' | 'discord' | 'voice' },
+): Promise<boolean> {
+  const [row] = await db
+    .update(userInteractions)
+    .set({
+      response: params.response,
+      status: 'resolved',
+      resolvedVia: params.resolvedVia,
+      resolvedAt: new Date(),
+    })
+    .where(and(eq(userInteractions.id, id), eq(userInteractions.status, 'pending')))
+    .returning({ agentRunId: userInteractions.agentRunId })
+  if (!row) return false
+  const [run] = await db
+    .select({ conversationId: agentRuns.conversationId })
+    .from(agentRuns)
+    .where(eq(agentRuns.id, row.agentRunId))
+  await pgNotify(
+    `conversation:${run!.conversationId}`,
+    JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
+  )
+  return true
 }
 
 // Record an out-of-loop LLM call (one the worker/webserver made outside the agent loop —
@@ -267,6 +341,55 @@ export async function getTrigger(
 // agent can report what's scheduled and find the ids to disable/delete.
 export function listTriggers(db: DbOrTx, userId: string): Promise<(typeof triggers.$inferSelect)[]> {
   return db.select().from(triggers).where(eq(triggers.userId, userId)).orderBy(desc(triggers.createdAt))
+}
+
+// Resolve a watcher by its persistent conversation (Discord-conversation-model spec, the
+// load-bearing seam): run.ts looks the trigger up by the run's conversation id rather than the
+// conversation's channelKey, so a recurring watcher whose conversation moved to a Discord forum
+// post still finds its scratchpad. UUID-guarded (a non-UUID conversationId is a clean miss, not a
+// thrown uuid cast — mirrors deleteMemoryFact). Returns the trigger row (or undefined).
+//
+// Invariant: one conversation ⇒ one trigger (each watcher owns its own post conversation; a 'self'
+// trigger owns its originating one). There's no DB-level uniqueness on triggers.conversation_id, so
+// order by created_at asc — first-created wins — to make resolution deterministic if that invariant
+// is ever violated (run.ts keys the scratchpad scope off this). A partial unique index on
+// conversation_id is the stronger guarantee if it ever needs enforcing.
+export async function getTriggerByConversation(
+  db: DbOrTx,
+  conversationId: string,
+): Promise<(typeof triggers.$inferSelect) | undefined> {
+  if (!UUID_RE.test(conversationId)) return undefined
+  const [row] = await db
+    .select()
+    .from(triggers)
+    .where(eq(triggers.conversationId, conversationId))
+    .orderBy(asc(triggers.createdAt))
+    .limit(1)
+  return row
+}
+
+// Repoint a watcher's persistent conversation (Discord-conversation-model spec): the bot sets
+// triggers.conversation_id to the Discord forum-post conversation it created, so the NEXT
+// escalation's run (and run.ts's scratchpad lookup) routes through that post. Owner-agnostic — the
+// bot acts as the owner on the single-user box. Bumps updatedAt like the other trigger mutators.
+//
+// `ifNull` adds `WHERE conversation_id IS NULL` so the UPDATE never overwrites an already-set
+// conversation. detect.ts's legacy backfill passes it: during the one-time migration the bot's
+// reconcile may have already repointed conversation_id at a Discord post, and detect must NOT clobber
+// that (which would transiently drop a fire's Discord delivery + leak a duplicate post). The bot's
+// repoint must win, so detect only backfills when nothing has claimed the slot yet.
+export async function setTriggerConversation(
+  db: DbOrTx,
+  params: { id: string; conversationId: string; ifNull?: boolean },
+): Promise<void> {
+  await db
+    .update(triggers)
+    .set({ conversationId: params.conversationId, updatedAt: new Date() })
+    .where(
+      params.ifNull
+        ? and(eq(triggers.id, params.id), isNull(triggers.conversationId))
+        : eq(triggers.id, params.id),
+    )
 }
 
 // Enable/disable a trigger, owner-scoped (a model-supplied id can't touch another user's row) and

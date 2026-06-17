@@ -2,7 +2,7 @@
 
 Shared TypeScript libraries consumed by `services/` and `clients/web`. See `docs/ARCHITECTURE.md` §6 (data layer) and §7 (agent core) for context.
 
-Contents: `db/` (Drizzle schema + migrations + query helpers), `shared/` (TS types shared across the stack), `agent-core/` (the hand-rolled agent loop, LLM provider abstraction, and unified tool interface).
+Contents: `db/` (Drizzle schema + migrations + query helpers), `shared/` (TS types shared across the stack), `agent-core/` (the hand-rolled agent loop, LLM provider abstraction, and unified tool interface), and `commands/` (the shared chat-command registry — `rename`/`help` + `executeCommand`/`listCommands` — consumed by the webserver's `POST /commands` route and the Discord bot's slash commands, so one registry serves every ingress).
 
 ## Required tools
 

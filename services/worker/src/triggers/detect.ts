@@ -8,6 +8,7 @@ import {
   getDb,
   getTrigger,
   markTriggerFired,
+  setTriggerConversation,
   recordOutOfLoopLlmCall,
   terminateRuns,
   type Db,
@@ -34,10 +35,20 @@ import { runTriage, type TriageUsage } from './triage.js'
 // skip/coalesce (logged, not lost — the next tick re-evaluates the gate). The detect handler never
 // crashes a healthy worker.
 
-// For a recurring watcher (schedule/inbox/webhook) the conversation is persistent and resolved
-// deterministically so channelKey === triggerId (run.ts looks the trigger up by the conversation's
-// channelKey). We use the trigger id as the conversation id too — it's a uuid, collision-free, and
-// stable across fires. A one-shot 'self' trigger instead carries its originating conversationId.
+// Resolve the conversation a fire's Tier-2 run lands in. run.ts now looks the watcher up by the
+// run's conversation id (getTriggerByConversation), so every recurring watcher must have its
+// triggers.conversation_id set — that's what survives the Discord-conversation-model repoint.
+//
+//   - A one-shot 'self' trigger carries its originating conversation id directly.
+//   - A recurring watcher (schedule/inbox/webhook) whose conversation_id is SET (the Discord
+//     forum-post conversation the bot created + repointed) uses it as-is — we do NOT re-ensure it
+//     ingress='trigger' (it's a 'discord' conversation now; createTriggerRun only touches recency,
+//     never clobbering ingress). This is what routes the next escalation into the post.
+//   - A recurring watcher with NO conversation_id (the legacy default, and the unconfigured-Discord
+//     path) falls back to today's exact behavior: derive the trigger id as the conversation id and
+//     ensure it ingress='trigger', channel_key=trigger.id. We ALSO persist conversation_id=trigger.id
+//     so getTriggerByConversation(trigger.id) keeps resolving the watcher in run.ts — without this
+//     the legacy path would lose its scratchpad once run.ts switched off the channelKey lookup.
 async function resolveConversationId(trigger: NonNullable<Awaited<ReturnType<typeof getTrigger>>>): Promise<string> {
   if (trigger.kind === 'self') {
     if (!trigger.conversationId) {
@@ -45,10 +56,21 @@ async function resolveConversationId(trigger: NonNullable<Awaited<ReturnType<typ
     }
     return trigger.conversationId
   }
-  // Recurring watcher: one persistent 'trigger' conversation keyed on the trigger id, so each
-  // fire resolves to the same thread and run.ts can find the trigger by channelKey.
+  // Recurring watcher with a conversation set (Discord forum post, or an already-backfilled legacy
+  // row): route through it, leaving its ingress untouched.
+  if (trigger.conversationId) return trigger.conversationId
+  // Legacy / unconfigured-Discord recurring watcher: derive a 'trigger' conversation keyed on the
+  // trigger id, then backfill triggers.conversation_id = trigger.id so run.ts's by-conversation
+  // lookup finds the watcher (and its scratchpad survives) on this and every subsequent fire.
   const conversationId = trigger.id
-  await ensureConversation(getDb(), conversationId, { ingress: 'trigger', channelKey: trigger.id })
+  const db = getDb()
+  await ensureConversation(db, conversationId, { ingress: 'trigger', channelKey: trigger.id })
+  // ifNull: the bot's reconcile may have repointed conversation_id at a Discord post between our
+  // earlier read and now (one-time migration race). The bot's repoint must win — only backfill when
+  // the slot is still empty, so we never clobber a Discord post (dropping its delivery + leaking a
+  // duplicate). If the bot won, this is a no-op and the resolved conversationId we return is the
+  // legacy 'trigger' conversation for THIS fire only; the next fire re-reads and routes to the post.
+  await setTriggerConversation(db, { id: trigger.id, conversationId, ifNull: true })
   return conversationId
 }
 

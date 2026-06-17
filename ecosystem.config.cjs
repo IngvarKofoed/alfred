@@ -24,6 +24,16 @@ module.exports = {
       autorestart: true,
     },
     {
+      // Second interactive ingress (spec 2026-06-16-discord-bot). Inert-unless-configured: with
+      // no DISCORD_BOT_TOKEN / ALLOWED_DISCORD_USER_ID it logs and idles (doesn't exit), so pm2
+      // autorestart never crash-loops it.
+      name: 'alfred-discord',
+      cwd: __dirname,
+      script: 'services/discord/dist/index.js',
+      env: { NODE_ENV: 'production' },
+      autorestart: true,
+    },
+    {
       name: 'alfred-updater',
       cwd: __dirname,
       script: 'services/updater/dist/index.js',

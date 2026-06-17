@@ -1,5 +1,5 @@
 {
-  "name": "@alfred/webserver",
+  "name": "@alfred/discord",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,13 +9,11 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@alfred/agent-core": "workspace:*",
     "@alfred/commands": "workspace:*",
     "@alfred/db": "workspace:*",
     "@alfred/shared": "workspace:*",
-    "@hono/node-server": "^1.13.0",
+    "discord.js": "^14.16.0",
     "drizzle-orm": "^0.36.4",
-    "hono": "^4.6.0",
     "pg": "^8.13.0"
   },
   "devDependencies": {

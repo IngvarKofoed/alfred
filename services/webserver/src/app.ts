@@ -13,6 +13,7 @@ import {
   OWNER_USER_ID,
   pgNotify,
   recordOutOfLoopLlmCall,
+  resolveInteraction,
   terminateRuns,
   toolCalls,
   tools as toolsTable,
@@ -29,9 +30,9 @@ import {
   loadConfig,
   resolveInWorkspace,
 } from '@alfred/shared'
+import { executeCommand, listCommands } from '@alfred/commands'
 import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
 import { Hono, type Context } from 'hono'
-import { executeCommand, listCommands } from './commands.js'
 import { streamSSE } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
@@ -294,10 +295,10 @@ app.get('/media/:conversationId/:filename', async (c) => {
 // The owner's recent conversations, for the chat-surface history sidebar (web + iOS share this).
 // Newest-active first (the resurrected last_active_at, bumped per message), capped at 100. Selects
 // (id, title, ingress, last_active_at) only — no message join; an untitled row (null title) is
-// labelled "New conversation" by the client. ALL ingresses are included now (one Alfred, one
-// continuous history across surfaces — CONCEPT): web/iOS chat (ingress='web'), autonomous-watcher
-// threads (ingress='trigger'), and future Discord/voice. `ingress` lets the client badge non-web
-// rows and keep the "/" redirect from landing in a watcher thread.
+// labelled "New conversation" by the client. ALL ingresses are included (one Alfred, one continuous
+// history across surfaces — CONCEPT): web/iOS chat (ingress='web'), Discord forum posts + watcher
+// posts (ingress='discord'), autonomous-watcher threads (ingress='trigger'), and future voice. The
+// client uses `ingress` only to badge 'trigger'/'voice' rows — Discord rows are shown un-badged.
 app.get('/api/conversations', async (c) => {
   const rows = await getDb()
     .select({
@@ -506,31 +507,17 @@ async function resolveQuestion(c: Context, db: ReturnType<typeof getDb>, id: str
   return c.json({ ok: true })
 }
 
-// First-writer-wins resolve, shared by both kinds: claim the still-pending row (the conditional
-// UPDATE is the race guard — a second resolver or the timeout sweeper loses), write the
-// kind-specific response, and NOTIFY the conversation so the parked worker wakes and every
-// ingress tears down its prompt UI (§10.3). Returns false (caller → 409) if the row was
-// already resolved/timed_out.
-async function writeResolution(
+// First-writer-wins resolve for the web ingress: the conditional UPDATE + NOTIFY now lives in
+// @alfred/db's resolveInteraction (one writer shared with the Discord ingress, no drift); this is
+// the thin web caller that supplies resolvedVia:'web'. Both resolveApproval and resolveQuestion
+// route through it, keeping their own kind-specific validation (and the approval "remember" side
+// effect) above. Returns false (caller → 409) if the row was already resolved/timed_out.
+function writeResolution(
   db: ReturnType<typeof getDb>,
   id: string,
   response: unknown,
 ): Promise<boolean> {
-  const [row] = await db
-    .update(userInteractions)
-    .set({ response, status: 'resolved', resolvedVia: 'web', resolvedAt: new Date() })
-    .where(and(eq(userInteractions.id, id), eq(userInteractions.status, 'pending')))
-    .returning({ agentRunId: userInteractions.agentRunId })
-  if (!row) return false
-  const [run] = await db
-    .select({ conversationId: agentRuns.conversationId })
-    .from(agentRuns)
-    .where(eq(agentRuns.id, row.agentRunId))
-  await pgNotify(
-    `conversation:${run!.conversationId}`,
-    JSON.stringify({ type: 'interaction_resolved', interactionId: id }),
-  )
-  return true
+  return resolveInteraction(db, id, { response, resolvedVia: 'web' })
 }
 
 // Single writer for the owner's per-tool approval setting (tools.require_approval), shared by
