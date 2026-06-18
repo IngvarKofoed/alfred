@@ -12,14 +12,15 @@ import {
   RetryProvider,
   runAgent,
   speechLlmCallFields,
+  stripMarkdownForSpeech,
   TracingProvider,
   type TtsProvider,
+  TTS_MIN_SENTENCE_CHARS,
 } from '@alfred/agent-core'
 import { agentRuns, conversations, getDb, getTriggerByConversation, insertNotification, llmCalls, messages, OWNER_USER_ID, pgNotify, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
-import { loadConfig } from '@alfred/shared'
+import { loadConfig, writeAudioToWorkspace } from '@alfred/shared'
 import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
-import { writeAudioToWorkspace } from './audio.js'
 import { buildRunTools } from './catalog.js'
 import { notifyRun } from './events.js'
 import { type ImageRef, writeImageToWorkspace } from './images.js'
@@ -28,30 +29,6 @@ import { rowsToMessages, textOf } from './messages.js'
 // MVP approval window (§10.4): a deliberate shortening of the 24h default. The pg-boss
 // lease sits just above it so a job blocked on approval outlives the timeout.
 const APPROVAL_TIMEOUT_MS = 60 * 60 * 1000
-
-// Voice TTS (run.speak, spec 2026-06-14): flush a sentence to synthesis once it ends on a
-// .!?/newline boundary AND is at least this long, so a tiny fragment ("Hi.") still speaks but
-// an abbreviation mid-sentence doesn't trigger a premature, choppy clip.
-const TTS_MIN_SENTENCE_CHARS = 12
-
-// Strip light markdown so the spoken text reads as plain prose, not symbols ("star star bold").
-// Best-effort and conservative — emphasis/heading/code markers, link/image syntax (keep the
-// visible label, drop the URL). Not a full markdown parser; the model's prose is mostly plain.
-function stripMarkdownForSpeech(text: string): string {
-  return (
-    text
-      // images then links: ![alt](url) / [label](url) -> alt / label
-      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
-      // fenced/inline code fences -> drop the backticks, keep the content
-      .replace(/`+/g, '')
-      // emphasis/bold markers and leading heading hashes/blockquote markers
-      .replace(/[*_~]+/g, '')
-      .replace(/^\s{0,3}#{1,6}\s+/gm, '')
-      .replace(/^\s{0,3}>\s?/gm, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-  )
-}
 
 // Minimal system prompt for now; full persona assembly (§7.5) is deferred.
 const SYSTEM_PROMPT =

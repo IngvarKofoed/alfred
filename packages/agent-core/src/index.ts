@@ -38,6 +38,13 @@ export {
   makeTtsProvider,
 } from './speech-provider.js'
 export {
+  stripMarkdownForSpeech,
+  splitIntoSpeechChunks,
+  synthesizeSpeech,
+  synthesizeToClip,
+  TTS_MIN_SENTENCE_CHARS,
+} from './speech.js'
+export {
   type Notifier,
   type NotificationPayload,
   type PushSubscription,

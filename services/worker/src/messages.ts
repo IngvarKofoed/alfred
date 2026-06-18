@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import type { ContentPart, Message, Role } from '@alfred/agent-core'
-import { resolveInWorkspace } from '@alfred/shared'
+import { resolveInWorkspace, textFromContent } from '@alfred/shared'
 
 // messages.content is stored as the agent-core ContentPart[]. Images are persisted as a
 // workspace reference { type:'image', path, mimeType } (Postgres stays blob-free, the spec's
@@ -51,5 +51,5 @@ export async function rowsToMessages(
 }
 
 export function textOf(content: ContentPart[]): string {
-  return content.map((p) => (p.type === 'text' ? p.text : '')).join('')
+  return textFromContent(content)
 }

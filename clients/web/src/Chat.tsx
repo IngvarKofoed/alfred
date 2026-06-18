@@ -191,6 +191,21 @@ export default function Chat({
   // Whether to keep pinning to the bottom; false once the user scrolls up to read.
   const stick = useRef(true)
 
+  // /speak playback: a single HTMLAudioElement plays the streamed clips in seq order, advancing
+  // on 'ended'. speakAudioRef holds the element currently playing; speakEpochRef bumps on each
+  // fresh /speak so a stale stream's late clips (and the prior audio) are abandoned. Stop the
+  // current audio + invalidate any in-flight stream when the conversation changes or unmounts.
+  const speakAudioRef = useRef<HTMLAudioElement | null>(null)
+  const speakEpochRef = useRef(0)
+  useEffect(
+    () => () => {
+      speakEpochRef.current++
+      speakAudioRef.current?.pause()
+      speakAudioRef.current = null
+    },
+    [conversationId],
+  )
+
   const loadHistory = () =>
     fetch(`/api/conversations/${conversationId}/messages`)
       .then((r) => r.json() as Promise<{ messages: ChatMessage[] }>)
@@ -434,8 +449,16 @@ export default function Chat({
         note?: string
         error?: string
         conversation?: { title: string }
+        action?: 'speak'
       }
       if (r.conversation?.title) onTitleChange(r.conversation.title)
+      // The `speak` command returns an action directive instead of a note: open the read-out
+      // stream (don't also push note/error — the directive IS the result). The "🔊 Speaking…" /
+      // "nothing to read" feedback is pushed inside speakLastReply once the route responds.
+      if (r.action === 'speak') {
+        void speakLastReply()
+        return
+      }
       pushSystemNote(r.note ?? r.error ?? 'Command failed')
       return
     }
@@ -465,6 +488,110 @@ export default function Chat({
         ...h,
         { role: 'assistant', content: [{ type: 'text', text: `⚠️ ${error ?? 'request failed'}` }] },
       ])
+    }
+  }
+
+  // Read out the last assistant reply (the /speak command). POSTs to the streaming route, reads
+  // its NDJSON body, and plays the returned clips through ONE ordered HTMLAudioElement queue (next
+  // clip plays on the previous one's 'ended'). Clips arrive in seq order on the stream, so they're
+  // enqueued and played in arrival order. A fresh /speak bumps the epoch, stopping the prior
+  // playback before this one starts; an { error } line surfaces a system note and stops.
+  const speakLastReply = async () => {
+    const epoch = ++speakEpochRef.current
+    // Stop any audio still playing from a prior /speak in this conversation.
+    speakAudioRef.current?.pause()
+    speakAudioRef.current = null
+
+    // FIFO queue of clip paths + a single advancing player. playNext pulls the head and plays it;
+    // 'ended'/'error' advances. `playing` guards against starting a second element while one is
+    // active. `gotClip` tracks whether anything actually played, so an error reports honestly.
+    const queue: string[] = []
+    let playing = false
+    let gotClip = false
+    const advance = (audio: HTMLAudioElement) => {
+      // Drop both listeners off the finished element before moving on, so a read-out (especially
+      // one with failing clips) doesn't accumulate dangling listeners holding the closure alive.
+      audio.removeEventListener('ended', onClipDone)
+      audio.removeEventListener('error', onClipDone)
+      playNext()
+    }
+    function onClipDone(this: HTMLAudioElement) {
+      advance(this)
+    }
+    const playNext = () => {
+      if (epoch !== speakEpochRef.current) return // a newer /speak superseded this one
+      const path = queue.shift()
+      if (!path) {
+        playing = false
+        speakAudioRef.current = null
+        return
+      }
+      playing = true
+      const audio = new Audio(`/media/${conversationId}/${path}`)
+      speakAudioRef.current = audio
+      audio.addEventListener('ended', onClipDone)
+      // A clip that fails to load/play shouldn't stall the queue — advance past it.
+      audio.addEventListener('error', onClipDone)
+      void audio.play().catch(() => {})
+    }
+    const enqueue = (path: string) => {
+      gotClip = true
+      queue.push(path)
+      if (!playing) playNext()
+    }
+
+    try {
+      const res = await fetch(`/api/conversations/${conversationId}/speak`, { method: 'POST' })
+      if (!res.ok || !res.body) {
+        // 422 = nothing to read out (a neutral note, not an error); anything else is a failure.
+        const { error } = (await res.json().catch(() => ({}))) as { error?: string }
+        if (epoch === speakEpochRef.current) {
+          pushSystemNote(res.status === 422 ? (error ?? 'Nothing to read out yet.') : `⚠️ ${error ?? 'Could not read that out.'}`)
+        }
+        return
+      }
+      if (epoch === speakEpochRef.current) pushSystemNote('🔊 Speaking…')
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      // Parse newline-delimited JSON: accumulate, split on '\n', handle each complete line, keep
+      // the trailing partial in the buffer for the next chunk; flush whatever remains at EOF.
+      const handleLine = (line: string) => {
+        const trimmed = line.trim()
+        if (!trimmed) return
+        let msg: { seq?: number; path?: string; mimeType?: string; error?: string }
+        try {
+          msg = JSON.parse(trimmed)
+        } catch {
+          return // a malformed line shouldn't abort the read-out
+        }
+        if (msg.error) {
+          // "Some of that" only if at least one clip played; otherwise nothing was read out.
+          if (epoch === speakEpochRef.current) {
+            pushSystemNote(gotClip ? '⚠️ Some of that could not be read out.' : '⚠️ Could not read that out.')
+          }
+          return
+        }
+        if (msg.path) enqueue(msg.path)
+      }
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (epoch !== speakEpochRef.current) {
+          // A newer /speak superseded this one — stop reading and let it own playback.
+          void reader.cancel().catch(() => {})
+          return
+        }
+        buf += decoder.decode(value, { stream: true })
+        let nl: number
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          handleLine(buf.slice(0, nl))
+          buf = buf.slice(nl + 1)
+        }
+      }
+      handleLine(buf)
+    } catch {
+      if (epoch === speakEpochRef.current) pushSystemNote('⚠️ Could not read that out.')
     }
   }
 

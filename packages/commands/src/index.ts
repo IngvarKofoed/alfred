@@ -7,8 +7,15 @@ import { ensureConversation, type Db } from '@alfred/db'
 export type CommandContext = { conversationId: string; db: Db }
 
 // Effects the client should apply (a `conversation` echo updates the header) plus the inline
-// note/error it renders as an ephemeral system line.
-export type CommandResult = { note?: string; error?: string; conversation?: { title: string } }
+// note/error it renders as an ephemeral system line. `action` is an ingress-interpreted directive
+// (e.g. 'speak' ⇒ open the read-out stream); the package stays a pure @alfred/db-only registry —
+// it decides WHETHER to act, the ingress decides HOW (spec 2026-06-18-read-out-command).
+export type CommandResult = {
+  note?: string
+  error?: string
+  conversation?: { title: string }
+  action?: 'speak'
+}
 
 export type Command = {
   name: string
@@ -46,8 +53,21 @@ const help: Command = {
   },
 }
 
+const speak: Command = {
+  name: 'speak',
+  aliases: ['read'],
+  description: 'Read out the last reply aloud.',
+  usage: '/speak',
+  async run() {
+    // No synthesis or DB read here — hand the ingress a 'speak' directive and let the read-out
+    // route be the single authority on whether there's anything to read (its 422 surfaces
+    // "Nothing to read out yet."), so the message isn't loaded twice per /speak.
+    return { action: 'speak' }
+  },
+}
+
 // The single source of truth: the registry /help derives from and executeCommand dispatches on.
-export const COMMANDS: Command[] = [rename, help]
+export const COMMANDS: Command[] = [rename, help, speak]
 
 // Public metadata for the command catalog (served at GET /api/commands so the web client can
 // render autocomplete suggestions). Derived from the same registry, so the suggestions can

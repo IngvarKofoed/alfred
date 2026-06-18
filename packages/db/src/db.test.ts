@@ -7,9 +7,11 @@ import {
   deleteTrigger,
   insertMemoryFact,
   insertTrigger,
+  latestRunIdForConversation,
   listEnabledTriggers,
   listMemoryFacts,
   listTriggers,
+  readLastAssistantText,
   readMemoryFacts,
   setTriggerEnabled,
 } from './queries.js'
@@ -307,5 +309,76 @@ describe.skipIf(!url)('trigger management', () => {
     expect(observed!.firstDelete).toEqual({ deleted: true })
     expect(observed!.secondDelete).toEqual({ deleted: false }) // idempotent on a missing row
     expect(observed!.after).toEqual([])
+  })
+})
+
+// Integration test for the /speak read-out helpers (spec 2026-06-18-read-out-command):
+// readLastAssistantText returns the newest assistant turn's text (skipping a later tool-only /
+// empty assistant turn) and null when there's none; latestRunIdForConversation returns the
+// newest run id (uuidv7-ordered) or null. Same rollback pattern, so the DB stays pristine.
+describe.skipIf(!url)('read-out helpers', () => {
+  it('reads the last non-empty assistant text and the latest run id', async () => {
+    const db = createDb(url!)
+    const ROLLBACK = Symbol('rollback')
+    let observed:
+      | {
+          emptyConvText: string | null
+          emptyConvRun: string | null
+          text: string | null
+          latestRun: string | null
+          secondRunId: string
+        }
+      | undefined
+
+    try {
+      await db.transaction(async (tx) => {
+        const [user] = await tx.insert(users).values({ displayName: 'Owner' }).returning()
+        const [conv] = await tx
+          .insert(conversations)
+          .values({ userId: user!.id, ingress: 'web', channelKey: crypto.randomUUID() })
+          .returning()
+
+        // A fresh conversation: no assistant text, no run yet.
+        const emptyConvText = await readLastAssistantText(tx, conv!.id)
+        const emptyConvRun = await latestRunIdForConversation(tx, conv!.id)
+
+        // user -> assistant(text) -> assistant(tool-only, no text). The newest assistant turn has
+        // no text part, so readLastAssistantText must skip it and return the earlier reply.
+        await tx
+          .insert(messages)
+          .values({ conversationId: conv!.id, role: 'user', content: [{ type: 'text', text: 'hi' }] })
+        await tx.insert(messages).values({
+          conversationId: conv!.id,
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Hello there, friend.' }],
+        })
+        await tx.insert(messages).values({
+          conversationId: conv!.id,
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 't1', name: 'echo', args: {} }],
+        })
+
+        // Two runs; the second (uuidv7, inserted later) is the "latest".
+        await tx.insert(agentRuns).values({ conversationId: conv!.id, status: 'done' })
+        const [second] = await tx
+          .insert(agentRuns)
+          .values({ conversationId: conv!.id, status: 'done' })
+          .returning()
+
+        const text = await readLastAssistantText(tx, conv!.id)
+        const latestRun = await latestRunIdForConversation(tx, conv!.id)
+
+        observed = { emptyConvText, emptyConvRun, text, latestRun, secondRunId: second!.id }
+        throw ROLLBACK // abort the transaction so the DB stays pristine
+      })
+    } catch (err) {
+      if (err !== ROLLBACK) throw err
+    }
+
+    expect(observed).toBeDefined()
+    expect(observed!.emptyConvText).toBeNull()
+    expect(observed!.emptyConvRun).toBeNull()
+    expect(observed!.text).toBe('Hello there, friend.') // skipped the tool-only newest turn
+    expect(observed!.latestRun).toBe(observed!.secondRunId)
   })
 })

@@ -1,5 +1,4 @@
-import { extForImageMime } from '@alfred/shared'
-import { writeBytesToWorkspace } from './workspace-files.js'
+import { extForImageMime, writeBytesToWorkspace } from '@alfred/shared'
 
 // A persisted image reference — the DB/wire form (Postgres stays blob-free, the spec's
 // Approach A). The inline base64 lives only in agent-core's `image` ContentPart in memory.

@@ -7,11 +7,13 @@ import {
   enqueueTriggerDetect,
   getDb,
   getTrigger,
+  latestRunIdForConversation,
   listTriggers,
   llmCalls,
   messages,
   OWNER_USER_ID,
   pgNotify,
+  readLastAssistantText,
   recordOutOfLoopLlmCall,
   resolveInteraction,
   terminateRuns,
@@ -20,7 +22,13 @@ import {
   upsertPushSubscription,
   userInteractions,
 } from '@alfred/db'
-import { makeSttProvider, speechLlmCallFields, type SpeechUsage } from '@alfred/agent-core'
+import {
+  makeSttProvider,
+  speechLlmCallFields,
+  splitIntoSpeechChunks,
+  synthesizeToClip,
+  type SpeechUsage,
+} from '@alfred/agent-core'
 import {
   APP_VERSION,
   audioMimeForExt,
@@ -33,7 +41,7 @@ import {
 import { executeCommand, listCommands } from '@alfred/commands'
 import { and, asc, count, desc, eq, inArray, sql, sum, type SQL } from 'drizzle-orm'
 import { Hono, type Context } from 'hono'
-import { streamSSE } from 'hono/streaming'
+import { streamSSE, streamText } from 'hono/streaming'
 import { createReadStream } from 'node:fs'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -267,6 +275,76 @@ app.post('/api/conversations/:id/audio', async (c) => {
 
   await enqueueAgentRun(runId)
   return c.json({ runId, transcript })
+})
+
+// Read out the last assistant reply on demand (spec 2026-06-18). The `/speak` command dispatches
+// here after readLastAssistantText confirms there's something to read. This is a RUN-FREE path: no
+// pg-boss job, no agent loop, no one-active-run conflict — the webserver synthesizes the reply's
+// sentences itself (it already depends on @alfred/agent-core for STT) and streams clip refs back as
+// each is ready, so the client can start playing clip 0 while later clips synthesize.
+//
+// Response is a stream of newline-delimited JSON: { seq, path, mimeType } per clip in order, or an
+// { error } line if synthesis fails (then the stream ends). The null check is BEFORE the stream so
+// "nothing to read out" is a clean 422, not a stream that opens then immediately errors.
+app.post('/api/conversations/:id/speak', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+
+  const text = await readLastAssistantText(getDb(), conversationId)
+  if (!text) return c.json({ error: 'Nothing to read out yet.' }, 422)
+
+  const chunks = splitIntoSpeechChunks(text)
+  // The request's AbortSignal: when the client supersedes this read-out (a fresh /speak bumps the
+  // epoch and cancels the reader), switches conversation, or unmounts, stop synthesizing so we
+  // don't keep making billed TTS calls + workspace writes for audio nobody will play.
+  const signal = c.req.raw.signal
+  return streamText(c, async (stream) => {
+    let aggUsage: SpeechUsage | undefined
+    for (let seq = 0; seq < chunks.length; seq++) {
+      if (signal.aborted) break
+      try {
+        const clip = await synthesizeToClip(conversationId, chunks[seq]!, { signal })
+        // Null = the chunk stripped to nothing (markdown-only); skip it, no clip line.
+        if (!clip) continue
+        if (clip.usage) {
+          aggUsage = aggUsage
+            ? {
+                model: aggUsage.model,
+                promptTokens: (aggUsage.promptTokens ?? 0) + (clip.usage.promptTokens ?? 0),
+                completionTokens: (aggUsage.completionTokens ?? 0) + (clip.usage.completionTokens ?? 0),
+              }
+            : clip.usage
+        }
+        await stream.write(JSON.stringify({ seq, path: clip.path, mimeType: clip.mimeType }) + '\n')
+      } catch (err) {
+        if (signal.aborted) break
+        // A missing/failed TTS provider key (or a synth error) surfaces here, not at boot. Tell the
+        // client the read-out is unavailable and stop — partial audio already played is fine.
+        console.error('[speak] TTS synthesis failed:', err)
+        await stream.write(JSON.stringify({ error: 'speech_unavailable' }) + '\n')
+        break
+      }
+    }
+
+    // Attribute the aggregated TTS cost to the conversation's most recent run (the CHANGELOG-76
+    // out-of-loop pattern: a synthetic 'tts' tool_calls row + a linked llm_calls row). There's no
+    // message→run FK, so "latest run" is the pragmatic anchor; it will NOT re-sum into that run's
+    // already-rolled-up agent_runs.cost_usd, but shows per-call on /debug. Best-effort — a failure
+    // here (or no usage, e.g. ElevenLabs) must never fail the read-out.
+    if (aggUsage) {
+      try {
+        const runId = await latestRunIdForConversation(getDb(), conversationId)
+        if (runId) {
+          await recordOutOfLoopLlmCall(getDb(), {
+            runId,
+            ...speechLlmCallFields(aggUsage, 'tts', { detail: `${chunks.length} chunks` }),
+          })
+        }
+      } catch (err) {
+        console.error('[speak] TTS cost record failed:', err)
+      }
+    }
+  })
 })
 
 // Serve a file from the conversation's workspace (the UI fetches images here after a run).

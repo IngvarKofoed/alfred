@@ -1,3 +1,4 @@
+import { textFromContent } from '@alfred/shared'
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm'
 import { OWNER_USER_ID } from './constants.js'
 import { pgNotify, type Db } from './client.js'
@@ -579,4 +580,44 @@ export async function deletePushSubscription(db: DbOrTx, endpoint: string): Prom
     .where(eq(pushSubscriptions.endpoint, endpoint))
     .returning({ id: pushSubscriptions.id })
   return { deleted: deleted.length > 0 }
+}
+
+// The text of the conversation's most recent NON-EMPTY assistant message — the unit the /speak
+// command (spec 2026-06-18-read-out-command) re-speaks. messages.content is jsonb ContentPart[]
+// (DATABASE.md §6.1); we join the text of its `type:'text'` parts and skip tool-only / empty
+// assistant turns (mirroring Chat.tsx's showName, which walks past them). Scans the latest few
+// assistant rows (newest first) and returns the first with non-empty text, else null. Ordered by
+// (createdAt desc, id desc) so same-timestamp rows are still deterministic by the uuidv7 id.
+export async function readLastAssistantText(
+  db: DbOrTx,
+  conversationId: string,
+): Promise<string | null> {
+  const rows = await db
+    .select({ content: messages.content })
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), eq(messages.role, 'assistant')))
+    .orderBy(desc(messages.createdAt), desc(messages.id))
+    .limit(10)
+  for (const row of rows) {
+    const text = textFromContent(row.content).trim()
+    if (text) return text
+  }
+  return null
+}
+
+// The id of the conversation's most recent agent_run, or null if it has none. agent_runs ids are
+// uuidv7 (time-ordered), so `order by id desc` is "newest run" without a started_at join — the
+// same trick the /debug endpoint uses. Used by /speak to anchor its out-of-loop TTS cost row on
+// the latest run (there's no message -> run FK, so latest-run is the pragmatic anchor).
+export async function latestRunIdForConversation(
+  db: DbOrTx,
+  conversationId: string,
+): Promise<string | null> {
+  const [row] = await db
+    .select({ id: agentRuns.id })
+    .from(agentRuns)
+    .where(eq(agentRuns.conversationId, conversationId))
+    .orderBy(desc(agentRuns.id))
+    .limit(1)
+  return row?.id ?? null
 }

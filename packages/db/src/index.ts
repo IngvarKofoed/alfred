@@ -30,6 +30,8 @@ export {
   listPushSubscriptions,
   upsertPushSubscription,
   deletePushSubscription,
+  readLastAssistantText,
+  latestRunIdForConversation,
   type DbOrTx,
 } from './queries.js'
 export {

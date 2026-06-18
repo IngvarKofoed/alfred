@@ -103,7 +103,9 @@ final class VoiceController {
 
     // Endpointing constants (energy-based; tuned for AEC'd voice-chat input).
     private let energyThreshold: Float = 0.012          // RMS over which a frame counts as speech.
-    private let trailingSilenceToEnd: TimeInterval = 1.2 // silence after speech → utterance end.
+    private let trailingSilenceToEnd: TimeInterval = 0.5 // silence after speech → utterance end.
+                                                         // Aggressive for snappy time-to-first-word;
+                                                         // raise if it endpoints on mid-sentence pauses.
     private let minUtterance: TimeInterval = 0.3         // ignore blips shorter than this.
     private let maxUtterance: TimeInterval = 30.0        // hard cap on a single capture.
 
