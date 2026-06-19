@@ -14,6 +14,7 @@
     "db:start": "\"${ALFRED_PG_CTL:-/opt/homebrew/opt/postgresql@17/bin/pg_ctl}\" -D \"${ALFRED_PGDATA:-/opt/homebrew/var/postgresql@17}\" -l /tmp/alfred-pg.log start",
     "db:stop": "\"${ALFRED_PG_CTL:-/opt/homebrew/opt/postgresql@17/bin/pg_ctl}\" -D \"${ALFRED_PGDATA:-/opt/homebrew/var/postgresql@17}\" stop",
     "db:migrate": "pnpm --filter @alfred/db db:migrate",
+    "env:sync": "node scripts/sync-env.mjs",
     "predev": "pnpm --filter \"./packages/*\" build",
     "dev": "concurrently -k -n worker,server,web,discord -c green,cyan,magenta,blue \"pnpm --filter @alfred/worker dev\" \"pnpm --filter @alfred/webserver dev\" \"pnpm --filter @alfred/web dev\" \"pnpm --filter @alfred/discord dev\"",
     "dev:up": "pnpm db:start || echo db already running && pnpm db:migrate && pnpm dev",
