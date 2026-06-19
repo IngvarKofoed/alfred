@@ -26,9 +26,19 @@ Every change you make to this repository must be recorded in `docs/CHANGELOG.md`
 
 - Each entry is numbered with a monotonically increasing integer (1, 2, 3, ...). Never reuse or reorder numbers.
 - Append new entries to the end of the file.
-- Keep entries short and to the point — one line where possible, a few lines at most. Focus on *what* changed, not how.
+- Write each entry as **durable project memory, not a recap of the diff**: record what is now *true that wasn't before* — new behavior, state, or rule — plus, in a clause and only when it isn't obvious, the *why*, the alternative you rejected (so a future agent doesn't re-introduce it), or a known limit / deferred follow-up. Skip filenames, mechanical edits, and refactors with no behavior change; the diff and commit already hold those. Self-check: *if a future agent reads this entry before the code, does it learn what changed, why it matters, or what's now safe to assume?* If not, it's noise.
+- Keep each entry to **1–5 lines, ~20 words per line at most**. The changelog is read at session start to orient — that only works if it stays scannable. The failure mode to avoid is cramming everything onto one unbroken line: a 40-word run-on isn't a short entry, it just hides the bulk on a single line. Break it into a few short lines instead; and if it sprawls past ~5 lines, that's a signal it's really several changes — give each its own numbered entry.
 - Write the entry as part of the same change. Do not batch multiple changes into one entry, and do not skip entries.
 - When a phase/increment completes, its per-task entries move to `docs/CHANGELOG-archive.md`, leaving only the milestone summary in `docs/CHANGELOG.md`. Numbers are globally unique across both files — never reuse one that already appears in either.
+
+Same change, bad vs. good entry:
+
+- **Bad** (short, but just recaps the diff — zero orientation value): `42. Updated auth files, reworked middleware, added tests, renamed AuthHelper.`
+- **Good** (states what's now true, with the why in a clause):
+  ```
+  42. Auth now rejects expired refresh tokens before session lookup; stale sessions can no longer silently renew.
+      Validated at the middleware boundary so handlers can assume requests are current.
+  ```
 
 ## Nested guidance
 
@@ -42,15 +52,19 @@ Each major subtree has its own `CLAUDE.md` with scoped tool/skill rules — read
 
 ## After making changes
 
-After a non-trivial edit, invoke the **`code-review`** skill with the `high` argument to review the touched code for correctness, reuse, clarity, and efficiency. It does not auto-trigger — you must invoke it explicitly.
+After a non-trivial edit, invoke the **`code-review`** skill with the `high --fix` arguments to review the touched code for correctness, reuse, clarity, and efficiency, then apply every finding to the working tree automatically. It does not auto-trigger — you must invoke it explicitly.
 
-Once the review returns, do not start fixing findings immediately. Instead:
+Once the fixes are applied, report what changed:
 
-1. **Group findings by severity** — blockers (correctness bugs, data loss, security), should-fix (clear improvements, missed reuse), nits (style, naming, minor clarity).
-2. **Summarize each bucket in one line** so the user can see what's in it without expanding every finding.
-3. **Ask the user which to fix** via `AskUserQuestion` with `multiSelect: true`. Options are the severity buckets ("Blockers (N)", "Should-fix (N)", "Nits (N)"), plus a "None — leave as is" option. Skip buckets that are empty.
-4. If a single bucket has more findings than fit cleanly into one label, list each finding as its own option (up to 4 per question; chunk into follow-up questions if more).
-5. Apply only the selected fixes. Re-run `code-review` only if the user asks.
+1. **Group the applied fixes by severity** — blockers (correctness bugs, data loss, security), should-fix (clear improvements, missed reuse), nits (style, naming, minor clarity).
+2. **Summarize each bucket in one line** so the user can see what was fixed without expanding every finding.
+3. Do not stop to ask which to fix — all findings are fixed by default. The user can review the diff and revert anything they disagree with.
+
+## Git workflow
+
+**Direct to `main`** — when you commit, commit straight to `main`; don't open branches or PRs unless asked. Leave pushing to the user unless you're asked to push.
+
+**This setting only chooses *where* commits go — not *when* to make them.** Commit only when the user asks; finishing a change is not a cue to commit it. When you do commit, each commit is one complete change including its `docs/CHANGELOG.md` entry — never leave the tree half-committed.
 
 <!-- Add additional sections below as the project develops:
   - Project-specific forcing rules (e.g., "Check in with the user before making CSS / layout / UX changes")
