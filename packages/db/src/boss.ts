@@ -80,28 +80,11 @@ export async function workTriggerDetects(handler: (job: TriggerDetectJob) => Pro
   })
 }
 
-// Register a recurring trigger-detect via pg-boss cron scheduling (first use of boss.schedule in
-// the codebase). Kept inside @alfred/db so the triggers slice never touches PgBoss directly,
-// matching the "consumers never touch PgBoss" rule. pg-boss keys a schedule by queue name, so the
-// triggers slice carries the trigger id in `data` (the detect handler reads job.data.triggerId).
-export async function scheduleTrigger(
-  name: string,
-  cron: string,
-  data: TriggerDetectJob,
-  tz?: string,
-): Promise<void> {
-  const b = await getBoss()
-  // pg-boss evaluates cron in `tz` (an IANA zone) when given, else UTC — so the owner's "8am" means
-  // 8am in their zone. The triggers scheduler passes TRIGGER_TZ.
-  await b.schedule(name, cron, data, { retryLimit: 0, expireInSeconds: 4500, ...(tz ? { tz } : {}) })
-}
-
-// Clear the trigger-detect schedule on boot so the triggers scheduler can re-register from the
-// current enabled rows (fail-and-restart: re-read truth, don't trust prior state).
-export async function unscheduleAll(): Promise<void> {
-  const b = await getBoss()
-  await b.unschedule(TRIGGER_DETECT_QUEUE).catch(() => {}) // no-op if nothing scheduled
-}
+// NOTE: cron timing for recurring automations is NOT done via pg-boss scheduling. pg-boss v10 keys a
+// schedule by queue name and requires that queue to exist, which doesn't fit "N automations → one
+// shared trigger-detect consumer." The pure scheduler (alfred-triggers) owns the cron clock
+// in-process (Croner) and calls enqueueTriggerDetect on each tick — so there are no scheduleTrigger /
+// unscheduleAll helpers here.
 
 // §10.9 invariant 4 in one implementation: flip the runs matched by `where` to a terminal
 // status, then — in the same transaction — cascade: every non-terminal tool_call → failed,

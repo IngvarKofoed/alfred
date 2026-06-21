@@ -1,9 +1,11 @@
 import { textFromContent } from '@alfred/shared'
-import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, sql } from 'drizzle-orm'
+import { uuidv7 } from 'uuidv7'
 import { OWNER_USER_ID } from './constants.js'
 import { pgNotify, type Db } from './client.js'
 import {
   agentRuns,
+  automations,
   conversations,
   llmCalls,
   memoryFacts,
@@ -11,7 +13,6 @@ import {
   notifications,
   pushSubscriptions,
   toolCalls,
-  triggers,
   userInteractions,
   users,
 } from './schema.js'
@@ -283,19 +284,24 @@ export async function deleteMemoryFact(
   return { deleted: deleted.length > 0 }
 }
 
-// ---- Triggers (autonomous watchers, spec 2026-06-16) ----
+// ---- Automations (autonomous watchers; trigger-abstraction spec 2026-06-19) ----
+//
+// An automation = a chosen Trigger (`trigger`) + its `params` + the action (`objective`) + notify
+// policy + cursor state (was the `triggers` table). The `cursor`/`pending_cursor` jsonb columns
+// hold the opaque per-Trigger detection cursor: the framework only stages/commits it, all cursor
+// semantics live in the worker Trigger's detect().
 
-// Insert a watcher row (used by the `schedule_self` tool in the worker). `notifyPolicy` defaults
-// 'on_change' (any escalation pushes). Returns the new id so the agent can reference it.
-export async function insertTrigger(
+// Insert an automation row (used by the `create_automation` tool in the worker). `notifyPolicy`
+// defaults 'on_change' (any escalation pushes). Returns the new id so the agent can reference it.
+export async function insertAutomation(
   db: DbOrTx,
   params: {
     userId: string
     name: string
-    kind: 'schedule' | 'inbox' | 'webhook' | 'self'
+    trigger: string // the Trigger name: 'email' | 'timer' | 'webhook'
     conversationId?: string | null
     schedule?: string | null
-    gate?: unknown
+    params?: unknown // the Trigger's params, validated against its paramsSchema before insert
     triage?: unknown
     objective: string
     notifyPolicy?: string
@@ -304,113 +310,106 @@ export async function insertTrigger(
   },
 ): Promise<{ id: string }> {
   const [row] = await db
-    .insert(triggers)
+    .insert(automations)
     .values({
       userId: params.userId,
       name: params.name,
-      kind: params.kind,
+      trigger: params.trigger,
       conversationId: params.conversationId ?? null,
       schedule: params.schedule ?? null,
-      gate: params.gate ?? null,
+      params: params.params ?? null,
       triage: params.triage ?? null,
       objective: params.objective,
       notifyPolicy: params.notifyPolicy ?? 'on_change',
       nextFireAt: params.nextFireAt ?? null,
       sourceRunId: params.sourceRunId ?? null,
     })
-    .returning({ id: triggers.id })
+    .returning({ id: automations.id })
   return { id: row!.id }
 }
 
 // All enabled rows for a user — read by the triggers scheduler at boot to register schedules.
-// Full rows so the scheduler has kind / schedule / nextFireAt.
-export function listEnabledTriggers(db: DbOrTx, userId: string): Promise<(typeof triggers.$inferSelect)[]> {
-  return db.select().from(triggers).where(and(eq(triggers.userId, userId), eq(triggers.enabled, true)))
+// Full rows so the scheduler has trigger / schedule / nextFireAt.
+export function listEnabledAutomations(
+  db: DbOrTx,
+  userId: string,
+): Promise<(typeof automations.$inferSelect)[]> {
+  return db.select().from(automations).where(and(eq(automations.userId, userId), eq(automations.enabled, true)))
 }
 
-// Fetch one trigger by id — used by the worker's trigger-detect handler (the job payload carries
-// triggerId) and the webserver's webhook route.
-export async function getTrigger(
+// Fetch one automation by id — used by the worker's trigger-detect handler (the job payload carries
+// triggerId, which holds the automation id) and the webserver's webhook route.
+export async function getAutomation(
   db: DbOrTx,
   id: string,
-): Promise<(typeof triggers.$inferSelect) | undefined> {
-  const [row] = await db.select().from(triggers).where(eq(triggers.id, id)).limit(1)
+): Promise<(typeof automations.$inferSelect) | undefined> {
+  const [row] = await db.select().from(automations).where(eq(automations.id, id)).limit(1)
   return row
 }
 
-// All of a user's triggers (incl. disabled) newest-first — backs the `list_triggers` tool so the
+// All of a user's automations (incl. disabled) newest-first — backs the `list_triggers` tool so the
 // agent can report what's scheduled and find the ids to disable/delete.
-export function listTriggers(db: DbOrTx, userId: string): Promise<(typeof triggers.$inferSelect)[]> {
-  return db.select().from(triggers).where(eq(triggers.userId, userId)).orderBy(desc(triggers.createdAt))
+export function listTriggers(db: DbOrTx, userId: string): Promise<(typeof automations.$inferSelect)[]> {
+  return db.select().from(automations).where(eq(automations.userId, userId)).orderBy(desc(automations.createdAt))
 }
 
-// Resolve a watcher by its persistent conversation (Discord-conversation-model spec, the
-// load-bearing seam): run.ts looks the trigger up by the run's conversation id rather than the
-// conversation's channelKey, so a recurring watcher whose conversation moved to a Discord forum
-// post still finds its scratchpad. UUID-guarded (a non-UUID conversationId is a clean miss, not a
-// thrown uuid cast — mirrors deleteMemoryFact). Returns the trigger row (or undefined).
-//
-// Invariant: one conversation ⇒ one trigger (each watcher owns its own post conversation; a 'self'
-// trigger owns its originating one). There's no DB-level uniqueness on triggers.conversation_id, so
-// order by created_at asc — first-created wins — to make resolution deterministic if that invariant
-// is ever violated (run.ts keys the scratchpad scope off this). A partial unique index on
-// conversation_id is the stronger guarantee if it ever needs enforcing.
-export async function getTriggerByConversation(
+// Resolve the automation a conversation BELONGS TO, via the per-fire `conversations.automation_id`
+// link (per-fire spec 2026-06-20). This is the run-side lookup that replaces
+// getAutomationByConversation(automations.conversation_id): a watcher now has many conversations
+// (one per fire), so the link lives on the conversation, and run.ts resolves the automation here for
+// EVERY run in the conversation (the escalation AND any follow-up reply) — the scratchpad scope
+// (automation:<id>) and the cursor-commit gate key off it. A NULL automation_id (a normal
+// web/discord/voice/legacy conversation) returns undefined. UUID-guarded (a non-UUID conversationId
+// is a clean miss, not a thrown uuid cast — mirrors deleteMemoryFact). Returns the automation row
+// (or undefined). One JOIN, no second round-trip.
+export async function getAutomationForConversation(
   db: DbOrTx,
   conversationId: string,
-): Promise<(typeof triggers.$inferSelect) | undefined> {
+): Promise<(typeof automations.$inferSelect) | undefined> {
   if (!UUID_RE.test(conversationId)) return undefined
   const [row] = await db
-    .select()
-    .from(triggers)
-    .where(eq(triggers.conversationId, conversationId))
-    .orderBy(asc(triggers.createdAt))
+    .select({ automation: automations })
+    .from(conversations)
+    .innerJoin(automations, eq(conversations.automationId, automations.id))
+    .where(eq(conversations.id, conversationId))
     .limit(1)
-  return row
+  return row?.automation
 }
 
-// Repoint a watcher's persistent conversation (Discord-conversation-model spec): the bot sets
-// triggers.conversation_id to the Discord forum-post conversation it created, so the NEXT
-// escalation's run (and run.ts's scratchpad lookup) routes through that post. Owner-agnostic — the
-// bot acts as the owner on the single-user box. Bumps updatedAt like the other trigger mutators.
-//
-// `ifNull` adds `WHERE conversation_id IS NULL` so the UPDATE never overwrites an already-set
-// conversation. detect.ts's legacy backfill passes it: during the one-time migration the bot's
-// reconcile may have already repointed conversation_id at a Discord post, and detect must NOT clobber
-// that (which would transiently drop a fire's Discord delivery + leak a duplicate post). The bot's
-// repoint must win, so detect only backfills when nothing has claimed the slot yet.
-export async function setTriggerConversation(
+// Repoint a conversation's SURFACE — its ingress + channel_key (per-fire spec 2026-06-20). The
+// Discord bot calls it after creating a Watchers-forum post for a fire: the conversation is created
+// ingress='trigger' (by createAutomationRun); the bot moves it to ('discord', <post id>) so a reply
+// in the post resolves to (and continues) the same conversation via the normal guild-forum
+// onMessageCreate path. Safe against the unique(ingress, channel_key) index only because the post is
+// freshly created (no collision). Does not touch automation_id/title/recency. Bumps nothing else.
+export async function repointConversationChannel(
   db: DbOrTx,
-  params: { id: string; conversationId: string; ifNull?: boolean },
+  params: { id: string; ingress: string; channelKey: string },
 ): Promise<void> {
   await db
-    .update(triggers)
-    .set({ conversationId: params.conversationId, updatedAt: new Date() })
-    .where(
-      params.ifNull
-        ? and(eq(triggers.id, params.id), isNull(triggers.conversationId))
-        : eq(triggers.id, params.id),
-    )
+    .update(conversations)
+    .set({ ingress: params.ingress, channelKey: params.channelKey })
+    .where(eq(conversations.id, params.id))
 }
 
-// Enable/disable a trigger, owner-scoped (a model-supplied id can't touch another user's row) and
-// UUID-guarded (a hallucinated non-UUID is a clean miss, not a thrown uuid cast — mirrors
+// Enable/disable an automation, owner-scoped (a model-supplied id can't touch another user's row)
+// and UUID-guarded (a hallucinated non-UUID is a clean miss, not a thrown uuid cast — mirrors
 // deleteMemoryFact). Returns whether a row matched. Disabling stops it firing + frees the
-// schedule_self cap; the scheduler unregisters it on its next reconcile. Backs `disable_trigger`.
+// create_automation cap; the scheduler unregisters it on its next reconcile. Backs `disable_trigger`.
 export async function setTriggerEnabled(
   db: DbOrTx,
   params: { userId: string; id: string; enabled: boolean },
 ): Promise<{ updated: boolean }> {
   if (!UUID_RE.test(params.id)) return { updated: false }
   const updated = await db
-    .update(triggers)
+    .update(automations)
     .set({ enabled: params.enabled, updatedAt: new Date() })
-    .where(and(eq(triggers.id, params.id), eq(triggers.userId, params.userId)))
-    .returning({ id: triggers.id })
+    .where(and(eq(automations.id, params.id), eq(automations.userId, params.userId)))
+    .returning({ id: automations.id })
   return { updated: updated.length > 0 }
 }
 
-// Permanently delete a trigger, owner-scoped + UUID-guarded (mirrors deleteMemoryFact). Returns
+// Permanently delete an automation, owner-scoped + UUID-guarded (mirrors deleteMemoryFact). Returns
 // whether a row was removed. Backs the `delete_trigger` tool.
 export async function deleteTrigger(
   db: DbOrTx,
@@ -418,73 +417,161 @@ export async function deleteTrigger(
 ): Promise<{ deleted: boolean }> {
   if (!UUID_RE.test(params.id)) return { deleted: false }
   const deleted = await db
-    .delete(triggers)
-    .where(and(eq(triggers.id, params.id), eq(triggers.userId, params.userId)))
-    .returning({ id: triggers.id })
+    .delete(automations)
+    .where(and(eq(automations.id, params.id), eq(automations.userId, params.userId)))
+    .returning({ id: automations.id })
   return { deleted: deleted.length > 0 }
 }
 
-// Persist the new Tier-0 gate signal after a change is detected (gate.ts).
-export async function updateTriggerSignal(db: DbOrTx, id: string, lastSeenSignal: unknown): Promise<void> {
-  await db
-    .update(triggers)
-    .set({ lastSeenSignal: lastSeenSignal ?? null, updatedAt: new Date() })
-    .where(eq(triggers.id, id))
-}
-
-// Increment triggers.detection_cost_usd by a dismissed Tier-1 call's cost (triage.ts, on dismiss).
-// The add is done in SQL so concurrent ticks don't read-modify-write stomp each other; the
-// numeric column accepts the text-cast addend.
-export async function bumpDetectionCost(db: DbOrTx, id: string, costUsd: number): Promise<void> {
-  await db
-    .update(triggers)
-    .set({ detectionCostUsd: sql`${triggers.detectionCostUsd} + ${costUsd.toFixed(6)}`, updatedAt: new Date() })
-    .where(eq(triggers.id, id))
-}
-
-// Set last_fired_at=now() and optionally update next_fire_at (a one-shot 'self' trigger sets
-// next_fire_at=null after firing). Called by the worker's detect handler on each tick.
-export async function markTriggerFired(
+// Commit a cursor straight to `cursor` (detect.ts, on Tier-1 dismiss / empty-delta baseline): set
+// `cursor ← params.cursor` and clear `pending_cursor`. There's no run to wait for — the events were
+// either nothing (baseline) or evaluated-and-rejected (dismiss), so advancing now is correct. `cursor`
+// is opaque jsonb (the framework never interprets it); detect() owns its shape. Bumps updatedAt.
+//
+// NOTE on `id` provenance: this and stageAutomationCursor are deliberately NOT owner-scoped (no
+// userId in WHERE). The id always comes from a trusted internal row (detect.ts's getAutomation,
+// run.ts's getAutomationForConversation), never a model-supplied id — so a userId guard would add no
+// safety. A future caller passing an untrusted id must scope it itself.
+export async function advanceAutomationCursor(
   db: DbOrTx,
-  id: string,
-  opts: { nextFireAt?: Date | null } = {},
+  params: { id: string; cursor: unknown },
 ): Promise<void> {
   await db
-    .update(triggers)
+    .update(automations)
+    .set({ cursor: params.cursor ?? null, pendingCursor: null, updatedAt: new Date() })
+    .where(eq(automations.id, params.id))
+}
+
+// Commit a STAGED cursor after the escalated run succeeds (run.ts, on terminal `done`): set
+// `cursor ← pending_cursor` and clear `pending_cursor`, but ONLY when the row's current
+// `pending_cursor` still equals the value this run staged. This is the at-least-once commit point —
+// the delta is only "handled" once its run reached done.
+//
+// The `pending_cursor = $expected` guard makes the commit idempotent + regression-proof against
+// interleaving: run.ts captures `pending_cursor` at run START, but a long-parked run can outlive
+// another writer that re-stages (the next escalation) or clears (a Tier-1 dismiss) `pending_cursor`
+// while it ran. Committing the stale captured value unconditionally would REGRESS the cursor (a later
+// dismiss already advanced past it) and force re-triage of already-handled events. Comparing against
+// the current `pending_cursor` means: matches ⇒ this run still owns the staged delta, commit it;
+// no match ⇒ someone else already moved it, skip (the safe direction — at most a re-deliver). The
+// jsonb equality compares the staged value to the column. Bumps updatedAt only when it commits.
+export async function commitAutomationCursorIfStaged(
+  db: DbOrTx,
+  params: { id: string; expectedPendingCursor: unknown },
+): Promise<void> {
+  await db
+    .update(automations)
+    .set({ cursor: params.expectedPendingCursor ?? null, pendingCursor: null, updatedAt: new Date() })
+    .where(
+      and(
+        eq(automations.id, params.id),
+        sql`${automations.pendingCursor} = ${JSON.stringify(params.expectedPendingCursor ?? null)}::jsonb`,
+      ),
+    )
+}
+
+// Stage a cursor at escalation (detect.ts): set `pending_cursor` only — `cursor` is left untouched
+// until the escalated run commits it via commitAutomationCursorIfStaged on `done`. (On Tier-1 dismiss
+// / empty-delta baseline, detect.ts commits straight to `cursor` by folding it into
+// markAutomationFired instead, since the events were nothing or evaluated-and-rejected — there's no
+// run to wait for.) Bumps updatedAt.
+export async function stageAutomationCursor(
+  db: DbOrTx,
+  params: { id: string; pendingCursor: unknown },
+): Promise<void> {
+  await db
+    .update(automations)
+    .set({ pendingCursor: params.pendingCursor ?? null, updatedAt: new Date() })
+    .where(eq(automations.id, params.id))
+}
+
+// Increment automations.detection_cost_usd by a dismissed Tier-1 call's cost (triage.ts, on
+// dismiss). The add is done in SQL so concurrent ticks don't read-modify-write stomp each other;
+// the numeric column accepts the text-cast addend.
+export async function bumpDetectionCost(db: DbOrTx, id: string, costUsd: number): Promise<void> {
+  await db
+    .update(automations)
+    .set({ detectionCostUsd: sql`${automations.detectionCostUsd} + ${costUsd.toFixed(6)}`, updatedAt: new Date() })
+    .where(eq(automations.id, id))
+}
+
+// Set last_fired_at=now() and optionally update next_fire_at (a one-shot 'timer' automation sets
+// next_fire_at=null after firing). Called by the worker's detect handler on each tick.
+// `cursor` (optional) folds a cursor advance into the SAME update as the fire-record, so the
+// dismiss / empty-delta paths (detect.ts) advance `cursor` and record `last_fired_at` atomically —
+// a crash between two separate statements would otherwise re-detect the delta (re-triage cost) or
+// double-charge detection_cost_usd. When `cursor` is present, `pending_cursor` is also cleared
+// (mirrors advanceAutomationCursor): a direct commit supersedes any stale stage. Absent ⇒ neither
+// `cursor` nor `pending_cursor` is touched (the escalation path stages separately, and a no-advance
+// detect failure leaves the cursor untouched for re-delivery).
+export async function markAutomationFired(
+  db: DbOrTx,
+  id: string,
+  opts: { nextFireAt?: Date | null; cursor?: unknown } = {},
+): Promise<void> {
+  const hasCursor = Object.prototype.hasOwnProperty.call(opts, 'cursor')
+  await db
+    .update(automations)
     .set({
       lastFiredAt: sql`now()`,
       ...(Object.prototype.hasOwnProperty.call(opts, 'nextFireAt') ? { nextFireAt: opts.nextFireAt } : {}),
+      ...(hasCursor ? { cursor: opts.cursor ?? null, pendingCursor: null } : {}),
       updatedAt: new Date(),
     })
-    .where(eq(triggers.id, id))
+    .where(eq(automations.id, id))
 }
 
-// The autonomous sibling of createUserMessageRun: resolve (touching recency) the trigger's
-// persistent conversation, persist the objective as a user message, and create its pending run
-// with human_in_loop=false. Runs inside the caller's transaction so the one-active-run unique
-// index violation surfaces to the caller (the detect handler catches it → skip/coalesce per
-// spec §78). Returns the new run id. The conversation's ingress/channelKey are caller-controlled
-// (the detect handler resolves a recurring watcher via ensureConversation('trigger', '<id>')
-// before calling this with the same conversationId); here we only touch recency.
-export async function createTriggerRun(
+// The autonomous sibling of createUserMessageRun: CREATE a fresh per-fire conversation for an
+// automation escalation and seed its first run (per-fire spec 2026-06-20). One new conversation
+// per fire (was: append forever to one persistent watcher thread), so Alfred's reply is the first
+// VISIBLE message and the owner can reply to continue it. In one transaction:
+//   1. insert a new conversation — ingress='trigger', channel_key = the new conversation's OWN id
+//      (the trigger ingress has no natural external key; mirroring the web shape keeps the
+//      unique(ingress, channel_key) index satisfied), automation_id = the escalating automation,
+//      title = the automation name (or null) so the per-fire thread is named without an auto-title.
+//   2. insert the seed user message as a FULLY-HIDDEN turn: the objective and (if present) the
+//      untrusted fenced trigger context (new events + classifier hint) are EACH a `trigger_context`
+//      content part — NO visible `text` part. The web/Discord renderers skip non-text parts, so the
+//      seed shows nothing and Alfred speaks first; the worker normalizes trigger_context → text for
+//      the model (rowsToMessages), so the model still gets the objective + fenced delta (§16 fencing
+//      preserved in the model input).
+//   3. insert the pending run, human_in_loop=false (the autonomous escalation), trigger_message_id
+//      = the seed message.
+//   4. UPDATE automations.conversation_id = the new conversation — the repurposed "jump to latest"
+//      pointer at the most-recent fire (no longer the routing key; that lives on conversation.automation_id).
+// The id is minted here (uuidv7) so channel_key can reference it. Runs inside the caller's
+// transaction. Returns { runId, conversationId }.
+export async function createAutomationRun(
   db: DbOrTx,
-  params: { conversationId: string; objective: string },
-): Promise<string> {
-  await ensureConversation(db, params.conversationId, { touch: true })
-  const [msg] = await db
-    .insert(messages)
-    .values({ conversationId: params.conversationId, role: 'user', content: [{ type: 'text', text: params.objective }] })
-    .returning()
+  params: { automationId: string; objective: string; context?: string; title?: string | null },
+): Promise<{ runId: string; conversationId: string }> {
+  await db.insert(users).values({ id: OWNER_USER_ID, displayName: 'Owner' }).onConflictDoNothing()
+  const conversationId = uuidv7()
+  await db.insert(conversations).values({
+    id: conversationId,
+    userId: OWNER_USER_ID,
+    ingress: 'trigger',
+    channelKey: conversationId,
+    automationId: params.automationId,
+    title: params.title ?? null,
+  })
+  const content: { type: string; text: string }[] = [{ type: 'trigger_context', text: params.objective }]
+  if (params.context?.trim()) content.push({ type: 'trigger_context', text: params.context })
+  const [msg] = await db.insert(messages).values({ conversationId, role: 'user', content }).returning()
   const [run] = await db
     .insert(agentRuns)
     .values({
-      conversationId: params.conversationId,
+      conversationId,
       triggerMessageId: msg!.id,
       status: 'pending',
       humanInLoop: false,
     })
     .returning()
-  return run!.id
+  await db
+    .update(automations)
+    .set({ conversationId, updatedAt: new Date() })
+    .where(eq(automations.id, params.automationId))
+  return { runId: run!.id, conversationId }
 }
 
 // ---- Notifications outbox + push subscriptions (autonomous-watchers spec) ----

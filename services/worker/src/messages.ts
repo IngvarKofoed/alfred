@@ -35,6 +35,17 @@ async function inlinePart(conversationId: string, part: ContentPart): Promise<Co
   }
 }
 
+// A stored `trigger_context` part (the fenced, model-only watcher delta written by createAutomationRun)
+// is normalized to a plain text part so the provider includes it in the model input. The chat
+// renderers skip it (non-text), so it stays out of the visible thread; the model still sees the fenced
+// delta — keeping the §16 fencing in the prompt. Defined loosely because trigger_context is a
+// storage-only shape (not an agent-core ContentPart) that exists only between createAutomationRun here.
+function normalizeTriggerContext(part: ContentPart): ContentPart {
+  const p = part as { type?: unknown; text?: unknown }
+  if (p.type === 'trigger_context' && typeof p.text === 'string') return { type: 'text', text: p.text }
+  return part
+}
+
 export async function rowsToMessages(
   conversationId: string,
   rows: { role: string; content: unknown }[],
@@ -44,7 +55,7 @@ export async function rowsToMessages(
     rows.map(async (r) => ({
       role: r.role as Role,
       content: await Promise.all(
-        (r.content as ContentPart[]).map((p) => inlinePart(conversationId, p)),
+        (r.content as ContentPart[]).map((p) => inlinePart(conversationId, normalizeTriggerContext(p))),
       ),
     })),
   )

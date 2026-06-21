@@ -6,7 +6,7 @@ import {
   enqueueAgentRun,
   enqueueTriggerDetect,
   getDb,
-  getTrigger,
+  getAutomation,
   latestRunIdForConversation,
   listTriggers,
   llmCalls,
@@ -788,7 +788,7 @@ app.get('/api/debug/triggers', async (c) => {
     return {
       id: t.id,
       name: t.name,
-      kind: t.kind,
+      trigger: t.trigger,
       enabled: t.enabled,
       schedule: t.schedule,
       notifyPolicy: t.notifyPolicy,
@@ -897,8 +897,8 @@ app.post('/api/triggers/:id/webhook', async (c) => {
   const id = c.req.param('id')
   if (!UUID_RE.test(id)) return c.json({ error: 'invalid trigger id' }, 400)
 
-  const trigger = await getTrigger(getDb(), id)
-  if (!trigger || !trigger.enabled || trigger.kind !== 'webhook') {
+  const automation = await getAutomation(getDb(), id)
+  if (!automation || !automation.enabled || automation.trigger !== 'webhook') {
     return c.json({ error: 'not found' }, 404)
   }
 

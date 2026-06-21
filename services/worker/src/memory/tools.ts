@@ -17,7 +17,7 @@ const MAX_FACT_CHARS = 500
 //
 // `scope` (default 'global') selects which memory scope these tools read/write. An interactive
 // run uses 'global' (Alfred's one cross-conversation memory). An autonomous watcher run passes
-// its scratchpad scope (`trigger:<id>`, autonomous-watchers spec §7.7) so remember/list_memories
+// its scratchpad scope (`automation:<id>`, autonomous-watchers spec §7.7) so remember/list_memories
 // operate on the watcher's own progress notes — kept out of the owner's global memory — and a
 // future run of the same watcher recalls them (run.ts folds the same scope into the system block).
 // `forget` is by-id+owner (deleteMemoryFact), so it needs no scope: ids come from list_memories,

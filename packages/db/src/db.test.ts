@@ -3,17 +3,22 @@ import { describe, expect, it } from 'vitest'
 import { terminateRuns } from './boss.js'
 import { createDb } from './client.js'
 import {
+  advanceAutomationCursor,
+  commitAutomationCursorIfStaged,
   deleteMemoryFact,
   deleteTrigger,
+  getAutomation,
+  insertAutomation,
   insertMemoryFact,
-  insertTrigger,
   latestRunIdForConversation,
-  listEnabledTriggers,
+  listEnabledAutomations,
   listMemoryFacts,
   listTriggers,
+  markAutomationFired,
   readLastAssistantText,
   readMemoryFacts,
   setTriggerEnabled,
+  stageAutomationCursor,
 } from './queries.js'
 import { agentRuns, conversations, messages, toolCalls, userInteractions, users } from './schema.js'
 
@@ -257,21 +262,21 @@ describe.skipIf(!url)('trigger management', () => {
       await db.transaction(async (tx) => {
         const [user] = await tx.insert(users).values({ displayName: 'Owner' }).returning()
         const [other] = await tx.insert(users).values({ displayName: 'Other' }).returning()
-        const { id } = await insertTrigger(tx, {
+        const { id } = await insertAutomation(tx, {
           userId: user!.id,
           name: 'Inbox watcher',
-          kind: 'inbox',
+          trigger: 'email',
           schedule: '*/10 * * * *',
           objective: 'Check for urgent unread mail',
           notifyPolicy: 'on_change',
         })
 
         const listed = await listTriggers(tx, user!.id)
-        const enabledBefore = await listEnabledTriggers(tx, user!.id)
+        const enabledBefore = await listEnabledAutomations(tx, user!.id)
         // Owner-scoping: another user can neither disable nor delete it.
         const foreignDisable = await setTriggerEnabled(tx, { userId: other!.id, id, enabled: false })
         const disabled = await setTriggerEnabled(tx, { userId: user!.id, id, enabled: false })
-        const enabledAfter = await listEnabledTriggers(tx, user!.id)
+        const enabledAfter = await listEnabledAutomations(tx, user!.id)
         // A non-UUID id is a clean miss (never a uuid-cast throw); a foreign owner can't delete.
         const malformedDelete = await deleteTrigger(tx, { userId: user!.id, id: 'not-a-uuid' })
         const foreignDelete = await deleteTrigger(tx, { userId: other!.id, id })
@@ -309,6 +314,122 @@ describe.skipIf(!url)('trigger management', () => {
     expect(observed!.firstDelete).toEqual({ deleted: true })
     expect(observed!.secondDelete).toEqual({ deleted: false }) // idempotent on a missing row
     expect(observed!.after).toEqual([])
+  })
+})
+
+// Integration test for the at-least-once cursor lifecycle (spec 2026-06-19-trigger-abstraction,
+// "Cursor commit"). Reproduces the cursor-regression scenario the adversarial review flagged:
+// a long-parked run captures pending_cursor at start, a later Tier-1 dismiss advances `cursor`
+// (clearing pending_cursor), and the parked run must NOT regress `cursor` when it finally commits a
+// now-stale staged value. commitAutomationCursorIfStaged guards on the staged value still being
+// current; the dismiss path (markAutomationFired with cursor) only advances when no stage is in
+// flight. Same rollback pattern, so the DB stays pristine.
+describe.skipIf(!url)('automation cursor lifecycle', () => {
+  it('stages, commits-if-current, and never regresses on a stale commit', async () => {
+    const db = createDb(url!)
+    const ROLLBACK = Symbol('rollback')
+    let observed:
+      | {
+          afterStage: { cursor: unknown; pendingCursor: unknown }
+          afterFreshCommit: { cursor: unknown; pendingCursor: unknown }
+          afterDismissAdvance: { cursor: unknown; pendingCursor: unknown }
+          afterStaleCommit: { cursor: unknown; pendingCursor: unknown }
+        }
+      | undefined
+
+    try {
+      await db.transaction(async (tx) => {
+        const [user] = await tx.insert(users).values({ displayName: 'Owner' }).returning()
+        const { id } = await insertAutomation(tx, {
+          userId: user!.id,
+          name: 'Inbox watcher',
+          trigger: 'email',
+          schedule: '*/10 * * * *',
+          objective: 'Check for urgent unread mail',
+          notifyPolicy: 'on_change',
+        })
+        const snap = async () => {
+          const a = await getAutomation(tx, id)
+          return { cursor: a!.cursor, pendingCursor: a!.pendingCursor }
+        }
+
+        // Escalation stages pending_cursor only; cursor stays null.
+        await stageAutomationCursor(tx, { id, pendingCursor: { lastUid: 103 } })
+        const afterStage = await snap()
+
+        // The run reaches `done` with the current staged value ⇒ commit advances cursor, clears stage.
+        await commitAutomationCursorIfStaged(tx, { id, expectedPendingCursor: { lastUid: 103 } })
+        const afterFreshCommit = await snap()
+
+        // A new escalation re-stages (a later run), then a NON-deterministic dismiss of the same
+        // unadvanced delta would advance `cursor` directly (markAutomationFired w/ cursor) — but the
+        // detect guard only does so when pending_cursor is null. Here we simulate the in-flight case:
+        // pending is staged, so dismiss records the fire WITHOUT a cursor (no advance). Then a later
+        // out-of-order writer advances cursor to 105 and clears the stage (e.g. the next escalation's
+        // own done-commit). We model the net post-condition: cursor=105, pending cleared.
+        await stageAutomationCursor(tx, { id, pendingCursor: { lastUid: 105 } })
+        await advanceAutomationCursor(tx, { id, cursor: { lastUid: 105 } })
+        const afterDismissAdvance = await snap()
+
+        // The ORIGINAL parked run finally commits its stale captured value (103). The guard must make
+        // this a NO-OP — pending_cursor no longer equals 103 (it's null) — so cursor stays 105.
+        await commitAutomationCursorIfStaged(tx, { id, expectedPendingCursor: { lastUid: 103 } })
+        const afterStaleCommit = await snap()
+
+        observed = { afterStage, afterFreshCommit, afterDismissAdvance, afterStaleCommit }
+        throw ROLLBACK
+      })
+    } catch (err) {
+      if (err !== ROLLBACK) throw err
+    }
+
+    expect(observed).toBeDefined()
+    expect(observed!.afterStage).toEqual({ cursor: null, pendingCursor: { lastUid: 103 } })
+    expect(observed!.afterFreshCommit).toEqual({ cursor: { lastUid: 103 }, pendingCursor: null })
+    expect(observed!.afterDismissAdvance).toEqual({ cursor: { lastUid: 105 }, pendingCursor: null })
+    // The stale commit must NOT regress cursor 105 → 103.
+    expect(observed!.afterStaleCommit).toEqual({ cursor: { lastUid: 105 }, pendingCursor: null })
+  })
+
+  it('markAutomationFired atomically advances the cursor when given one', async () => {
+    const db = createDb(url!)
+    const ROLLBACK = Symbol('rollback')
+    let observed: { withCursor: { cursor: unknown; pendingCursor: unknown }; withoutCursor: { cursor: unknown } } | undefined
+
+    try {
+      await db.transaction(async (tx) => {
+        const [user] = await tx.insert(users).values({ displayName: 'Owner' }).returning()
+        const { id } = await insertAutomation(tx, {
+          userId: user!.id,
+          name: 'Inbox watcher',
+          trigger: 'email',
+          schedule: '*/10 * * * *',
+          objective: 'Check for urgent unread mail',
+          notifyPolicy: 'on_change',
+        })
+        // A stale stage from a prior in-flight run; a direct cursor-commit clears it (a dismiss/empty
+        // tick with no stage in flight supersedes).
+        await stageAutomationCursor(tx, { id, pendingCursor: { lastUid: 7 } })
+        await markAutomationFired(tx, id, { cursor: { lastUid: 42 } })
+        const a1 = await getAutomation(tx, id)
+        const withCursor = { cursor: a1!.cursor, pendingCursor: a1!.pendingCursor }
+
+        // Without a cursor opt, neither cursor nor pending_cursor is touched.
+        await stageAutomationCursor(tx, { id, pendingCursor: { lastUid: 99 } })
+        await markAutomationFired(tx, id, {})
+        const a2 = await getAutomation(tx, id)
+        const withoutCursor = { cursor: a2!.cursor }
+
+        observed = { withCursor, withoutCursor }
+        throw ROLLBACK
+      })
+    } catch (err) {
+      if (err !== ROLLBACK) throw err
+    }
+
+    expect(observed).toBeDefined()
+    expect(observed!.withCursor).toEqual({ cursor: { lastUid: 42 }, pendingCursor: null })
+    expect(observed!.withoutCursor).toEqual({ cursor: { lastUid: 42 } }) // untouched by the no-cursor fire
   })
 })
 

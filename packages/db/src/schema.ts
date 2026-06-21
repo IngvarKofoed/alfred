@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import {
+  type AnyPgColumn,
   boolean,
   index,
   integer,
@@ -40,12 +41,25 @@ export const conversations = pgTable(
     ingress: text('ingress').notNull(), // 'web' | 'discord' | 'voice' | 'trigger'
     channelKey: text('channel_key').notNull(),
     title: text('title'),
+    // The automation this conversation belongs to (per-fire watcher conversations, spec
+    // 2026-06-20). Nullable: NULL ⇒ a normal conversation (web/discord/voice/legacy trigger).
+    // Set ⇒ this conversation was created by an automation escalation; run.ts resolves the
+    // automation from here for the scratchpad scope (automation:<id>) and the cursor-commit
+    // gate — for EVERY run in the conversation, so a follow-up reply recalls the same
+    // scratchpad. A watcher now has MANY conversations (one per fire), so the automation link
+    // lives here, not on automations.conversation_id (which becomes a jump-to-latest pointer).
+    // FK → automations.id is a circular table dependency with automations.conversation_id; the
+    // migration ADDs the column + constraint after both tables exist (Drizzle's () => thunk
+    // tolerates the forward ref at the type level).
+    automationId: uuid('automation_id').references((): AnyPgColumn => automations.id),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     lastActiveAt: timestamp('last_active_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     unique('conversations_ingress_channel_key_unique').on(t.ingress, t.channelKey),
     index('conversations_user_last_active_idx').on(t.userId, t.lastActiveAt.desc()),
+    // Recurring watcher runs resolve their automation by this column per run, so index it.
+    index('conversations_automation_idx').on(t.automationId),
   ],
 )
 
@@ -89,7 +103,7 @@ export const agentRuns = pgTable(
     // Whether a human is watching this run (ARCHITECTURE §7.7, autonomous-watchers spec).
     // Derived from ingress: interactive ingresses (web/voice) → true; 'trigger' → false. The
     // worker reads it to select overflow + approval-timeout behaviour at the edges. Defaults
-    // true so every existing interactive run is unchanged; only createTriggerRun sets it false.
+    // true so every existing interactive run is unchanged; only createAutomationRun sets it false.
     humanInLoop: boolean('human_in_loop').notNull().default(true),
     startedAt: timestamp('started_at', { withTimezone: true }),
     finishedAt: timestamp('finished_at', { withTimezone: true }),
@@ -228,14 +242,22 @@ export const memoryFacts = pgTable(
   (t) => [index('memory_facts_user_scope_idx').on(t.userId, t.scope)],
 )
 
-// triggers: the watcher definitions, one row per watcher (autonomous-watchers spec, the
-// fourth ingress — ARCHITECTURE §9.4 / RUNTIME §7.7). The thin `alfred-triggers` scheduler
-// reads enabled rows at boot and registers schedules; the worker's trigger-detect handler
-// reads gate/triage/objective and updates last_seen_signal / detection_cost_usd. A recurring
-// watcher resolves to one persistent conversation (`conversationId`); a one-shot 'self' trigger
-// carries the originating conversation instead.
-export const triggers = pgTable(
-  'triggers',
+// automations: the configured watcher instances, one row per automation (trigger-abstraction
+// spec 2026-06-19; was `triggers`). An automation = a chosen Trigger (`trigger`, the pluggable
+// firing mechanism: 'email'|'timer'|'webhook') + its `params` + the action (`objective`) +
+// notify policy + cursor state. The thin `alfred-triggers` scheduler reads enabled rows at boot
+// and registers schedules; the worker's trigger-detect handler runs the Trigger's detect() and
+// the Tier-1/Tier-2 ladder. A recurring watcher resolves to one persistent conversation
+// (`conversationId`); a one-shot 'timer'/'self' automation carries the originating conversation.
+//
+// The old scalar `last_seen_signal` (a maxUid/count/hash reduction) is replaced by the opaque
+// per-Trigger `cursor`: the framework stores it as jsonb and stages/commits it, but never
+// interprets it — all cursor semantics live in the Trigger's detect(). `pending_cursor` is the
+// cursor staged at escalation; run.ts commits `cursor ← pending_cursor` only when the escalated
+// run reaches `done` (at-least-once: a crashed run re-delivers the same delta next tick). The old
+// `gate` jsonb is dropped — Tier-0 detection moved into the worker triggerRegistry's detect().
+export const automations = pgTable(
+  'automations',
   {
     id: uuid('id')
       .primaryKey()
@@ -244,23 +266,28 @@ export const triggers = pgTable(
       .notNull()
       .references(() => users.id),
     name: text('name').notNull(), // human label
-    kind: text('kind').notNull(), // 'schedule' | 'inbox' | 'webhook' | 'self'
+    trigger: text('trigger').notNull(), // the Trigger name: 'email' | 'timer' | 'webhook'
     enabled: boolean('enabled').notNull().default(true),
-    conversationId: uuid('conversation_id').references(() => conversations.id), // persistent watcher conversation; null for 'self'
-    schedule: text('schedule'), // cron expr / poll cadence; null for webhook/self
-    gate: jsonb('gate'), // Tier-0: { tool, args, signal }; null ⇒ always-fire
+    // Was the persistent watcher conversation; per-fire spec (2026-06-20) repurposes it to a
+    // "jump to latest" pointer at the MOST RECENT fire's conversation, updated on each escalation.
+    // No longer the routing key — that moved to conversations.automation_id (a watcher now has many
+    // conversations, one per fire). Still nullable (null until a watcher has fired / for a one-shot).
+    conversationId: uuid('conversation_id').references(() => conversations.id),
+    schedule: text('schedule'), // cron expr / poll cadence; null for webhook / one-shot timer
+    params: jsonb('params'), // the Trigger's params, validated against its paramsSchema at create time
     triage: jsonb('triage'), // Tier-1: { enabled, model?, prompt? }; null ⇒ skip to action
-    objective: text('objective').notNull(), // Tier-2 seed prompt
+    objective: text('objective').notNull(), // Tier-2 seed prompt (the action)
     notifyPolicy: text('notify_policy').notNull(), // 'always' | 'on_change' | 'on_threshold' | 'digest'
-    lastSeenSignal: jsonb('last_seen_signal'), // gate diff state
+    cursor: jsonb('cursor'), // opaque per-Trigger detection cursor (replaces last_seen_signal); committed after a run succeeds
+    pendingCursor: jsonb('pending_cursor'), // cursor staged at escalation; run.ts commits it to `cursor` on terminal done
     nextFireAt: timestamp('next_fire_at', { withTimezone: true }),
     lastFiredAt: timestamp('last_fired_at', { withTimezone: true }),
     detectionCostUsd: numeric('detection_cost_usd', { precision: 10, scale: 6 }).notNull().default('0'), // cumulative dismissed-detection cost
-    sourceRunId: uuid('source_run_id').references(() => agentRuns.id), // nullable; provenance for agent-scheduled triggers
+    sourceRunId: uuid('source_run_id').references(() => agentRuns.id), // nullable; provenance for agent-scheduled automations
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('triggers_enabled_next_fire_idx').on(t.enabled, t.nextFireAt)],
+  (t) => [index('automations_enabled_next_fire_idx').on(t.enabled, t.nextFireAt)],
 )
 
 // notifications: the durable push outbox (autonomous-watchers spec). SSE is fire-and-forget and

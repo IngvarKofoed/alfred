@@ -3,6 +3,8 @@ dist/
 # vite-plugin-pwa dev-mode service-worker artifact (clients/web/dev-dist) — generated, never committed.
 dev-dist/
 .env
+# .env backup written by scripts/sync-env.mjs (pnpm env:sync) — holds the same secrets as .env.
+.env.bak
 *.log
 .DS_Store
 .pnpm-store/

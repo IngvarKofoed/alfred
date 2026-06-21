@@ -11,11 +11,11 @@ import {
   disableTriggerTool,
   listTriggersTool,
   makeAskUserTool,
+  makeCreateAutomationTool,
   makeFileTools,
   makeGenerateImageTool,
-  makeScheduleSelfTool,
   makeSetTitleTool,
-  runTriggerTool,
+  runAutomationTool,
 } from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
@@ -33,8 +33,8 @@ const askUserPauseStub = () => Promise.reject(new Error('ask_user pause not boun
 // The full toolset for a run. The conversation-bound tools (title, file, python, ask_user) are
 // rebuilt per call; the memory tools close over runId so a saved fact records its source_run_id
 // (spec docs/specs/2026-06-15-long-term-memory.md) AND over the memory scope so a watcher run's
-// remember/list/forget operate on its own scratchpad scope (`trigger:<id>`, autonomous-watchers
-// spec §7.7) rather than the owner's global memory; echo, generate_image, and the browser tools
+// remember/list/forget operate on its own scratchpad scope (`automation:<id>`, trigger-abstraction
+// spec) rather than the owner's global memory; echo, generate_image, and the browser tools
 // carry no per-conversation state. `memoryScope` defaults 'global' so an interactive run is
 // byte-for-byte unchanged.
 export function buildRunTools(
@@ -48,11 +48,11 @@ export function buildRunTools(
     makeSetTitleTool(conversationId),
     makeGenerateImageTool(),
     makeAskUserTool(askUserPause ?? askUserPauseStub),
-    makeScheduleSelfTool(conversationId, runId),
+    makeCreateAutomationTool(conversationId, runId),
     listTriggersTool,
     disableTriggerTool,
     deleteTriggerTool,
-    runTriggerTool,
+    runAutomationTool,
     ...makeFileTools(conversationId),
     ...makePythonTools(conversationId),
     ...makeMemoryTools(runId, memoryScope),

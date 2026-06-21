@@ -17,7 +17,7 @@ import {
   type TtsProvider,
   TTS_MIN_SENTENCE_CHARS,
 } from '@alfred/agent-core'
-import { agentRuns, conversations, getDb, getTriggerByConversation, insertNotification, llmCalls, messages, OWNER_USER_ID, pgNotify, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
+import { agentRuns, commitAutomationCursorIfStaged, conversations, getAutomationForConversation, getDb, insertNotification, llmCalls, messages, OWNER_USER_ID, pgNotify, readMemoryFacts, recordOutOfLoopLlmCall, toolCalls, tools as toolsTable, userInteractions } from '@alfred/db'
 import { loadConfig, writeAudioToWorkspace } from '@alfred/shared'
 import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
@@ -49,9 +49,9 @@ const SYSTEM_PROMPT =
 // to untangle a concatenation. `scratchpad` is empty for an interactive (and 'self' one-shot) run.
 //
 // `isTrigger` frames any unattended run (no human live); `watcherId` is set ONLY for a recurring
-// watcher (which owns a `trigger:<id>` scratchpad scope) — its remember/forget already write that
+// watcher (which owns an `automation:<id>` scratchpad scope) — its remember/forget already write that
 // scope (the tools are scope-bound), so we tell the model to record progress with remember WITHOUT
-// naming the scope (a one-shot 'self' run has no scratchpad, so it never gets that instruction).
+// naming the scope (a one-shot run has no scratchpad, so it never gets that instruction).
 function systemTextWithMemory(
   facts: { text: string }[],
   scratchpad: { text: string }[] = [],
@@ -59,10 +59,15 @@ function systemTextWithMemory(
 ): string {
   let text = SYSTEM_PROMPT
   if (opts.isTrigger) {
-    // Frame the autonomous run: no human is watching live, be decisive, actions still gate.
+    // Frame the autonomous run: no human is watching live, be decisive, actions still gate. The owner
+    // reads the reply LATER as a standalone notification, so nudge self-containment — generically,
+    // NOT with a per-domain format. The objective is the instruction and wins; this only asks the
+    // model not to assume shared context (it won't override a deliberately narrow objective).
     text +=
       '\n\nThis is an autonomous background run with no human watching live. Be decisive; ' +
-      "any action that sends, deletes, or changes things still pauses for the owner's approval."
+      "any action that sends, deletes, or changes things still pauses for the owner's approval. " +
+      'The owner reads your reply later as a standalone notification — follow the objective, but make ' +
+      'the reply self-contained enough to stand on its own. Be concise; no preamble.'
     if (opts.watcherId) {
       // A recurring watcher: the scratchpad is the continuity mechanism, and remember/forget on
       // this run carry progress forward (no full-history replay). The tools are already scoped to
@@ -118,46 +123,45 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
   const [run] = await db.select().from(agentRuns).where(eq(agentRuns.id, runId))
   if (!run || run.status !== 'pending') return // already handled / cancelled
 
-  // The conversation backs the autonomous-watcher decisions (spec): its `ingress` distinguishes a
-  // trigger run (alongside run.humanInLoop, set false only by createTriggerRun).
-  const [conv] = await db
-    .select({ ingress: conversations.ingress })
-    .from(conversations)
-    .where(eq(conversations.id, run.conversationId))
-  // Trigger run: no human is watching (run.humanInLoop=false, or a 'trigger'-ingress conversation).
-  // Selects bounded context, a longer approval timeout, deferred ask_user, and out-of-band push (§7.7).
-  const isTrigger = !run.humanInLoop || conv?.ingress === 'trigger'
+  // The autonomous-escalation discriminator (per-fire spec 2026-06-20): run.humanInLoop is set false
+  // ONLY by createAutomationRun (the Tier-2 escalation). A follow-up reply in a per-fire watcher
+  // conversation is an ordinary interactive run (human_in_loop=true), even though the conversation
+  // started ingress='trigger'. So isTrigger keys STRICTLY on human_in_loop — it selects the autonomous
+  // framing, bounded context (just the hidden seed), a longer approval timeout, deferred ask_user,
+  // out-of-band push, AND the cursor commit. None of those apply to a follow-up reply.
+  const isTrigger = !run.humanInLoop
 
-  // Robustly derive watcher-ness for the scratchpad (spec §7.7). A RECURRING watcher's conversation
-  // IS the watcher: getTriggerByConversation(run.conversationId) resolves a 'schedule'|'inbox'|
-  // 'webhook' row by its triggers.conversation_id, so it owns a scratchpad scope `trigger:<id>` and
-  // uses the trigger's notify policy. Looking up by the conversation id (not channelKey) is what lets
-  // a watcher's conversation move to a Discord forum post (ingress='discord', spec
-  // 2026-06-17-discord-conversation-model) while still resolving its trigger; detect.ts backfills
-  // conversation_id=trigger.id on the legacy 'trigger'-ingress path, so existing watchers resolve too.
-  // A one-shot 'self' run is unattended but runs on the ORIGINATING (web) conversation, which no
-  // trigger.conversation_id points at, so getTriggerByConversation returns undefined → NO scratchpad
-  // scope (the agent must not be told to remember to a `trigger:<uuid>` scope nothing can resolve) and
-  // it notifies on result with an implicit 'always' policy. Resolved up front so the scratchpad recall
-  // + the memory tools' scope + the result-notify policy all key off the same, correct fact. Only
-  // resolved for a trigger run — an interactive run never resolves a watcher.
-  const watcher = isTrigger
-    ? await getTriggerByConversation(db, run.conversationId).catch(() => undefined)
-    : undefined
-  // A 'self' trigger stores conversation_id = its ORIGINATING (web) conversation, so
-  // getTriggerByConversation now MATCHES it (the old getTrigger(channelKey) returned undefined). But
-  // a 'self' run is a one-shot reminder that must keep the pre-watcher behavior: no scratchpad scope
-  // AND an always-push result notification with a generic title — NOT the self trigger's name or
-  // notify_policy (a 'digest' self reminder would otherwise be silently suppressed). So collapse the
-  // matched self trigger back to undefined: `recurringWatcher` is the watcher row ONLY for a
-  // recurring ('schedule'|'inbox'|'webhook') watcher, and it (not `watcher`) drives the scratchpad
-  // id and the result-notify policy below.
-  const recurringWatcher = watcher && watcher.kind !== 'self' ? watcher : undefined
-  // Only a recurring watcher (not a 'self' one-shot) keeps a durable scratchpad.
+  // Resolve the automation this conversation BELONGS TO, via the per-fire conversations.automation_id
+  // link (getAutomationForConversation) — for EVERY run in the conversation, NOT just the autonomous
+  // escalation (per-fire spec: a follow-up reply must recall/write the same scratchpad). A normal
+  // web/discord/voice conversation has no automation_id ⇒ undefined. Resolved up front so the
+  // scratchpad recall, the memory tools' scope, the result-notify policy, and the cursor commit all
+  // key off the same fact.
+  const watcher = await getAutomationForConversation(db, run.conversationId).catch((err) => {
+    // Best-effort, like the memory recalls below: a transient lookup failure degrades a watcher run
+    // to no-scratchpad + no-cursor-commit (the delta re-delivers next tick — at-least-once holds) +
+    // an implicit 'always' notify. Log it so a watcher silently losing continuity for a fire is
+    // visible, rather than swallowed.
+    console.error(`[run ${runId}] automation lookup failed; proceeding as a normal run:`, err)
+    return undefined
+  })
+  // A one-shot automation has no recurring `schedule` (the old kind='self' reminder, now a `timer`
+  // automation armed by next_fire_at alone). A one-shot keeps the pre-watcher behavior: no durable
+  // scratchpad AND an always-push generic-title notification (a 'digest' one-shot would otherwise be
+  // silently suppressed). So `recurringWatcher` is the row ONLY for a recurring automation — it drives
+  // the scratchpad id, the cursor commit, and the result-notify policy. NOTE: discriminated on
+  // `!schedule` ALONE (an immutable column), NOT on `nextFireAt` — the fire path clears next_fire_at
+  // (markAutomationFired) AFTER enqueue, so a run picked up post-fire could otherwise read a cleared
+  // next_fire_at and mis-scope a one-shot as a recurring watcher. A recurring watcher always carries a
+  // cron schedule; a one-shot never does.
+  const isOneShotWatcher = !!watcher && !watcher.schedule
+  const recurringWatcher = watcher && !isOneShotWatcher ? watcher : undefined
+  // Only a recurring watcher (not a one-shot) keeps a durable scratchpad — applied to every run in the
+  // conversation (escalation + follow-up reply), so a reply recalls/writes the same scratchpad.
   const watcherId = recurringWatcher?.id
   // The memory scope the run's remember/list_memories operate on: the watcher's scratchpad for a
-  // recurring watcher, the owner's global memory otherwise (interactive AND 'self' runs).
-  const memoryScope = watcherId ? `trigger:${watcherId}` : 'global'
+  // recurring watcher, the owner's global memory otherwise (interactive AND one-shot runs).
+  const memoryScope = watcherId ? `automation:${watcherId}` : 'global'
 
   // Autonomous runs pause for approval far longer than the 1h interactive window — the owner may
   // be asleep when a watcher fires (§7.7 / spec "Approval & questions while unattended").
@@ -201,13 +205,14 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // (history is essential, memory an enhancement). Injecting into the system message is safe for
     // maybeAutoTitle, which builds its own titleMessages and only reads history via find(role==='user').
     //
-    // For a TRIGGER run (autonomous-watchers spec §7.7 "Continuity via an objective scratchpad,
-    // not history replay") we ALSO read the watcher's scratchpad scope (`trigger:<id>`, recurring
-    // watchers only) — folded into the system block — and deliberately do NOT replay the full
-    // conversation history: a year of daily fires must not replay a year of messages, and the DB
-    // read must not grow with the watcher's lifetime. The history query is BOUNDED to the latest
-    // user message (the objective for this fire); an interactive run still selects the full
-    // history. Global recall applies to both.
+    // For the AUTONOMOUS escalation run (human_in_loop=false, isTrigger; autonomous-watchers spec §7.7
+    // "Continuity via an objective scratchpad, not history replay") we ALSO read the watcher's
+    // scratchpad scope (`automation:<id>`, recurring watchers only) — folded into the system block —
+    // and deliberately do NOT replay history: the per-fire conversation is fresh and carries only the
+    // hidden seed (objective + fenced delta), so the bounded query (latest user message) returns
+    // exactly that. A follow-up REPLY in a per-fire conversation is interactive (human_in_loop=true),
+    // so it replays the FULL conversation history (the hidden seed normalizes to text + every prior
+    // turn) — it's continuing a real conversation, not a fresh fire. Global recall applies to both.
     const historyQuery = isTrigger
       ? db
           .select({ role: messages.role, content: messages.content })
@@ -355,13 +360,21 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
     // ask_user's pause can resolve its own row from the call id (invariant 2, §10.9).
     const toolCallRowIds = new Map<string, string>()
 
+    // Tracks whether this run wrote an out-of-band pause notification (approval/question). Used on the
+    // done path so a 'digest' watcher that PAUSED still pushes its result: once an approval card has
+    // surfaced (Discord post / Web Push), the fire is no longer silent accrual, so suppressing the
+    // outcome would leave the owner having approved an action and then seeing nothing (per-fire spec,
+    // digest+approval gap). A digest run that never paused keeps emitting no per-run push.
+    let pausedWithNotify = false
+
     // Out-of-band push when an unattended (trigger) run pauses (§7.7 / spec "Approval & questions
     // while unattended"). For an interactive run this is undefined (no push — the owner is on SSE).
     // For a trigger run it writes a notifications row (kind 'approval'|'question') deep-linking the
     // conversation + NOTIFYs the SEPARATE 'notifications' channel so the dispatcher pushes it.
     const pauseNotifier = isTrigger
-      ? (interactionId: string, kind: 'approval' | 'question'): Promise<void> =>
-          notifyOutbox(db, {
+      ? async (interactionId: string, kind: 'approval' | 'question'): Promise<void> => {
+          pausedWithNotify = true
+          await notifyOutbox(db, {
             userId: OWNER_USER_ID,
             conversationId: run.conversationId,
             agentRunId: runId,
@@ -371,6 +384,7 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
             body: 'A background task is waiting for your input.',
             deepLink: `/conversation/${run.conversationId}`,
           })
+        }
       : undefined
 
     // ask_user's run-bound pause (§7.3, §10.2): the agent calls ask_user, which calls this to
@@ -705,6 +719,33 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
       .returning({ id: agentRuns.id })
     if (doneRows.length > 0) {
       await notifyRun(run.conversationId, { type: 'done' })
+      // Commit the staged detection cursor (trigger-abstraction spec, "Cursor commit"): the escalated
+      // run reached `done`, so the delta it acted on is now handled — advance cursor ← pending_cursor
+      // and clear pending_cursor. Only here, only when the `done` write WON above (terminal states are
+      // absorbing, §10.9): a cancelled/failed run never commits, so its delta re-delivers next tick
+      // (at-least-once). Only a recurring watcher carries a cursor; one-shots/interactive runs have
+      // none (pending_cursor is null), so the commit is a no-op. Guard on a present pending_cursor so a
+      // normal recurring run with nothing staged doesn't needlessly write.
+      //
+      // ONLY the autonomous escalation (isTrigger / human_in_loop=false) commits the cursor (per-fire
+      // spec 2026-06-20): a follow-up REPLY (human_in_loop=true) in the same per-fire conversation also
+      // resolves recurringWatcher (for its scratchpad), but it must be side-effect-free on detection
+      // state — it never staged a cursor, so it must never commit one. (There's exactly one autonomous
+      // run per per-fire conversation — the escalation — so this is unambiguous.)
+      //
+      // `recurringWatcher.pendingCursor` was read at run START. A long-parked run can outlive another
+      // writer that moved pending_cursor while it ran (the next escalation re-staging, or a Tier-1
+      // dismiss advancing the cursor). Committing the stale captured value unconditionally would
+      // REGRESS the cursor. So commit conditionally — commitAutomationCursorIfStaged only writes when
+      // the row's pending_cursor still equals the value this run staged; otherwise someone else already
+      // moved it and we skip (the safe direction — at most a re-deliver). Best-effort: a commit failure
+      // must not fail the successful run; it only means the next tick re-delivers the same delta.
+      if (isTrigger && recurringWatcher && recurringWatcher.pendingCursor != null) {
+        await commitAutomationCursorIfStaged(db, {
+          id: recurringWatcher.id,
+          expectedPendingCursor: recurringWatcher.pendingCursor,
+        }).catch((cursorErr) => console.error(`[run ${runId}] cursor commit failed:`, cursorErr))
+      }
       // Out-of-band push for a finished UNATTENDED run (autonomous-watchers spec, "Notifications"):
       // write a notifications row + NOTIFY 'notifications', so the dispatcher pushes it. Only when
       // the done write actually won (a cancel at the finish line already told the client).
@@ -715,7 +756,9 @@ export async function runJob(runId: string, deps: RunDeps = {}): Promise<void> {
         const finalText = lastAssistantText(finalMessages)
         // Pass recurringWatcher (undefined for a 'self' one-shot): a recurring watcher uses its
         // notify_policy; a 'self' run notifies with an implicit 'always' policy + generic title.
-        await maybeNotifyResult(db, run, recurringWatcher, finalText).catch((notifyErr) =>
+        // pausedWithNotify forces a result push even under 'digest' (the fire already surfaced an
+        // approval card — the owner needs to see the outcome).
+        await maybeNotifyResult(db, run, recurringWatcher, finalText, pausedWithNotify).catch((notifyErr) =>
           console.error(`[run ${runId}] result notification failed:`, notifyErr),
         )
       }
@@ -1053,12 +1096,16 @@ function lastAssistantText(finalMessages: Message[]): string {
 async function maybeNotifyResult(
   db: ReturnType<typeof getDb>,
   run: typeof agentRuns.$inferSelect,
-  watcher: Awaited<ReturnType<typeof getTriggerByConversation>>,
+  watcher: Awaited<ReturnType<typeof getAutomationForConversation>>,
   resultText: string,
+  // The run raised an approval/question during the fire (so a card already surfaced). When true a
+  // 'digest' watcher STILL pushes its result — the fire is no longer silent accrual and the owner,
+  // having approved an action, must see the outcome rather than nothing (per-fire spec).
+  forceForPause = false,
 ): Promise<void> {
-  // A 'digest' watcher emits no per-run push; every other case (recurring non-digest watcher, or a
-  // 'self' run with no watcher row) pushes.
-  if (watcher?.notifyPolicy === 'digest') return
+  // A 'digest' watcher emits no per-run push UNLESS it paused (above); every other case (recurring
+  // non-digest watcher, or a 'self' run with no watcher row) pushes.
+  if (watcher?.notifyPolicy === 'digest' && !forceForPause) return
 
   await notifyOutbox(db, {
     userId: OWNER_USER_ID,

@@ -5,10 +5,10 @@ import {
   conversations,
   deleteTrigger,
   enqueueTriggerDetect,
+  getAutomation,
   getDb,
-  getTrigger,
-  insertTrigger,
-  listEnabledTriggers,
+  insertAutomation,
+  listEnabledAutomations,
   listTriggers,
   OWNER_USER_ID,
   setTriggerEnabled,
@@ -17,6 +17,8 @@ import { imageMimeForExt, resolveInWorkspace } from '@alfred/shared'
 import { eq } from 'drizzle-orm'
 import { capResult } from './cap.js'
 import { DEFAULT_IMAGE_MODEL, imageModelChoices, resolveImageProvider } from './images-registry.js'
+import { lookupTrigger, triggerCatalog } from './triggers/registry.js'
+import { validateParams } from './triggers/validate-params.js'
 
 // A context-bound built-in tool (ARCHITECTURE §7.3): it acts on a specific
 // conversation, captured in a closure so Tool.invoke(args) stays context-free.
@@ -259,30 +261,34 @@ export function makeFileTools(conversationId: string): Tool[] {
   ]
 }
 
-// schedule_self bounds (§16 blast radius): a prompt-injected agent must not be able to self-schedule
+// create_automation bounds (§16 blast radius): a prompt-injected agent must not be able to schedule
 // an amplification loop. We keep the tool read-tier/no-approval (owner's deliberate choice) but bound
-// it structurally — a minimum cadence (no sub-hourly cron) and a cap on the total enabled self/
-// schedule triggers per owner. Past the cap, the tool returns a clear error instead of inserting.
+// it structurally — a cap on the total enabled standing automations per owner. Past the cap, the tool
+// returns a clear error instead of inserting. There is deliberately NO cadence floor: the owner is the
+// decider and per-minute schedules are allowed (cron's finest granularity). A per-minute *poll* is
+// cheap — Tier-0 detect on no change is free, only escalations cost — so the standing-automation cap,
+// not a frequency limit, is the bound that matters.
 export const MAX_SELF_SCHEDULE_TRIGGERS = 25
 
 // A token in a single cron field: '*', a number, a step ('*/N' | 'a/N'), a range ('a-b'), or a
 // comma list of those. Used by the validator below — pg-boss cron is the standard 5-field form.
 const CRON_FIELD_TOKEN = /^(\*|\d+)(-\d+)?(\/\d+)?$/
 
-// The decision schedule_self makes from its `when` arg, as a pure value so it's unit-testable
+// The decision create_automation makes from its `when` arg, as a pure value so it's unit-testable
 // without a db write. `kind:'schedule'` ⇒ a recurring cron trigger; `kind:'self'` ⇒ a one-shot
-// trigger firing once at `nextFireAt`; `error` ⇒ a rejection (bad cron / unparseable timestamp /
-// sub-hourly cadence) surfaced to the agent as a clear tool error.
+// trigger firing once at `nextFireAt`; `error` ⇒ a rejection (bad cron / unparseable timestamp)
+// surfaced to the agent as a clear tool error.
 export type WhenDecision =
   | { kind: 'schedule'; cron: string }
   | { kind: 'self'; nextFireAt: Date }
   | { error: string }
 
-// Validate a standard 5-field cron expression AND enforce the minimum cadence. Returns an error
-// string (not throwing) so callers can surface it verbatim. Rejecting 6-field expressions matters:
-// pg-boss cron is 5-field, so a 6-field string would be silently misinterpreted. The cadence rule
-// (≥ hourly) accepts only a single fixed minute value (0–59) in the minute field — '*', a step, a
-// list, or a range there would fire multiple times per hour (sub-hourly), which we refuse.
+// Validate a standard 5-field cron expression. Returns an error string (not throwing) so callers can
+// surface it verbatim. Rejecting 6-field expressions matters: pg-boss cron is 5-field, so a 6-field
+// string would be silently misinterpreted. There is deliberately NO minimum-cadence floor — the owner
+// is the decider, and cron's finest granularity is 1 minute, so '* * * * *' (every minute) and '*/5'
+// (every 5 min) are allowed. The §16 self-scheduling bound is the standing-automation cap, not a
+// frequency limit (a per-minute poll is cheap — see MAX_SELF_SCHEDULE_TRIGGERS).
 function validateCron(expr: string): string | null {
   const fields = expr.split(/\s+/)
   if (fields.length !== 5) {
@@ -293,14 +299,12 @@ function validateCron(expr: string): string | null {
       if (!CRON_FIELD_TOKEN.test(part)) return `"${expr}" has an invalid cron field "${field}"`
     }
   }
-  // Minimum cadence: the minute field must be a single fixed minute (0–59). Anything that can match
-  // more than one minute-per-hour (wildcard, step, range, list) is sub-hourly and refused.
+  // A single fixed minute must still be in range (0–59); other forms (*, steps, ranges, lists) are
+  // shape-checked above and bounded by cron semantics at schedule time.
   const minute = fields[0]!
-  if (!/^\d+$/.test(minute)) {
-    return `"${expr}" schedules sub-hourly; the minute field must be a single fixed value (0–59) — minimum cadence is hourly`
+  if (/^\d+$/.test(minute) && Number(minute) > 59) {
+    return `"${expr}" has an out-of-range minute "${minute}"`
   }
-  const m = Number(minute)
-  if (m < 0 || m > 59) return `"${expr}" has an out-of-range minute "${minute}"`
   return null
 }
 
@@ -311,57 +315,78 @@ function validateCron(expr: string): string | null {
 // error, never a silently never-firing trigger.
 export function decideWhen(rawWhen: string): WhenDecision {
   const when = rawWhen.trim()
-  if (!when) return { error: 'schedule_self requires a non-empty when' }
+  if (!when) return { error: 'create_automation requires a non-empty when' }
   // More than one whitespace-separated field ⇒ the agent meant a cron expression. Validate it
-  // strictly (5 fields + cadence) rather than treating a malformed 5-token string as a valid cron
+  // strictly (5 fields, valid tokens) rather than treating a malformed 5-token string as a valid cron
   // that never fires.
   if (/\s/.test(when)) {
     const err = validateCron(when)
-    return err ? { error: `schedule_self: ${err}` } : { kind: 'schedule', cron: when }
+    return err ? { error: `create_automation: ${err}` } : { kind: 'schedule', cron: when }
   }
   // A single token: an absolute one-shot timestamp.
   const ms = Date.parse(when)
   if (Number.isNaN(ms)) {
-    return { error: `schedule_self: "${when}" is neither a cron expression nor a parseable timestamp` }
+    return { error: `create_automation: "${when}" is neither a cron expression nor a parseable timestamp` }
   }
   return { kind: 'self', nextFireAt: new Date(ms) }
 }
 
-// schedule_self: the agent schedules a future autonomous run (autonomous-watchers spec, §7.7
-// self-scheduling). Inserts ONE triggers row — a recurring cron ('schedule') or a one-shot future
-// time ('self', carrying THIS conversation so the future run appends here, not an orphan thread).
-// read-tier and NOT approval-gated (owner's decision): scheduling is low-risk because the future
-// run gates every ACTION itself; the 'read' tier is a deliberate "no approval" choice, not a
-// no-side-effects claim (it writes one triggers row). The owner can flip it to ask via the Tools
+// The agent-facing Trigger catalog, read once at module load (it can't drift from the registry).
+// Surfaces each Trigger's name + params schema in the create_automation description so the agent
+// picks a Trigger and fills valid params — the Trigger analogue of exposing the tool catalog.
+const TRIGGER_CATALOG = triggerCatalog()
+const TRIGGER_NAMES = TRIGGER_CATALOG.map((t) => t.name)
+const TRIGGER_CATALOG_DESCRIPTION = TRIGGER_CATALOG.map(
+  (t) => `${t.name} (${t.mode}): params ${JSON.stringify(t.paramsSchema)}`,
+).join('; ')
+
+// create_automation: the agent creates an autonomous automation (trigger-abstraction spec,
+// "Creation"; supersedes schedule_self). An automation = a chosen Trigger (the pluggable firing
+// mechanism — 'email'|'timer'|'webhook') + its schema-validated params + the action (objective) +
+// notify policy. Inserts ONE automations row. `params` is validated against the chosen Trigger's
+// paramsSchema at create time, so an invalid email automation is rejected up front, not silently
+// degraded to fire-every-tick (the old freeform-gate footgun).
+//
+// `when` selects the cadence for a POLL Trigger: a cron expression → a recurring `schedule`, or an
+// absolute ISO timestamp → a one-shot `next_fire_at` (carrying THIS conversation so the future run
+// appends here). A PUSH Trigger ('webhook') is enqueued by an ingress and takes no `when`.
+//
+// read-tier and NOT approval-gated (owner's decision): scheduling is low-risk because the future run
+// gates every ACTION itself; the 'read' tier is a deliberate "no approval" choice, not a
+// no-side-effects claim (it writes one automations row). The owner can flip it to ask via the Tools
 // page. group 'triggers'. source_run_id = the current run (provenance).
-export function makeScheduleSelfTool(conversationId: string, runId?: string): Tool {
+export function makeCreateAutomationTool(conversationId: string, runId?: string): Tool {
   return {
-    name: 'schedule_self',
+    name: 'create_automation',
     description:
-      'Schedule a future autonomous run for yourself — a reminder or a recurring check. Use a ' +
-      'cron expression (e.g. "0 8 * * *" for 8am daily) for a recurring schedule, or an absolute ' +
-      'ISO timestamp (e.g. "2026-06-20T09:00:00Z") for a one-time run. The scheduled run gates ' +
-      'any real actions itself when it fires.',
+      'Create an autonomous automation — a watcher or a scheduled/one-time run. Pick a trigger ' +
+      '(the firing mechanism) and fill its params. Available triggers: ' +
+      TRIGGER_CATALOG_DESCRIPTION +
+      '. For a poll trigger (email/timer) give `when`: a cron expression (e.g. "0 8 * * *" for 8am ' +
+      'daily) for a recurring schedule, or an absolute ISO-8601 timestamp (e.g. ' +
+      '"2026-06-20T09:00:00Z") for a one-time run. A webhook trigger needs no `when`. The automation ' +
+      'gates any real actions itself when it fires.',
     inputSchema: {
       type: 'object',
       properties: {
+        trigger: {
+          type: 'string',
+          enum: TRIGGER_NAMES,
+          description: 'The firing mechanism. ' + TRIGGER_CATALOG_DESCRIPTION,
+        },
+        params: {
+          type: 'object',
+          description: "The chosen trigger's params (validated against its schema). Omit for triggers with no params.",
+        },
         when: {
           type: 'string',
           description:
-            'A cron expression for a recurring schedule, or an absolute ISO-8601 timestamp for a one-time run.',
+            'For a poll trigger: a cron expression for a recurring schedule, or an absolute ISO-8601 ' +
+            'timestamp for a one-time run. Omit for a webhook (push) trigger.',
         },
         objective: {
           type: 'string',
-          description: 'What the future run should do (its seed prompt).',
-        },
-        gate: {
-          type: 'object',
-          description:
-            'Optional Tier-0 deterministic gate { tool, args, signal } — only escalate to a full ' +
-            'run when a read-tier tool result changes. signal: "maxUid" for NEW arrivals (monotonic — ' +
-            'use this for new-mail/new-item watchers; reading or removing items never re-fires), ' +
-            '"count" only if a decrease should ALSO fire, "hash" for content changes. The first poll ' +
-            'establishes a baseline silently (it never fires on what already exists). Omit to always run.',
+          description: 'What the automation run should do when it fires (its seed prompt).',
         },
         notify_policy: {
           type: 'string',
@@ -369,24 +394,43 @@ export function makeScheduleSelfTool(conversationId: string, runId?: string): To
           description: 'When a finished run should push a notification (default on_change).',
         },
       },
-      required: ['when', 'objective'],
+      required: ['trigger', 'objective'],
     },
     trustTier: 'read',
     group: 'triggers',
     async invoke(args: unknown): Promise<unknown> {
       const {
+        trigger: rawTrigger,
+        params: rawParams,
         when: rawWhen,
         objective: rawObjective,
-        gate,
         notify_policy: rawNotifyPolicy,
       } = (args ?? {}) as {
+        trigger?: unknown
+        params?: unknown
         when?: unknown
         objective?: unknown
-        gate?: unknown
         notify_policy?: unknown
       }
+
       const objective = String(rawObjective ?? '').trim()
-      if (!objective) throw new Error('schedule_self requires a non-empty objective')
+      if (!objective) throw new Error('create_automation requires a non-empty objective')
+
+      // Resolve the chosen Trigger from the registry; an unknown name is a clear tool error (the
+      // agent picked something not shipped) rather than a thrown crash.
+      const triggerName = String(rawTrigger ?? '').trim()
+      let trigger
+      try {
+        trigger = lookupTrigger(triggerName)
+      } catch {
+        return { ok: false, error: `create_automation: unknown trigger "${triggerName}" (available: ${TRIGGER_NAMES.join(', ')})` }
+      }
+
+      // Validate params against the Trigger's paramsSchema at create time — the whole point of the
+      // abstraction (an invalid email automation is rejected here, not silently fire-every-tick).
+      const params = rawParams ?? null
+      const paramErr = validateParams(trigger.paramsSchema, params)
+      if (paramErr) return { ok: false, error: `create_automation: invalid params for "${triggerName}" — ${paramErr}` }
 
       const notifyPolicy =
         rawNotifyPolicy === 'always' ||
@@ -396,42 +440,48 @@ export function makeScheduleSelfTool(conversationId: string, runId?: string): To
           ? rawNotifyPolicy
           : 'on_change'
 
-      // Decide cron vs one-shot timestamp + validate (5-field cron, ≥ hourly cadence). A rejection
-      // is returned as a tool error the agent can read and correct — NOT a thrown exception, and
-      // never a silently never-firing row. (Bare arrays are never returned — CHANGELOG 34.)
-      const decision = decideWhen(String(rawWhen ?? ''))
-      if ('error' in decision) return { ok: false, error: decision.error }
+      // A push Trigger ('webhook') is enqueued by an ingress, never scheduled — it takes no `when`.
+      // A poll Trigger needs a `when`: cron (recurring) or timestamp (one-shot). decideWhen validates
+      // the 5-field cron syntax (no cadence floor — per-minute allowed); a rejection is returned as a
+      // tool error, never a silently never-firing row. (Bare arrays are never returned — CHANGELOG 34.)
+      const isPush = trigger.mode === 'push'
+      let schedule: string | null = null
+      let nextFireAt: Date | null = null
+      if (!isPush) {
+        const decision = decideWhen(String(rawWhen ?? ''))
+        if ('error' in decision) return { ok: false, error: decision.error }
+        if (decision.kind === 'schedule') schedule = decision.cron
+        else nextFireAt = decision.nextFireAt
+      }
 
-      // Cap the standing recurring/one-shot self-scheduled triggers per owner so a prompt-injected
-      // agent can't fan out an amplification loop (§16). Count the owner's enabled self/schedule rows
-      // and refuse past the cap with a clear error. Kept here (not as a write-tier gate) so the tool
-      // stays read-tier/no-approval per the owner's decision.
+      // Cap the standing automations per owner so a prompt-injected agent can't fan out an
+      // amplification loop (§16). Count the owner's enabled rows and refuse past the cap. Kept here
+      // (not as a write-tier gate) so the tool stays read-tier/no-approval per the owner's decision.
       const db = getDb()
-      const enabled = await listEnabledTriggers(db, OWNER_USER_ID)
-      const standing = enabled.filter((t) => t.kind === 'self' || t.kind === 'schedule').length
-      if (standing >= MAX_SELF_SCHEDULE_TRIGGERS) {
+      const enabled = await listEnabledAutomations(db, OWNER_USER_ID)
+      if (enabled.length >= MAX_SELF_SCHEDULE_TRIGGERS) {
         return {
           ok: false,
           error:
-            `schedule_self: already at the cap of ${MAX_SELF_SCHEDULE_TRIGGERS} scheduled triggers — ` +
+            `create_automation: already at the cap of ${MAX_SELF_SCHEDULE_TRIGGERS} automations — ` +
             `disable an existing one before adding another.`,
         }
       }
 
-      const isCron = decision.kind === 'schedule'
-      const { id } = await insertTrigger(db, {
+      // A recurring (cron) or push automation lives in its own persistent conversation (resolved by
+      // the detect handler); a one-shot run appends to THIS conversation.
+      const isOneShot = !schedule && nextFireAt != null
+      const { id } = await insertAutomation(db, {
         userId: OWNER_USER_ID,
         // A short human label from the objective (the row's `name`).
         name: objective.slice(0, 80),
-        kind: decision.kind,
-        // A recurring 'schedule' lives in its own persistent trigger conversation (resolved by the
-        // detect handler); a one-shot 'self' run appends to THIS conversation.
-        conversationId: isCron ? null : conversationId,
-        schedule: isCron ? decision.cron : null,
-        gate: gate ?? null,
+        trigger: triggerName,
+        conversationId: isOneShot ? conversationId : null,
+        schedule,
+        params,
         objective,
         notifyPolicy,
-        nextFireAt: isCron ? null : decision.nextFireAt,
+        nextFireAt,
         sourceRunId: runId ?? null,
       })
       return { ok: true, id }
@@ -439,14 +489,14 @@ export function makeScheduleSelfTool(conversationId: string, runId?: string): To
   }
 }
 
-// The management half of the `triggers` tool family (schedule_self is the create half). list is
+// The management half of the `triggers` tool family (create_automation is the create half). list is
 // read-tier; disable + delete are write-tier so a prompt-injected agent can't silently kill the
-// owner's watchers (approval is owner-overridable from the Tools page). All in group 'triggers'.
+// owner's automations (approval is owner-overridable from the Tools page). All in group 'triggers'.
 export const listTriggersTool: Tool = {
   name: 'list_triggers',
   description:
-    'List your scheduled triggers / watchers (recurring schedules, inbox/page watchers, one-shot ' +
-    'reminders) with their id, kind, schedule, enabled state, objective, and last/next fire time. ' +
+    'List your automations / watchers (recurring schedules, inbox/page watchers, one-shot ' +
+    'reminders) with their id, trigger, schedule, enabled state, objective, and last/next fire time. ' +
     'Use an id with disable_trigger or delete_trigger.',
   inputSchema: { type: 'object', properties: {} },
   trustTier: 'read',
@@ -457,7 +507,7 @@ export const listTriggersTool: Tool = {
       triggers: rows.map((t) => ({
         id: t.id,
         name: t.name,
-        kind: t.kind,
+        trigger: t.trigger,
         enabled: t.enabled,
         schedule: t.schedule,
         objective: t.objective,
@@ -510,26 +560,26 @@ export const deleteTriggerTool: Tool = {
   },
 }
 
-// Fire a trigger NOW (read-tier — testing convenience; it only fires an EXISTING owner trigger,
-// and the spawned action run still gates write/destructive tools, so the blast radius is "run an
-// already-defined objective now". Owner can flip it to ask via the Tools page).
-export const runTriggerTool: Tool = {
-  name: 'run_trigger',
+// Fire an automation NOW (read-tier — testing convenience; it only fires an EXISTING owner
+// automation, and the spawned action run still gates write/destructive tools, so the blast radius is
+// "run an already-defined objective now". Owner can flip it to ask via the Tools page).
+export const runAutomationTool: Tool = {
+  name: 'run_automation',
   description:
-    'Fire a scheduled trigger NOW instead of waiting for its schedule (useful for testing). mode ' +
-    '"now" (default) skips the gate + triage and runs the watcher\'s objective immediately — best ' +
+    'Fire an automation NOW instead of waiting for its schedule (useful for testing). mode ' +
+    '"now" (default) skips detection + triage and runs the automation\'s objective immediately — best ' +
     'for testing the action + its notification; mode "detect" runs the full detection ladder ' +
-    '(gate → triage) now, exactly as a real tick would. Find the id with list_triggers. The fired ' +
-    'run still gates any write/destructive actions.',
+    '(the trigger\'s detect() → triage) now, exactly as a real tick would. Find the id with ' +
+    'list_triggers. The fired run still gates any write/destructive actions.',
   inputSchema: {
     type: 'object',
     properties: {
-      id: { type: 'string', description: 'The trigger id from list_triggers.' },
+      id: { type: 'string', description: 'The automation id from list_triggers.' },
       mode: {
         type: 'string',
         enum: ['now', 'detect'],
         description:
-          '"now" (default) = skip detection, run the objective immediately; "detect" = run the gate + triage ladder now.',
+          '"now" (default) = skip detection, run the objective immediately; "detect" = run the detect() + triage ladder now.',
       },
     },
     required: ['id'],
@@ -539,10 +589,10 @@ export const runTriggerTool: Tool = {
   async invoke(args: unknown): Promise<unknown> {
     const { id: rawId, mode } = (args ?? {}) as { id?: unknown; mode?: unknown }
     const id = String(rawId ?? '').trim()
-    if (!id) return { ok: false, error: 'run_trigger requires a trigger id' }
-    const trigger = await getTrigger(getDb(), id)
-    if (!trigger) return { ok: false, error: 'no such trigger' }
-    if (!trigger.enabled) return { ok: false, error: 'trigger is disabled — enable it first' }
+    if (!id) return { ok: false, error: 'run_automation requires an automation id' }
+    const automation = await getAutomation(getDb(), id)
+    if (!automation) return { ok: false, error: 'no such automation' }
+    if (!automation.enabled) return { ok: false, error: 'automation is disabled — enable it first' }
     const force = mode !== 'detect' // default 'now' ⇒ skip detection, run the objective immediately
     await enqueueTriggerDetect(id, { force })
     return { ok: true, id, mode: force ? 'now' : 'detect' }

@@ -2,6 +2,12 @@ export type { Role, ContentPart, Message, StreamEvent } from './types.js'
 export type { LlmProvider, StreamOptions } from './provider.js'
 export { type Tool, type ToolContext, type ToolLlmCall, echoTool } from './tool.js'
 export {
+  type Trigger,
+  type DetectCtx,
+  type DetectResult,
+  type TriggerEvent,
+} from './trigger.js'
+export {
   runAgent,
   CancelledError,
   type RunOptions,

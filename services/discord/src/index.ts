@@ -13,12 +13,20 @@
 // DISCORD_GUILD_ID. When set, the owner's private Alfred guild becomes the home surface: two FORUM
 // channels (`conversations`, `watchers`), where a forum POST is a conversation (it's a thread with
 // its own channel id, so the existing channel_key=message.channelId keying is unchanged). Inside
-// that guild the bot answers EVERY owner message in a post (no @-mention), a DM just redirects, and
-// each recurring watcher gets its own post — its run streams + approvals there over the SAME paths a
-// DM turn uses. To stream a watcher-initiated run (which has NO preceding owner message), the bot
-// LISTENs every watcher's conversation up front (watcher-reconcile, below) and LAZILY creates render
-// state when the first event arrives. When DISCORD_GUILD_ID is UNSET, none of this runs — the bot is
-// byte-for-byte today's DM-or-mention bot.
+// that guild the bot answers EVERY owner message in a post (no @-mention) and a DM just redirects.
+//
+// Per-fire watcher conversations (spec docs/specs/2026-06-20-watcher-conversation-per-fire.md). The
+// "one persistent watcher post" model is RETIRED: each Tier-2 escalation now lands in its OWN fresh
+// conversation (created by the worker, ingress='trigger', conversations.automation_id set), and the
+// notifications outbox is the cross-surface fan-out. The bot is a SECOND consumer of the 'notifications'
+// channel (alongside the worker's Web Push dispatcher — LISTEN/NOTIFY broadcasts to both): on the FIRST
+// notification for a watcher conversation (a mid-run approval/question OR the final result/error), it
+// creates a NEW post in the `watchers` forum (a new thread = a real Discord ping), repoints the
+// conversation to (ingress='discord', channel_key=<post id>), and renders the content read FROM THE DB
+// (post-final, no token streaming — watcher reports are async, the new post is itself the alert). A reply
+// IN that post is then an ordinary ingress='discord' message handled by the normal onMessageCreate path,
+// so no standing LISTEN / proactive reconcile is needed. When DISCORD_GUILD_ID is UNSET, none of the
+// guild model runs — the bot is byte-for-byte today's DM-or-mention bot.
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -28,12 +36,11 @@ import {
   enqueueAgentRun,
   getDb,
   getOrCreateConversationByChannel,
-  getTriggerByConversation,
-  listEnabledTriggers,
   messages,
-  OWNER_USER_ID,
+  notifications as notificationsTable,
+  readLastAssistantText,
+  repointConversationChannel,
   resolveInteraction,
-  setTriggerConversation,
   userInteractions,
 } from '@alfred/db'
 import { executeCommand, listCommands } from '@alfred/commands'
@@ -183,27 +190,6 @@ function catchAllChannelKey(guildId: string): string {
   return `guild:${guildId}:catch-all`
 }
 
-// Watcher-reconcile bookkeeping: trigger ids we've already given a live Discord post + LISTEN this
-// process, so repeated sweeps don't double-create posts or re-LISTEN. Not durable (rebuilt at boot
-// by re-reading triggers.conversation_id), which is the fail-and-restart model — a restart re-reads
-// the rows and re-LISTENs, creating a post only for a watcher that still lacks one.
-const reconciledTriggers = new Set<string>()
-
-// Channel names (`conversation:<id>`) that carry a STANDING watcher LISTEN — the proactive
-// subscription reconcile opens so a watcher-initiated run streams in even with no owner message.
-// teardownRender must NOT UNLISTEN these: an interactive turn the owner had inside a watcher post
-// tears down its render state on `done`, but the standing subscription must survive so the watcher's
-// NEXT autonomous fire still streams (without it the channel would silently go dark until the next
-// 30s reconcile re-LISTENs). Populated by listenConversation; never cleared (the bot listens for the
-// life of the process — a removed watcher just stops NOTIFYing).
-const standingListens = new Set<string>()
-
-// How often the watcher-reconcile sweep runs (mirrors services/triggers SWEEP_INTERVAL_MS): it
-// ensures every enabled watcher has a Discord post + an open LISTEN, so a watcher created at runtime
-// (the agent calling schedule_self, or a row inserted directly) starts streaming into Discord
-// without a bot restart.
-const RECONCILE_INTERVAL_MS = 30_000
-
 const notifyClient = new pg.Client({ connectionString: POSTGRES_URL })
 
 // Set before the deliberate notifyClient.end() in the SIGINT/SIGTERM handler, so the 'end' listener
@@ -320,34 +306,39 @@ function scheduleFlush(state: RenderState): void {
   }, EDIT_THROTTLE_MS)
 }
 
-// Tear down a finished run's render state: disable any still-open interaction components, clear its
-// timer, drop it from the dispatch map, and UNLISTEN its channel (the shared client no longer needs
-// notifications for it). Idempotent.
-async function teardownRender(channel: string): Promise<void> {
-  const state = renderByChannel.get(channel)
-  if (!state) return
-  // Any component message still tracked here is an interaction that never got an
-  // `interaction_resolved` — most importantly a TIMEOUT (the worker resolves the interaction to
-  // `timed_out` but emits NO interaction_resolved event), but also an error/cancel mid-pause. If
-  // we just dropped the state the buttons/select would stay clickable forever against a terminal
-  // run. Disable them with a brief terminal note. Best-effort, in parallel.
+// Disable + drop every still-open interaction component tracked on a render state. A tracked
+// component is an interaction that never got a local resolve nor an `interaction_resolved` — most
+// importantly a TIMEOUT (the worker resolves it to `timed_out` but emits NO interaction_resolved),
+// or a cross-surface resolve the bot couldn't observe (a watcher post is not LISTENed, so a
+// web-side approval never reaches it). Leaving them live would keep buttons/select clickable
+// forever against a terminal interaction. Disable with a brief terminal note. Best-effort, parallel.
+async function disablePendingComponents(state: RenderState): Promise<void> {
+  if (state.pendingComponents.size === 0) return
   await Promise.all(
     [...state.pendingComponents.values()].map((compMsg) =>
       compMsg.edit({ content: `${compMsg.content}\n\n_No longer available._`, components: [] }).catch(() => {}),
     ),
   )
   state.pendingComponents.clear()
+}
+
+// Tear down a finished run's render state: disable any still-open interaction components, clear its
+// timer, drop it from the dispatch map, and UNLISTEN its channel (the shared client no longer needs
+// notifications for it). Idempotent.
+async function teardownRender(channel: string): Promise<void> {
+  const state = renderByChannel.get(channel)
+  if (!state) return
+  await disablePendingComponents(state)
   if (state.editTimer) {
     clearTimeout(state.editTimer)
     state.editTimer = undefined
   }
   renderByChannel.delete(channel)
-  // Keep a standing watcher subscription open across a finished run — only UNLISTEN an ad-hoc
-  // owner-turn subscription (a DM / interactive post that has no proactive listen). A watcher post's
-  // channel stays subscribed so its NEXT autonomous fire streams without waiting for a reconcile.
-  if (!standingListens.has(channel)) {
-    await notifyClient.query(`UNLISTEN "${channel}"`).catch(() => {})
-  }
+  // The per-conversation LISTEN was opened for THIS run (onMessageCreate, an interactive turn); the
+  // run is terminal, so UNLISTEN it. There are no standing watcher subscriptions anymore — a watcher
+  // run never streams into Discord (its report is posted post-final from the notifications consumer),
+  // so the only conversation:<id> channels we LISTEN are interactive turns, all torn down here.
+  await notifyClient.query(`UNLISTEN "${channel}"`).catch(() => {})
 }
 
 // --- Outbound images ----------------------------------------------------------------------------
@@ -614,108 +605,6 @@ async function handleEvent(state: RenderState, event: { type?: string; [k: strin
   }
 }
 
-// Lazily stand up render state for a WATCHER-initiated run streaming over a LISTENed conversation
-// that has no render state yet (the watcher run had no preceding owner message — spec "Watcher-render
-// path"). We can't post the target message synchronously here (the dispatcher is sync), so build the
-// state with an EMPTY `emitted` and prepend the message-post to its eventChain: because eventChain
-// serializes everything, the post completes before any event handler reads state.emitted, and a
-// subsequent event for the same channel chains AFTER the post rather than racing it. The forum post
-// to render into is the channel id parsed off `conversation:<id>` resolved back to its Discord post
-// via the trigger's conversation; falling back to the watchers forum's matching thread.
-//
-// Eligibility: only create state for an event that actually has a Discord surface to render
-// (token/tool_call_*/interaction_required). A bare terminal (done/error/cancelled) for a run we
-// never rendered, or a payload-less ping, has nothing to show — skip it (returns null) so we don't
-// post an empty message into the post for a no-op.
-function lazyWatcherRender(
-  channel: string,
-  event: { type?: string; [k: string]: unknown },
-): RenderState | undefined {
-  if (!channel.startsWith('conversation:')) return undefined
-  const conversationId = channel.slice('conversation:'.length)
-  const renderable =
-    event.type === 'token' ||
-    event.type === 'tool_call_start' ||
-    event.type === 'tool_call_end' ||
-    event.type === 'interaction_required'
-  if (!renderable) return undefined
-
-  const state: RenderState = {
-    conversationId,
-    emitted: [],
-    buffer: '',
-    sealedLen: 0,
-    editTimer: undefined,
-    editing: false,
-    pendingFlush: false,
-    flushPromise: undefined,
-    // A watcher run has no preceding owner message, so every assistant/tool message this run writes
-    // is new — capture nothing to exclude (null selects the whole conversation's images; the role
-    // filter still keeps inbound owner images out, and a fresh watcher post has none anyway).
-    sinceMessageId: null,
-    pendingComponents: new Map(),
-    eventChain: Promise.resolve(),
-  }
-  renderByChannel.set(channel, state)
-  // Prepend the post-into-the-thread step so it lands before the first event handler. If it fails
-  // to resolve a target post, tear the state down so a later event re-attempts (and we don't strand
-  // a stateful-but-surfaceless channel).
-  state.eventChain = state.eventChain.then(async () => {
-    const target = await openWatcherTarget(conversationId)
-    if (target) {
-      state.emitted.push(target)
-    } else {
-      // No post to render into — drop the state + stop listening would lose the standing watcher
-      // LISTEN, so DON'T UNLISTEN here; just drop the render state and let reconcile re-establish a
-      // post. Removing the map entry lets the next event re-enter lazyWatcherRender.
-      renderByChannel.delete(channel)
-    }
-  })
-  return state
-}
-
-// Resolve the Discord forum post a watcher run should render into, and return a fresh placeholder
-// message posted into it (the run's first edit target). The watcher's trigger points at this
-// conversation (triggers.conversation_id), and reconcile created the post as that conversation's
-// channel_key — so the conversation's channelKey IS the post's channel id. Fetch that channel and
-// post a placeholder. Best-effort: returns null (logged) on any mismatch, so a non-watcher or
-// foreign channel degrades silently instead of getting a stray '…' placeholder.
-async function openWatcherTarget(conversationId: string): Promise<DiscordMessage | null> {
-  try {
-    const [conv] = await db
-      .select({ ingress: conversationsTable.ingress, channelKey: conversationsTable.channelKey })
-      .from(conversationsTable)
-      .where(eq(conversationsTable.id, conversationId))
-    if (!conv || conv.ingress !== 'discord') return null
-    // EVERY Discord conversation is ingress='discord' (DMs, mention turns, ordinary #conversations
-    // posts) — the ingress check alone does NOT confine this to watcher posts. Watcher output is the
-    // most sensitive thing the bot emits, so before posting confirm BOTH: (a) this conversation is a
-    // genuine, still-enabled watcher (a trigger points at it), and (b) the channel lives in OUR
-    // guild. Either miss → null + log, so a stale/duplicate NOTIFY can't drop a stray placeholder
-    // into a DM, an unrelated post, or a foreign channel.
-    const watcher = await getTriggerByConversation(db, conversationId).catch(() => undefined)
-    if (!watcher || !watcher.enabled) {
-      console.error(`[discord ${conversationId}] not an enabled watcher conversation; skipping`)
-      return null
-    }
-    const channel = await client.channels.fetch(conv.channelKey).catch(() => null)
-    if (!channel || !channel.isSendable()) return null
-    if (!('guildId' in channel) || channel.guildId !== DISCORD_GUILD_ID) {
-      console.error(`[discord ${conversationId}] watcher channel not in the Alfred guild; skipping`)
-      return null
-    }
-    // A low-frequency watcher thread can auto-archive after Discord's inactivity window; a render
-    // into an archived thread fails. Un-archive first (best-effort) so the placeholder + run stream.
-    if (channel.isThread() && channel.archived) {
-      await channel.setArchived(false).catch(() => {})
-    }
-    return await channel.send({ content: '…' })
-  } catch (err) {
-    console.error(`[discord ${conversationId}] failed to open watcher render target:`, err)
-    return null
-  }
-}
-
 notifyClient.on('notification', (msg) => {
   if (!msg.channel || !msg.payload) return
   let event: { type?: string; [k: string]: unknown }
@@ -725,17 +614,12 @@ notifyClient.on('notification', (msg) => {
     return // ignore malformed payloads
   }
 
-  let state = renderByChannel.get(msg.channel)
-  if (!state) {
-    // No render state for this channel. For an owner-initiated turn that's a stale NOTIFY for a
-    // torn-down run — ignore. But a WATCHER-initiated run has no preceding owner message (onMessage
-    // never ran), only the standing LISTEN from watcher-reconcile, so the FIRST event arrives with
-    // no state: lazily create render state + a fresh target message posted into the watcher's forum
-    // post (lazyWatcherRender). Only meaningful events (a terminal/teardown for a vanished run, or a
-    // payload-less ping) are skipped — see lazyWatcherRender's eligibility check.
-    state = lazyWatcherRender(msg.channel, event)
-    if (!state) return
-  }
+  const state = renderByChannel.get(msg.channel)
+  // No render state for this channel ⇒ a stale NOTIFY for a torn-down (or never-rendered) run —
+  // ignore it. Watcher runs no longer stream into Discord: their report is posted post-final by the
+  // notifications consumer (below), not over the conversation channel, so the only conversation:<id>
+  // channels with state are interactive turns the owner started via onMessageCreate.
+  if (!state) return
   // Serialize per-channel handling so two events don't interleave their Discord calls (a token
   // edit racing the done teardown); chained on a per-state promise, preserving NOTIFY order. A
   // handler throw is swallowed so the chain never wedges.
@@ -763,6 +647,266 @@ notifyClient.on('end', () => {
   console.error('[discord] NOTIFY connection ended unexpectedly — exiting for pm2 restart')
   process.exit(1)
 })
+
+// --- Notifications consumer (per-fire watcher posts, spec 2026-06-20) ---------------------------
+//
+// The bot is a SECOND consumer of the 'notifications' channel (the worker's Web Push dispatcher is
+// the first; LISTEN/NOTIFY broadcasts to both independently). The NOTIFY payload is a bare doorbell
+// (run.ts: pgNotify('notifications', '')), so on each ping we re-read recent rows and act on the ones
+// we haven't yet. A watcher run no longer streams into Discord — instead, on the FIRST notification
+// for a watcher conversation (a mid-run approval/question OR the final result/error) we create a NEW
+// post in the `watchers` forum (a real Discord ping), repoint the conversation to it, and render the
+// content read FROM THE DB. A reply in that post is then an ordinary onMessageCreate turn.
+//
+// Status-column ownership: this consumer NEVER touches notifications.status — the Web Push dispatcher
+// owns the outbox lifecycle (sent/failed). The two don't clash because we dedupe locally (seenNotifs)
+// instead of by status, and we read rows regardless of status. The price: on a bot restart we'd
+// re-see every still-pending row, so a boot catch-up could post a flood of historical fires; the spec
+// says a fire while the bot is down notifies via Web Push ONLY (no catch-up post), so boot SEEDS
+// seenNotifs with every existing notification id — only rows that appear AFTER boot get a post.
+
+const notifClient = new pg.Client({ connectionString: POSTGRES_URL })
+
+// Notification ids already handled this process (dedupe; seeded at boot with the existing backlog so
+// historical fires never get a catch-up post — spec "Re-pointing when the bot is down").
+const seenNotifs = new Set<string>()
+
+// Watcher conversation id -> the Discord post (thread) channel id we created for it this process, so
+// the SECOND notification for the same fire (e.g. result after an approval) renders into the existing
+// post instead of creating a duplicate. Persisted only in-process; a restart rebuilds it lazily from
+// conversations.ingress='discord' (a repointed conversation needs no new post — its channelKey IS the
+// post). Mirrors the old reconciledTriggers de-dup intent.
+const watcherPosts = new Map<string, string>()
+
+// Serializes notification drains (a burst of NOTIFYs + the per-channel async post-create/render)
+// so two pings don't race into creating two posts for the same fire.
+let notifDrainChain: Promise<void> = Promise.resolve()
+
+function scheduleNotifDrain(): void {
+  notifDrainChain = notifDrainChain
+    .then(() => drainNotifications())
+    .catch((err) => console.error('[discord] notifications drain failed:', err))
+}
+
+// Read recent notification rows and handle any unseen ones whose conversation is a WATCHER
+// conversation (conversations.automation_id set). Bounded (most-recent 50 by uuidv7 id) — a fire
+// generates at most a few rows (result, or approval(s)+result), and seenNotifs caps re-work; the
+// window only needs to comfortably exceed the rows produced between two drains.
+async function drainNotifications(): Promise<void> {
+  let rows
+  try {
+    rows = await db
+      .select({
+        id: notificationsTable.id,
+        conversationId: notificationsTable.conversationId,
+        interactionId: notificationsTable.interactionId,
+        kind: notificationsTable.kind,
+        title: notificationsTable.title,
+        body: notificationsTable.body,
+        automationId: conversationsTable.automationId,
+        channelKey: conversationsTable.channelKey,
+        ingress: conversationsTable.ingress,
+        convTitle: conversationsTable.title,
+      })
+      .from(notificationsTable)
+      .innerJoin(conversationsTable, eq(notificationsTable.conversationId, conversationsTable.id))
+      .orderBy(desc(notificationsTable.id))
+      .limit(50)
+  } catch (err) {
+    console.error('[discord] notifications read failed:', err)
+    return
+  }
+
+  // Process oldest-first (rows came newest-first) so a fire's approval renders before its result, and
+  // a missing post is created by the FIRST notification rather than the last.
+  for (const row of rows.reverse()) {
+    if (seenNotifs.has(row.id)) continue
+    seenNotifs.add(row.id)
+    // Only watcher conversations: automation_id must be set (a normal web/discord/voice conversation
+    // has none, and its run already streamed/answered live — nothing to post).
+    if (!row.automationId || !row.conversationId) continue
+    try {
+      await handleWatcherNotification(row)
+    } catch (err) {
+      console.error(`[discord] watcher notification ${row.id} handling failed:`, err)
+    }
+  }
+}
+
+// Handle one watcher notification: ensure the conversation has a Discord post (create + repoint on the
+// first notification), then render the notification's content into the post by reading the DB.
+async function handleWatcherNotification(row: {
+  id: string
+  conversationId: string | null
+  interactionId: string | null
+  kind: string
+  title: string
+  body: string
+  channelKey: string
+  ingress: string
+  convTitle: string | null
+}): Promise<void> {
+  const conversationId = row.conversationId!
+  const post = await ensureWatcherPost(conversationId, row.ingress, row.channelKey, row.convTitle, row.title)
+  if (!post) return // forums unavailable / not in our guild — Web Push still delivered it
+
+  // Register (or reuse) a lightweight render state for this post so the approval/question renderers
+  // (which post into state.emitted[0]'s channel) and the component-resolve tracking work. Watcher
+  // runs don't stream, so we never LISTEN this conversation channel — the state only carries the post
+  // message + the pendingComponents map.
+  const channel = `conversation:${conversationId}`
+  let state = renderByChannel.get(channel)
+  if (!state) {
+    state = {
+      conversationId,
+      emitted: [post],
+      buffer: '',
+      sealedLen: 0,
+      editTimer: undefined,
+      editing: false,
+      pendingFlush: false,
+      flushPromise: undefined,
+      sinceMessageId: null,
+      pendingComponents: new Map(),
+      eventChain: Promise.resolve(),
+    }
+    renderByChannel.set(channel, state)
+  }
+
+  switch (row.kind) {
+    case 'approval':
+      if (row.interactionId) await renderApproval(state, row.interactionId)
+      break
+    case 'question':
+      if (row.interactionId) await renderQuestion(state, row.interactionId)
+      break
+    case 'error': {
+      const note = row.body?.trim() || 'A background task failed.'
+      await postWatcherText(post, `_Error: ${note}_`)
+      // A terminal notification means the run ended. Any approval/question this fire posted that the
+      // bot never saw resolved (timed out, or answered on web — the watcher post isn't LISTENed) must
+      // be disabled now so its buttons can't be clicked against a terminal interaction (S2).
+      await disablePendingComponents(state)
+      break
+    }
+    case 'result':
+    default: {
+      // Render the run's final report: the conversation's newest assistant text (read from the DB,
+      // post-final — no streaming) plus any images the run produced into the workspace.
+      const text = await readLastAssistantText(db, conversationId).catch(() => null)
+      if (text) await postWatcherText(post, text)
+      else if (row.body?.trim()) await postWatcherText(post, row.body.trim())
+      await uploadRunImages(state)
+      // Disable any leftover approval/question components for this terminal run (see the error case).
+      await disablePendingComponents(state)
+      break
+    }
+  }
+}
+
+// Ensure the watcher conversation has a Discord post, creating one on the first notification and
+// repointing the conversation to it. Returns the post's starter message (the surface the renderers
+// post into) or null if the forum is unavailable / not in our guild.
+//
+// Three cases:
+//   1. We already created a post this process (watcherPosts) — fetch + reuse it.
+//   2. The conversation is already ingress='discord' (a prior fire repointed it, surviving in the DB
+//      across a bot restart) — its channelKey IS the post; fetch + reuse, no new post.
+//   3. Still ingress='trigger' (worker just created it) — create a NEW post in the watchers forum and
+//      repoint the conversation to (ingress='discord', channel_key=<post id>).
+async function ensureWatcherPost(
+  conversationId: string,
+  ingress: string,
+  channelKey: string,
+  convTitle: string | null,
+  notificationTitle: string,
+): Promise<DiscordMessage | null> {
+  // Case 1/2: a post channel id is known (in-process map, or the conversation is already on Discord).
+  const knownPostId = watcherPosts.get(conversationId) ?? (ingress === 'discord' ? channelKey : undefined)
+  if (knownPostId) {
+    const msg = await fetchPostTarget(knownPostId)
+    if (msg) {
+      watcherPosts.set(conversationId, knownPostId)
+      // We created the post but a prior repoint failed (conversation still ingress='trigger') — retry
+      // so a reply in the post resolves. A no-op once it's already ingress='discord'.
+      if (ingress !== 'discord') {
+        await repointConversationChannel(db, { id: conversationId, ingress: 'discord', channelKey: knownPostId }).catch(
+          (err) => console.error(`[discord ${conversationId}] repoint retry failed:`, err instanceof Error ? err.message : err),
+        )
+      }
+      return msg
+    }
+    // The known post vanished (deleted) — fall through to create a fresh one.
+  }
+
+  // Case 3: create a new post in the watchers forum.
+  if (!watchersForum) {
+    console.error(`[discord ${conversationId}] watcher notification but no watchers forum — Web Push only`)
+    return null
+  }
+  const name = convTitle?.trim() || notificationTitle?.trim() || 'Watcher'
+  let post
+  try {
+    // Max auto-archive (1 week) so a low-frequency fire's post doesn't archive before the owner reads
+    // it. Seed the starter with the notification title (not a bare '…') so an approval/question-first
+    // fire reads as a sensible header rather than a dangling ellipsis; the result path edits it.
+    post = await createForumPost(watchersForum, name, notificationTitle?.trim() || name, 10080)
+  } catch (err) {
+    console.error(`[discord ${conversationId}] watcher post creation failed:`, err instanceof Error ? err.message : err)
+    return null
+  }
+  try {
+    await repointConversationChannel(db, { id: conversationId, ingress: 'discord', channelKey: post.id })
+  } catch (err) {
+    // The repoint failed — the conversation stays ingress='trigger', so a reply in the post won't
+    // resolve (onMessageCreate keys on channelId). Still post the report (better than silence), but
+    // log loudly. Best-effort; a next notification re-attempts the repoint via case 3 again.
+    console.error(`[discord ${conversationId}] repoint to post ${post.id} failed:`, err instanceof Error ? err.message : err)
+  }
+  watcherPosts.set(conversationId, post.id)
+  // The starter message of the post is its first renderable target (createForumPost seeds it with '…').
+  const starter = await post.fetchStarterMessage().catch(() => null)
+  return starter ?? (await fetchPostTarget(post.id))
+}
+
+// Fetch a fresh sendable message inside a post thread to render into. We post a new '…' message
+// rather than editing the starter, so each notification (approval card, then result) is its own
+// message in the thread. Returns null (logged) if the thread is gone / not in our guild / not sendable.
+async function fetchPostTarget(postChannelId: string): Promise<DiscordMessage | null> {
+  try {
+    const channel = await client.channels.fetch(postChannelId).catch(() => null)
+    if (!channel || !channel.isSendable()) return null
+    if (!('guildId' in channel) || channel.guildId !== DISCORD_GUILD_ID) {
+      console.error(`[discord] watcher post ${postChannelId} not in the Alfred guild; skipping`)
+      return null
+    }
+    // Un-archive a thread Discord auto-archived between fires, else the send fails.
+    if (channel.isThread() && channel.archived) {
+      await channel.setArchived(false).catch(() => {})
+    }
+    return await channel.send({ content: '…' })
+  } catch (err) {
+    console.error(`[discord] failed to open watcher post ${postChannelId}:`, err)
+    return null
+  }
+}
+
+// Post the watcher's report text into the post, editing the placeholder target and continuing past
+// Discord's 2000-char limit (reuse chunkMessage). Best-effort.
+async function postWatcherText(target: DiscordMessage, text: string): Promise<void> {
+  const chunks = chunkMessage(text, DISCORD_MESSAGE_LIMIT)
+  if (chunks.length === 0) return
+  await target.edit(chunks[0]!).catch((err) =>
+    console.error(`[discord] watcher report edit failed:`, err),
+  )
+  const channel = target.channel
+  if (!channel.isSendable()) return
+  for (const chunk of chunks.slice(1)) {
+    await channel.send({ content: chunk }).catch((err) =>
+      console.error(`[discord] watcher report continuation failed:`, err),
+    )
+  }
+}
 
 // --- Inbound message flow -----------------------------------------------------------------------
 
@@ -1196,14 +1340,14 @@ async function registerSlashCommands(applicationId: string): Promise<void> {
   console.log(`alfred-discord: registered ${body.length} global slash command(s)`)
 }
 
-// --- Guild home: forums + watcher-reconcile (gated on DISCORD_GUILD_ID) -------------------------
+// --- Guild home: forums (gated on DISCORD_GUILD_ID) ---------------------------------------------
 
 // Find (or create) the two forum channels the guild home needs: `conversations` and `watchers`.
 // Best-effort by design — a forum channel requires a COMMUNITY-enabled guild and Manage Channels,
 // neither of which we can guarantee. On any failure we log a clear, actionable error and leave the
 // forum refs null so every dependent feature degrades (no crash): the DM-redirect/mention filter
-// still works, /new reports the forum is unavailable, watcher-reconcile skips. Sets the module-level
-// conversationsForum/watchersForum refs.
+// still works, /new reports the forum is unavailable, and the notifications consumer can't create a
+// watcher post (Web Push still delivers). Sets the module-level conversationsForum/watchersForum refs.
 async function setupForums(guild: Guild): Promise<void> {
   // Need the bot's own Manage Channels to create a missing forum; without it we can still USE forums
   // that already exist. Check up front so the error message is precise.
@@ -1253,11 +1397,11 @@ async function findOrCreateForum(
 
 // Create a forum POST (a thread with a starter message, so it isn't empty). Discord requires the
 // starter `message` on a forum thread. `autoArchiveDuration` (minutes) overrides the forum default —
-// watcher posts pass the max (10080 = 1 week) so a low-frequency watcher's thread doesn't auto-
-// archive between fires (see openWatcherTarget's un-archive fallback for when it does anyway).
+// watcher posts pass the max (10080 = 1 week) so a low-frequency watcher's post doesn't auto-archive
+// before the owner reads it (see fetchPostTarget's un-archive fallback for when it does anyway).
 // Returns the created thread (its id is the conversation's channel_key). Throws on failure (callers
 // catch + degrade): a Community forum with "require tags when posting" rejects a tag-less create —
-// the most likely cause if a watcher never gets a post and the reconcile retries every sweep.
+// the most likely cause if a watcher post never gets created.
 async function createForumPost(
   forum: ForumChannel,
   name: string,
@@ -1273,93 +1417,11 @@ async function createForumPost(
   return thread
 }
 
-// Watcher-reconcile (the proactive-listen piece, spec "The bot proactively listens on its threads").
-// For each enabled watcher whose conversation is NOT yet a live Discord post, create a post in the
-// `watchers` forum, point the trigger's conversation_id at that post's conversation, and LISTEN its
-// conversation channel so a watcher-initiated run streams into the post (lazyWatcherRender stands up
-// the render state on the first event). Idempotent + de-duped via reconciledTriggers so repeated
-// sweeps don't double-create. Existing ingress='trigger' watchers are MIGRATED here: the repoint
-// moves them to a Discord post; their scratchpad (memory_facts scope trigger:<id>, keyed on the
-// trigger id) survives because run.ts resolves the watcher by conversation_id, which now points at
-// the post. Best-effort throughout — one watcher's failure is logged and doesn't block the rest.
-async function reconcileWatchers(): Promise<void> {
-  if (!watchersForum) return // forums unavailable — nothing to reconcile into
-  let triggerRows
-  try {
-    triggerRows = await listEnabledTriggers(db, OWNER_USER_ID)
-  } catch (err) {
-    console.error('[discord] watcher-reconcile: failed to list triggers:', err)
-    return
-  }
-
-  for (const trigger of triggerRows) {
-    // One-shot 'self' triggers run on their originating (interactive) conversation, not a watcher
-    // post — never reconcile them into the watchers forum (spec: recurring watchers only).
-    if (trigger.kind === 'self') continue
-    if (reconciledTriggers.has(trigger.id)) continue
-
-    try {
-      // Already a live Discord post? (conversation_id set AND that conversation is ingress='discord'.)
-      // If so, just ensure we're LISTENing it (this process may have restarted) and mark it done.
-      if (trigger.conversationId) {
-        const [conv] = await db
-          .select({ id: conversationsTable.id, ingress: conversationsTable.ingress })
-          .from(conversationsTable)
-          .where(eq(conversationsTable.id, trigger.conversationId))
-        if (conv?.ingress === 'discord') {
-          await listenConversation(conv.id)
-          reconciledTriggers.add(trigger.id)
-          continue
-        }
-      }
-
-      // No Discord post yet (no conversation_id, or it's still an ingress='trigger' conversation) —
-      // create one in the watchers forum, repoint the trigger at it, and start listening.
-      // Max auto-archive (1 week) so a low-frequency watcher's thread survives between fires.
-      const post = await createForumPost(
-        watchersForum,
-        trigger.name || 'Watcher',
-        `Watching: ${trigger.name || trigger.objective.slice(0, 200)}`,
-        10080,
-      )
-      const convId = await getOrCreateConversationByChannel(db, {
-        ingress: 'discord',
-        channelKey: post.id,
-        // Name the watcher's conversation by its post title (= the watcher name) so it isn't
-        // auto-titled by a watcher run (which has no owner message to set it).
-        title: trigger.name || 'Watcher',
-      })
-      await setTriggerConversation(db, { id: trigger.id, conversationId: convId })
-      await listenConversation(convId)
-      reconciledTriggers.add(trigger.id)
-      console.log(`[discord] watcher '${trigger.name}' (${trigger.id}) → post ${post.id} / conv ${convId}`)
-    } catch (err) {
-      // Leave it OUT of reconciledTriggers so the next sweep retries (e.g. a transient forum-create
-      // failure, or Manage Channels granted after boot). A persistent failure on EVERY sweep is most
-      // likely the `watchers` forum requiring tags on post — a tag-less create is rejected, so the
-      // watcher never gets a post; remove "require tags when posting" on that forum to fix it.
-      console.error(
-        `[discord] watcher-reconcile failed for ${trigger.id} (if this repeats every sweep, the 'watchers' forum likely requires tags on post — disable that):`,
-        err instanceof Error ? err.message : err,
-      )
-    }
-  }
-}
-
-// Open a standing LISTEN on a conversation channel (idempotent at the Postgres level — a duplicate
-// LISTEN is a no-op). Used by watcher-reconcile so a watcher-initiated run's NOTIFYs reach the
-// dispatcher even with no owner message having opened the subscription.
-async function listenConversation(conversationId: string): Promise<void> {
-  const channel = `conversation:${conversationId}`
-  standingListens.add(channel)
-  await notifyClient.query(`LISTEN "${channel}"`).catch((err) => {
-    console.error(`[discord] LISTEN ${channel} failed:`, err)
-  })
-}
-
-// Resolve the Alfred guild (cache → fetch), set up its forums, and run the first watcher-reconcile.
-// Gated on DISCORD_GUILD_ID by the caller. Best-effort: a missing/unreachable guild logs + leaves
-// the home features inert (the bot still answers DMs/mentions as the unconfigured bot would).
+// Resolve the Alfred guild (cache → fetch) and set up its forums. Gated on DISCORD_GUILD_ID by the
+// caller. Best-effort: a missing/unreachable guild logs + leaves the home features inert (the bot
+// still answers DMs/mentions as the unconfigured bot would). Watcher posts are no longer created here
+// (no proactive reconcile) — they're created on demand from the notifications consumer, the first time
+// a watcher conversation produces a notification.
 async function setupGuildHome(): Promise<void> {
   if (!DISCORD_GUILD_ID) return
   let guild: Guild | null
@@ -1373,7 +1435,6 @@ async function setupGuildHome(): Promise<void> {
     return
   }
   await setupForums(guild)
-  await reconcileWatchers()
   console.log(
     `alfred-discord: guild home ready — conversations forum ${conversationsForum ? 'ok' : 'MISSING'}, watchers forum ${watchersForum ? 'ok' : 'MISSING'}`,
   )
@@ -1381,30 +1442,25 @@ async function setupGuildHome(): Promise<void> {
 
 // --- Boot ---------------------------------------------------------------------------------------
 
-// Periodic watcher-reconcile timer (guild home only). Started in ClientReady; cleared on shutdown.
-let reconcileTimer: NodeJS.Timeout | undefined
+// Re-resolve the forums on a timer (guild home only) so the home self-heals if boot setup failed
+// (e.g. Manage Channels granted after boot, or the guild not yet Community-enabled). No watcher
+// reconcile anymore — posts are created on demand by the notifications consumer.
+const FORUM_RESETUP_INTERVAL_MS = 30_000
+let forumResetupTimer: NodeJS.Timeout | undefined
 
 client.once(Events.ClientReady, (ready) => {
   console.log(`alfred-discord: logged in as ${ready.user.tag}`)
   void registerSlashCommands(ready.user.id).catch((err) =>
     console.error('[discord] slash-command registration failed:', err),
   )
-  // Guild home (gated): set up forums + reconcile watchers at boot, then keep reconciling on a timer
-  // so a watcher created at runtime (schedule_self, or a direct row insert) gets its Discord post +
-  // LISTEN without a bot restart — mirroring how alfred-triggers reconciles cron on SWEEP_INTERVAL_MS.
+  // Guild home (gated): set up forums at boot, then re-resolve them on a timer until both are present
+  // so the home self-heals once the prerequisite (Community + Manage Channels) is fixed.
   if (DISCORD_GUILD_ID) {
     void setupGuildHome().catch((err) => console.error('[discord] guild-home setup failed:', err))
-    reconcileTimer = setInterval(() => {
-      // Forums may still be null if boot setup failed (e.g. Manage Channels granted later); re-resolve
-      // them each sweep before reconciling, so the home self-heals once the prerequisite is fixed.
-      void (async () => {
-        if (!conversationsForum || !watchersForum) {
-          await setupGuildHome().catch((err) => console.error('[discord] guild-home re-setup failed:', err))
-        } else {
-          await reconcileWatchers().catch((err) => console.error('[discord] watcher-reconcile failed:', err))
-        }
-      })()
-    }, RECONCILE_INTERVAL_MS)
+    forumResetupTimer = setInterval(() => {
+      if (conversationsForum && watchersForum) return
+      void setupGuildHome().catch((err) => console.error('[discord] guild-home re-setup failed:', err))
+    }, FORUM_RESETUP_INTERVAL_MS)
   }
 })
 
@@ -1412,9 +1468,45 @@ function isUniqueViolation(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23505'
 }
 
-// Connect the shared NOTIFY client first (a missing/unreachable Postgres fails fast here), then log
-// in to the Discord gateway.
+// Connect the shared NOTIFY client first (a missing/unreachable Postgres fails fast here).
 await notifyClient.connect()
+
+// Start the notifications consumer (per-fire watcher posts) — only in the guild model, where watcher
+// output lands in a forum post. Without DISCORD_GUILD_ID there's no watchers forum to post into, so
+// the worker's Web Push dispatcher is the only consumer (unchanged). A dropped socket exits for a pm2
+// restart, like notifyClient — the seed-then-live-only contract means a restart simply re-seeds (no
+// catch-up flood).
+if (DISCORD_GUILD_ID) {
+  await notifClient.connect()
+  notifClient.on('error', (err) => {
+    console.error('[discord] notifications LISTEN connection error — exiting for pm2 restart:', err)
+    process.exit(1)
+  })
+  notifClient.on('end', () => {
+    if (shuttingDown) return
+    console.error('[discord] notifications LISTEN connection ended unexpectedly — exiting for pm2 restart')
+    process.exit(1)
+  })
+  notifClient.on('notification', () => scheduleNotifDrain())
+  // Seed the dedupe set with the EXISTING backlog so a fire that happened while the bot was down is
+  // NOT given a catch-up post (spec "Re-pointing when the bot is down → Web Push only"). Only rows
+  // inserted after this point get a post. Bounded to the most-recent rows (uuidv7 id desc) — well
+  // above drainNotifications' 50-row read window, so nothing the drain could surface escapes the seed.
+  try {
+    const existing = await db
+      .select({ id: notificationsTable.id })
+      .from(notificationsTable)
+      .orderBy(desc(notificationsTable.id))
+      .limit(200)
+    for (const n of existing) seenNotifs.add(n.id)
+  } catch (err) {
+    console.error('[discord] notifications boot-seed failed (a stale fire may get a catch-up post):', err)
+  }
+  await notifClient.query('LISTEN "notifications"')
+  console.log('[discord] notifications consumer listening (per-fire watcher posts)')
+}
+
+// Log in to the Discord gateway.
 try {
   await client.login(botToken)
 } catch (err) {
@@ -1435,9 +1527,10 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     void (async () => {
       shuttingDown = true
-      if (reconcileTimer) clearInterval(reconcileTimer)
+      if (forumResetupTimer) clearInterval(forumResetupTimer)
       await client.destroy().catch(() => {})
       await notifyClient.end().catch(() => {})
+      await notifClient.end().catch(() => {})
       process.exit(0)
     })()
   })

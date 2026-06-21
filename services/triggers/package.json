@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@alfred/db": "workspace:*",
-    "@alfred/shared": "workspace:*"
+    "@alfred/shared": "workspace:*",
+    "croner": "^9.0.0"
   },
   "devDependencies": {
     "tsx": "^4.19.0",

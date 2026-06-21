@@ -60,26 +60,34 @@ describe('decideWhen — cron validation (5-field, pg-boss form)', () => {
   })
 })
 
-describe('decideWhen — minimum cadence (>= hourly)', () => {
-  it('rejects a wildcard minute (every minute — sub-hourly)', () => {
-    expect(expectError(decideWhen('* * * * *'))).toMatch(/sub-hourly/)
+describe('decideWhen — no cadence floor (per-minute allowed; owner decides)', () => {
+  it('accepts a wildcard minute (every minute)', () => {
+    expect(decideWhen('* * * * *')).toEqual({ kind: 'schedule', cron: '* * * * *' })
   })
 
-  it('rejects a stepped minute (*/5 — every 5 minutes)', () => {
-    expect(expectError(decideWhen('*/5 * * * *'))).toMatch(/sub-hourly/)
+  it('accepts a stepped minute (*/5 — every 5 minutes)', () => {
+    expect(decideWhen('*/5 * * * *')).toEqual({ kind: 'schedule', cron: '*/5 * * * *' })
   })
 
-  it('rejects a minute list (0,30 — twice an hour)', () => {
-    expect(expectError(decideWhen('0,30 * * * *'))).toMatch(/sub-hourly/)
+  it('accepts a minute list (0,30 — twice an hour)', () => {
+    expect(decideWhen('0,30 * * * *')).toEqual({ kind: 'schedule', cron: '0,30 * * * *' })
   })
 
-  it('rejects a minute range (0-30)', () => {
-    expect(expectError(decideWhen('0-30 * * * *'))).toMatch(/sub-hourly/)
+  it('accepts a minute range (0-30)', () => {
+    expect(decideWhen('0-30 * * * *')).toEqual({ kind: 'schedule', cron: '0-30 * * * *' })
   })
 
-  it('accepts a single fixed minute (hourly is the minimum allowed cadence)', () => {
+  it('accepts a single fixed minute too', () => {
     expect(decideWhen('0 * * * *')).toEqual({ kind: 'schedule', cron: '0 * * * *' })
     expect(decideWhen('15 * * * *')).toEqual({ kind: 'schedule', cron: '15 * * * *' })
+  })
+
+  it('still rejects an out-of-range single minute', () => {
+    expect(expectError(decideWhen('99 * * * *'))).toMatch(/out-of-range/)
+  })
+
+  it('still rejects a 6-field expression', () => {
+    expect(expectError(decideWhen('0 0 * * * *'))).toMatch(/5-field/)
   })
 })
 

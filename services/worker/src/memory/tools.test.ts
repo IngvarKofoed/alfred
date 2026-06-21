@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Capture the db helper calls so we can assert makeMemoryTools threads the right `scope` to
 // insertMemoryFact / listMemoryFacts (autonomous-watchers review fix #1: a watcher run's
-// remember/list_memories must operate on its `trigger:<id>` scratchpad scope, not the owner's
+// remember/list_memories must operate on its `automation:<id>` scratchpad scope, not the owner's
 // global memory). Offline — the helpers are mocked, no Postgres.
 const insertMemoryFact = vi.fn(async () => ({ id: 'new-id' }))
 const deleteMemoryFact = vi.fn(async () => ({ deleted: true }))
@@ -60,7 +60,7 @@ describe('default (interactive) scope is global — unchanged', () => {
 })
 
 describe('watcher scope is threaded through remember + list_memories', () => {
-  const scope = 'trigger:abc-123'
+  const scope = 'automation:abc-123'
 
   it('remember saves to the watcher scratchpad scope', async () => {
     await toolByName(scope)('remember').invoke({ text: 'last uid 42' })

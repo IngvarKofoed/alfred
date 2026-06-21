@@ -73,7 +73,9 @@ export function emailConfig(need: 'imap' | 'smtp', cfg: Config = loadConfig()): 
 
 // Connect-per-call (Approach A): a fresh IMAP connection per invoke, always logged out in
 // finally — no module-level/pooled connection, so a worker crash drops nothing to reclaim.
-async function withImap<T>(fn: (c: ImapFlow) => Promise<T>): Promise<T> {
+// Exported so the email Trigger's detect() (services/worker/src/triggers/) can run its
+// deterministic UID-floor poll over the same connect-per-call path the tools use.
+export async function withImap<T>(fn: (c: ImapFlow) => Promise<T>): Promise<T> {
   const { imap } = emailConfig('imap')
   const c = new ImapFlow({
     host: imap.host,
@@ -161,7 +163,7 @@ function toAddressList(value: unknown): string | string[] | undefined {
   return s ? s : undefined
 }
 
-interface MessageRow {
+export interface MessageRow {
   uid: number
   mailbox: string
   from: string
@@ -171,6 +173,11 @@ interface MessageRow {
   snippet: string
   unseen: boolean
 }
+
+// Upper bound on a single UID-floor poll (the email Trigger's detect()). A watcher should never
+// pull an unbounded delta — a long-disconnected mailbox could have thousands of new UIDs; cap so
+// one tick stays bounded work. Newest-first within the cap, like fetchMessages.
+const MAX_SINCE_UID_LIMIT = 200
 
 // Turn a fetched BODY[1] section into readable text for the snippet. A bodyParts fetch returns
 // the section STILL transfer-encoded (imapflow only decodes Content-Transfer-Encoding on its
@@ -212,6 +219,62 @@ async function fetchMessages(
     // bodyParts ['1','1.mime'] pulls the first body section + its MIME header so the snippet is
     // a decoded body preview (see decodeBodyPart), not an echo of the subject; headers:true gives
     // the message header used as the decode fallback for single-part messages.
+    for await (const msg of c.fetch(
+      chosen,
+      { uid: true, envelope: true, flags: true, bodyParts: ['1', '1.mime'], headers: true },
+      { uid: true },
+    )) {
+      const env = msg.envelope
+      const bodyText = await decodeBodyPart(msg.bodyParts?.get('1'), msg.bodyParts?.get('1.mime') ?? msg.headers)
+      byUid.set(msg.uid, {
+        uid: msg.uid,
+        mailbox,
+        from: formatAddresses(env?.from),
+        to: formatAddresses(env?.to),
+        subject: env?.subject ?? '',
+        date: env?.date ? new Date(env.date).toISOString() : '',
+        snippet: snippet(bodyText),
+        unseen: !(msg.flags?.has('\\Seen') ?? false),
+      })
+    }
+    return chosen.map((u) => byUid.get(u)).filter((r): r is MessageRow => r != null)
+  } finally {
+    lock.release()
+  }
+}
+
+// Fetch messages in `mailbox` with UID strictly greater than `sinceUid`, matching `criteria`
+// (merged onto the UID-floor range), newest-first, capped at `limit` (≤ MAX_SINCE_UID_LIMIT).
+// This is the email Trigger's deterministic delta source — list_emails only returns newest-N with
+// no UID floor, so it can't tell "new since I last looked" from "the newest N". An IMAP UID range
+// `${sinceUid + 1}:*` selects everything above the floor; the `*` (highest UID) means a server can
+// still return the single highest message even when none truly exceed the floor, so we filter
+// `uid > sinceUid` defensively rather than trusting the server-side range alone. Reuses the same
+// search/fetch/decode/format path as fetchMessages.
+export async function fetchSinceUid(
+  c: ImapFlow,
+  mailbox: string,
+  sinceUid: number,
+  criteria: Record<string, unknown> | undefined,
+  limit: number,
+): Promise<MessageRow[]> {
+  const max = Math.min(Math.max(1, Math.floor(limit)), MAX_SINCE_UID_LIMIT)
+  const lock = await c.getMailboxLock(mailbox)
+  try {
+    const floor = Math.max(0, Math.floor(sinceUid))
+    // Merge the UID-floor range with the param criteria. The `uid` key is the search range; the
+    // rest (from/subject/seen) AND with it server-side.
+    const searchCriteria: Record<string, unknown> = { ...(criteria ?? {}), uid: `${floor + 1}:*` }
+    const uids = await c.search(searchCriteria, { uid: true })
+    // search() returns false (not []) when it can't run; treat it as no matches. Defensively keep
+    // only UIDs strictly above the floor (see the `*` caveat above), newest-first, capped.
+    const chosen = (uids || [])
+      .filter((u) => u > floor)
+      .sort((a, b) => b - a)
+      .slice(0, max)
+    if (chosen.length === 0) return []
+
+    const byUid = new Map<number, MessageRow>()
     for await (const msg of c.fetch(
       chosen,
       { uid: true, envelope: true, flags: true, bodyParts: ['1', '1.mime'], headers: true },
