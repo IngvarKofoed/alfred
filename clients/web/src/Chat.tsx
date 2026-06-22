@@ -998,12 +998,14 @@ export default function Chat({
           )
         })()}
 
-      {/* Persistent cost footer: a thin muted status line showing the conversation's cumulative
-          token + USD total, climbing live during a run. Hidden until there's something to show. */}
+      {/* A thin muted status row above the composer showing the cumulative token + USD cost footer
+          (climbing live during a run), right-aligned. Hidden until there's something to show. */}
       {(totalTokens > 0 || totalCost > 0) && (
         <div className="px-5">
-          <div className="mx-auto max-w-xl text-right text-xs text-muted tabular-nums">
-            {fmtTokens(totalTokens)} tokens · {usd(totalCost)}
+          <div className="mx-auto flex max-w-xl items-center justify-end gap-3 text-xs text-muted">
+            <span className="tabular-nums">
+              {fmtTokens(totalTokens)} tokens · {usd(totalCost)}
+            </span>
           </div>
         </div>
       )}

@@ -7,9 +7,11 @@ import {
   agentRuns,
   automations,
   conversations,
+  conversationSurfaces,
   llmCalls,
   memoryFacts,
   messages,
+  messageSurfaceRefs,
   notifications,
   pushSubscriptions,
   toolCalls,
@@ -56,24 +58,39 @@ export async function ensureConversation(
     : insert.onConflictDoNothing())
 }
 
-// Resolve a conversation by its ingress-natural key, returning the (generated) PK. ensureConversation
-// is keyed BY the PK — it can't help an ingress whose natural identifier isn't the conversation uuid.
-// Discord's natural key is the channel id, so the bot maps a DM/guild channel to one long-lived
-// conversation via the unique(ingress, channel_key) index: a channel is a continuous thread across
-// days, not a new conversation per message. Seed the owner (like ensureConversation), then insert the
-// row letting the schema mint a fresh uuidv7 PK; .onConflictDoNothing().returning() yields the new id
-// on first sight and nothing on a re-visit, so on the empty case we SELECT the existing id by the
-// natural key. Returns the conversation id either way.
+// Resolve (or create) the conversation a Discord channel/post is bound to, returning the PK
+// (multi-surface spec 2026-06-21). Routing moved OFF conversations.channel_key (its unique index
+// was dropped) ONTO the conversation_surfaces binding table: a Discord post→conversation mapping
+// is a (surface='discord', external_key=<channelId>) row. The bot's onMessageCreate calls this for
+// a message in a guild post / catch-all / DM channel — a channel is a continuous thread across
+// days, not a new conversation per message.
+//
+// Resolution: look up an existing binding by (surface, externalKey). If found, return its
+// conversation_id (the canonical conversation, whatever its ingress/origin). If not — a
+// genuinely NEW discord-born conversation (a post created directly in Discord, never pulled) —
+// create a conversation row (ingress=params.ingress as origin metadata, channel_key=externalKey
+// as the origin key) AND its binding row, both in this caller's transaction.
+//
+// `title` is set on INSERT only (creation case) so a re-visit / later rename / auto-title isn't
+// clobbered; the Discord ingress passes the post's own name so a post-backed conversation is named
+// by the owner's post title (and the worker's auto-title is skipped, title already non-null).
+//
+// Concurrency: the create path fires only when the resolve above missed. Under a rare race — Discord
+// redelivers a message on a gateway reconnect, or the owner double-sends, so two onMessageCreate run
+// for the same brand-new post — both inserters create a conversation, but bindConversationSurface is
+// onConflictDoNothing on unique(surface, external_key), so only the FIRST binding wins. We therefore
+// re-resolve the binding after writing it and return the actually-bound conversation (the winner), so
+// this message lands there rather than in the orphan row the loser just created (a harmless extra
+// conversation, never a split thread or a 23505 to the caller). Prefer the explicit
+// getConversationBySurface + bindConversationSurface pair for non-onMessageCreate callers.
 export async function getOrCreateConversationByChannel(
   db: DbOrTx,
   params: { ingress: string; channelKey: string; title?: string },
 ): Promise<string> {
+  const existing = await getConversationBySurface(db, 'discord', params.channelKey)
+  if (existing) return existing
   await db.insert(users).values({ id: OWNER_USER_ID, displayName: 'Owner' }).onConflictDoNothing()
-  // `title` is set on INSERT only (the creation case); the onConflictDoNothing path never touches it,
-  // so a re-visit keeps the existing title (and a later /rename or auto-title isn't clobbered). The
-  // Discord ingress passes the forum post's own name so a post-backed conversation is named by the
-  // owner's post title — and the worker's auto-title is skipped (title is already non-null).
-  const [inserted] = await db
+  const [created] = await db
     .insert(conversations)
     .values({
       userId: OWNER_USER_ID,
@@ -81,14 +98,125 @@ export async function getOrCreateConversationByChannel(
       channelKey: params.channelKey,
       ...(params.title ? { title: params.title } : {}),
     })
-    .onConflictDoNothing()
     .returning({ id: conversations.id })
-  if (inserted) return inserted.id
-  const [existing] = await db
-    .select({ id: conversations.id })
+  await bindConversationSurface(db, {
+    conversationId: created!.id,
+    surface: 'discord',
+    externalKey: params.channelKey,
+  })
+  // Return the conversation the binding actually points at: under a concurrent race our bind was a
+  // no-op and the winner owns the post, so resolve again rather than returning our (possibly orphan)
+  // created row.
+  return (await getConversationBySurface(db, 'discord', params.channelKey)) ?? created!.id
+}
+
+// Bind a surface's external key to a conversation (multi-surface spec 2026-06-21) — the explicit
+// writer behind both the bot's pull-to-Discord (post created → bind it to the pulled conversation)
+// and the watcher per-fire materialization (replacing repointConversationChannel: the per-fire
+// conversation stays ingress='trigger' as origin, and gains a discord binding instead of having
+// its ingress overwritten). onConflictDoNothing on the unique(surface, external_key) so a re-bind
+// of an already-bound post is a harmless no-op (idempotent reconcile). Does NOT touch the
+// conversation's ingress/channel_key/title — the binding is purely additive surface presence.
+export async function bindConversationSurface(
+  db: DbOrTx,
+  params: { conversationId: string; surface: string; externalKey: string },
+): Promise<void> {
+  await db
+    .insert(conversationSurfaces)
+    .values({
+      conversationId: params.conversationId,
+      surface: params.surface,
+      externalKey: params.externalKey,
+    })
+    .onConflictDoNothing({ target: [conversationSurfaces.surface, conversationSurfaces.externalKey] })
+}
+
+// Resolve a surface's external key to its bound conversation id, or undefined if unbound
+// (multi-surface spec 2026-06-21). The read half of the Discord routing index — used by
+// getOrCreateConversationByChannel and the bot's interaction dispatch to map a post id → its
+// canonical conversation. Returns undefined for an unknown key (a stray channel never bound).
+export async function getConversationBySurface(
+  db: DbOrTx,
+  surface: string,
+  externalKey: string,
+): Promise<string | undefined> {
+  const [row] = await db
+    .select({ conversationId: conversationSurfaces.conversationId })
+    .from(conversationSurfaces)
+    .where(
+      and(eq(conversationSurfaces.surface, surface), eq(conversationSurfaces.externalKey, externalKey)),
+    )
+    .limit(1)
+  return row?.conversationId
+}
+
+// Reverse of getConversationBySurface (multi-surface spec 2026-06-21): the surface external key a
+// conversation is bound to on a given surface, or undefined if unbound. Used by the bot's per-fire
+// watcher path to find an existing Discord post for a watcher conversation across a restart (the
+// conversation no longer flips ingress='discord' — its presence is the binding row, not its ingress),
+// replacing the old `ingress === 'discord'` reuse signal. The reverse-lookup index
+// conversation_surfaces_conversation_idx covers this.
+export async function getConversationSurfaceKey(
+  db: DbOrTx,
+  conversationId: string,
+  surface: string,
+): Promise<string | undefined> {
+  const [row] = await db
+    .select({ externalKey: conversationSurfaces.externalKey })
+    .from(conversationSurfaces)
+    .where(
+      and(
+        eq(conversationSurfaces.conversationId, conversationId),
+        eq(conversationSurfaces.surface, surface),
+      ),
+    )
+    .limit(1)
+  return row?.externalKey
+}
+
+// Every conversation bound to a surface (multi-surface spec 2026-06-21) — read by the bot at boot
+// to re-establish a standing LISTEN per bound conversation (the standing-LISTEN re-establish the
+// per-fire change removed, now scoped to the curated set of explicitly-bound conversations). Each
+// row pairs the canonical conversation id with its surface external key (the Discord post/channel
+// to render into). Ordered newest-binding-first (uuidv7 PK desc) for deterministic iteration.
+export function listBoundConversations(
+  db: DbOrTx,
+  surface: string,
+): Promise<{ conversationId: string; externalKey: string }[]> {
+  return db
+    .select({
+      conversationId: conversationSurfaces.conversationId,
+      externalKey: conversationSurfaces.externalKey,
+    })
+    .from(conversationSurfaces)
+    .where(eq(conversationSurfaces.surface, surface))
+    .orderBy(desc(conversationSurfaces.id))
+}
+
+// Recent conversations NOT yet bound to a surface (multi-surface spec 2026-06-21) — backs the
+// Discord /pull picker, which lists conversations the owner can still materialize into Discord
+// (already-bound ones are filtered out, since pulling them again is a no-op / 409). Newest-active
+// first, capped (Discord's StringSelectMenu allows ≤25 options). The NOT EXISTS keeps it a single
+// query against the small per-user conversation set.
+export function listUnboundConversations(
+  db: DbOrTx,
+  params: { userId: string; surface: string; limit?: number },
+): Promise<{ id: string; title: string | null; ingress: string }[]> {
+  return db
+    .select({ id: conversations.id, title: conversations.title, ingress: conversations.ingress })
     .from(conversations)
-    .where(and(eq(conversations.ingress, params.ingress), eq(conversations.channelKey, params.channelKey)))
-  return existing!.id
+    .where(
+      and(
+        eq(conversations.userId, params.userId),
+        sql`not exists (
+          select 1 from ${conversationSurfaces}
+          where ${conversationSurfaces.conversationId} = ${conversations.id}
+            and ${conversationSurfaces.surface} = ${params.surface}
+        )`,
+      ),
+    )
+    .orderBy(desc(conversations.lastActiveAt))
+    .limit(params.limit ?? 25)
 }
 
 // Seed the conversation (touching recency), persist a user message, and create its pending run —
@@ -376,21 +504,12 @@ export async function getAutomationForConversation(
   return row?.automation
 }
 
-// Repoint a conversation's SURFACE — its ingress + channel_key (per-fire spec 2026-06-20). The
-// Discord bot calls it after creating a Watchers-forum post for a fire: the conversation is created
-// ingress='trigger' (by createAutomationRun); the bot moves it to ('discord', <post id>) so a reply
-// in the post resolves to (and continues) the same conversation via the normal guild-forum
-// onMessageCreate path. Safe against the unique(ingress, channel_key) index only because the post is
-// freshly created (no collision). Does not touch automation_id/title/recency. Bumps nothing else.
-export async function repointConversationChannel(
-  db: DbOrTx,
-  params: { id: string; ingress: string; channelKey: string },
-): Promise<void> {
-  await db
-    .update(conversations)
-    .set({ ingress: params.ingress, channelKey: params.channelKey })
-    .where(eq(conversations.id, params.id))
-}
+// (Removed: repointConversationChannel — multi-surface spec 2026-06-21. The Discord bot's per-fire
+// watcher path used to repoint a per-fire conversation's ingress/channel_key from ('trigger', id) to
+// ('discord', <post id>) so a reply resolved back to it; with the binding table that overwrite is
+// gone — the conversation keeps ingress='trigger' (origin) and gains a conversation_surfaces(discord,
+// postId) row instead, so the bot now calls bindConversationSurface. The per-fire consumer has fully
+// migrated, so the function is deleted rather than left as dead code.)
 
 // Enable/disable an automation, owner-scoped (a model-supplied id can't touch another user's row)
 // and UUID-guarded (a hallucinated non-UUID is a clean miss, not a thrown uuid cast — mirrors
@@ -404,6 +523,50 @@ export async function setTriggerEnabled(
   const updated = await db
     .update(automations)
     .set({ enabled: params.enabled, updatedAt: new Date() })
+    .where(and(eq(automations.id, params.id), eq(automations.userId, params.userId)))
+    .returning({ id: automations.id })
+  return { updated: updated.length > 0 }
+}
+
+// Partial, owner-scoped + UUID-guarded update of an automation's mutable definition fields (backs the
+// `update_automation` tool). Only the fields PRESENT (value !== undefined) are written — omitted ones
+// are left untouched, so this is a partial UPDATE, not a replace. `schedule`/`nextFireAt` are nullable
+// on purpose: the tool sets one and nulls the other when `when` re-decides the cadence. `cursor`/
+// `pendingCursor` are nullable too: the tool nulls them to RE-BASELINE detection when `params` change
+// (a changed detection param can make the prior cursor incomparable — e.g. an email `mailbox` switch,
+// since IMAP UIDs are per-mailbox; re-baselining is trigger-agnostic and safe). Always bumps
+// updated_at. Returns whether a row matched. The triggers scheduler picks up schedule/enabled changes
+// on its next reconcile (no extra wiring). The trigger MECHANISM itself is never changed by an update.
+export async function updateAutomation(
+  db: DbOrTx,
+  params: {
+    userId: string
+    id: string
+    name?: string
+    objective?: string
+    params?: unknown
+    schedule?: string | null
+    nextFireAt?: Date | null
+    notifyPolicy?: string
+    enabled?: boolean
+    cursor?: unknown
+    pendingCursor?: unknown
+  },
+): Promise<{ updated: boolean }> {
+  if (!UUID_RE.test(params.id)) return { updated: false }
+  const set: Partial<typeof automations.$inferInsert> = { updatedAt: new Date() }
+  if (params.name !== undefined) set.name = params.name
+  if (params.objective !== undefined) set.objective = params.objective
+  if (params.params !== undefined) set.params = params.params
+  if (params.schedule !== undefined) set.schedule = params.schedule
+  if (params.nextFireAt !== undefined) set.nextFireAt = params.nextFireAt
+  if (params.notifyPolicy !== undefined) set.notifyPolicy = params.notifyPolicy
+  if (params.enabled !== undefined) set.enabled = params.enabled
+  if (params.cursor !== undefined) set.cursor = params.cursor
+  if (params.pendingCursor !== undefined) set.pendingCursor = params.pendingCursor
+  const updated = await db
+    .update(automations)
+    .set(set)
     .where(and(eq(automations.id, params.id), eq(automations.userId, params.userId)))
     .returning({ id: automations.id })
   return { updated: updated.length > 0 }
@@ -707,4 +870,59 @@ export async function latestRunIdForConversation(
     .orderBy(desc(agentRuns.id))
     .limit(1)
   return row?.id ?? null
+}
+
+// ---- Multi-surface mirroring (spec 2026-06-21) ----
+
+// Record that a message has been mirrored to a surface (multi-surface spec 2026-06-21) — the
+// write half of the mirror-idempotency ledger. The bot calls it as it renders a message into a
+// bound Discord post; `externalId` is the rendered artifact's surface id (the Discord message id),
+// nullable for surfaces without one. onConflictDoNothing on unique(message_id, surface) so a
+// double-render attempt (a re-delivered event, a reconcile re-walking history) is a harmless
+// no-op. Pair with hasMessageSurfaceRef to skip already-mirrored messages.
+export async function insertMessageSurfaceRef(
+  db: DbOrTx,
+  params: { messageId: string; surface: string; externalId?: string | null },
+): Promise<void> {
+  await db
+    .insert(messageSurfaceRefs)
+    .values({
+      messageId: params.messageId,
+      surface: params.surface,
+      externalId: params.externalId ?? null,
+    })
+    .onConflictDoNothing({ target: [messageSurfaceRefs.messageId, messageSurfaceRefs.surface] })
+}
+
+// Whether a message has already been mirrored to a surface (multi-surface spec 2026-06-21) — the
+// read half of the dedup. The bot checks it before mirroring a web/iOS user message (the "🧑 …"
+// quoted line) or an assistant turn into a bound post, so it never re-posts content already there
+// (its own renders, or a Discord-originated turn the bot itself produced).
+export async function hasMessageSurfaceRef(
+  db: DbOrTx,
+  messageId: string,
+  surface: string,
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: messageSurfaceRefs.id })
+    .from(messageSurfaceRefs)
+    .where(and(eq(messageSurfaceRefs.messageId, messageId), eq(messageSurfaceRefs.surface, surface)))
+    .limit(1)
+  return Boolean(row)
+}
+
+// The cross-process pull-to-Discord seam (multi-surface spec 2026-06-21). Only the Discord bot can
+// create a forum post, but the trigger is an owner action on the WEBSERVER (POST
+// /api/conversations/:id/surfaces/discord) or the bot itself (/pull). The webserver has no Discord
+// client, so it hands the request to the bot over Postgres LISTEN/NOTIFY — the same fire-and-forget
+// pattern the bot already uses for the per-conversation render + the notifications doorbell. This
+// NOTIFYs the dedicated 'discord-pull' channel with the bare conversation id as the payload; the bot
+// LISTENs it, and on receipt materializes the post (createForumPost), writes the
+// conversation_surfaces(discord, postId) binding, mirrors the last ~20 messages in, and opens a
+// standing LISTEN. Fire-and-forget by design: if the bot is down (or DISCORD_GUILD_ID unset) the
+// pull is simply lost and the owner retries — acceptable for an interactive, retryable action (the
+// spec accepts the analogous loss for watcher fires). pgNotify uses the process-wide pool, like
+// resolveInteraction.
+export async function requestDiscordPull(db: DbOrTx, conversationId: string): Promise<void> {
+  await pgNotify('discord-pull', conversationId)
 }

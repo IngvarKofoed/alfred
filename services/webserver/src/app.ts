@@ -1,12 +1,14 @@
 import {
   agentRuns,
   conversations,
+  conversationSurfaces,
   createUserMessageRun,
   deletePushSubscription,
   enqueueAgentRun,
   enqueueTriggerDetect,
   getDb,
   getAutomation,
+  requestDiscordPull,
   latestRunIdForConversation,
   listTriggers,
   llmCalls,
@@ -345,6 +347,49 @@ app.post('/api/conversations/:id/speak', async (c) => {
       }
     }
   })
+})
+
+// "Continue in Discord": materialize this conversation as a Discord forum post (multi-surface
+// spec 2026-06-21). Fire-and-forget — the webserver has no Discord client, so it only NOTIFYs the
+// bot over the 'discord-pull' channel (requestDiscordPull); the bot creates the post, writes the
+// conversation_surfaces(discord, postId) binding, mirrors the last ~20 messages in, and opens a
+// standing LISTEN, all asynchronously. The conversation appears in Discord shortly. 202 Accepted
+// (the work happens out-of-process); no body. If the bot is down (or DISCORD_GUILD_ID unset) the
+// request is simply lost and the owner retries — acceptable for an interactive, retryable action
+// (spec: same loss accepted for watcher fires). The 409 below catches only an ALREADY-MATERIALIZED
+// conversation (a binding row exists); an in-flight pull (doorbell sent, post not yet created) has
+// no row yet, so two rapid clicks both 202 — single-post idempotency is enforced bot-side by the
+// serial pullChain re-checking the binding, not by this route.
+app.post('/api/conversations/:id/surfaces/discord', async (c) => {
+  const conversationId = c.req.param('id')
+  if (!UUID_RE.test(conversationId)) return c.json({ error: 'invalid conversation id' }, 400)
+  const db = getDb()
+
+  // The conversation must exist and belong to the owner (single-user; OWNER_USER_ID).
+  const [conv] = await db
+    .select({ id: conversations.id })
+    .from(conversations)
+    .where(and(eq(conversations.id, conversationId), eq(conversations.userId, OWNER_USER_ID)))
+    .limit(1)
+  if (!conv) return c.json({ error: 'not found' }, 404)
+
+  // Idempotent: if this conversation is already bound to Discord (its post exists / pull was
+  // already requested-and-materialized), don't NOTIFY a second pull — 409 with the existing key.
+  // The reverse-lookup index conversation_surfaces_conversation_idx covers this select.
+  const [bound] = await db
+    .select({ externalKey: conversationSurfaces.externalKey })
+    .from(conversationSurfaces)
+    .where(
+      and(
+        eq(conversationSurfaces.conversationId, conversationId),
+        eq(conversationSurfaces.surface, 'discord'),
+      ),
+    )
+    .limit(1)
+  if (bound) return c.json({ requested: false, alreadyBound: true, externalKey: bound.externalKey }, 409)
+
+  await requestDiscordPull(db, conversationId)
+  return c.json({ requested: true }, 202)
 })
 
 // Serve a file from the conversation's workspace (the UI fetches images here after a run).

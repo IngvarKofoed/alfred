@@ -21,30 +21,50 @@
 // notifications outbox is the cross-surface fan-out. The bot is a SECOND consumer of the 'notifications'
 // channel (alongside the worker's Web Push dispatcher — LISTEN/NOTIFY broadcasts to both): on the FIRST
 // notification for a watcher conversation (a mid-run approval/question OR the final result/error), it
-// creates a NEW post in the `watchers` forum (a new thread = a real Discord ping), repoints the
-// conversation to (ingress='discord', channel_key=<post id>), and renders the content read FROM THE DB
-// (post-final, no token streaming — watcher reports are async, the new post is itself the alert). A reply
-// IN that post is then an ordinary ingress='discord' message handled by the normal onMessageCreate path,
-// so no standing LISTEN / proactive reconcile is needed. When DISCORD_GUILD_ID is UNSET, none of the
-// guild model runs — the bot is byte-for-byte today's DM-or-mention bot.
+// creates a NEW post in the `watchers` forum (a new thread = a real Discord ping) and renders the
+// content read FROM THE DB (post-final, no token streaming — watcher reports are async, the new post
+// is itself the alert).
+//
+// Multi-surface conversations (spec docs/specs/2026-06-21-multi-surface-conversations.md). A logical
+// conversation can now live on web/iOS AND Discord at once. Routing moved OFF conversations.channel_key
+// (its unique index was dropped) ONTO the conversation_surfaces binding table: a Discord post → its
+// conversation is a (surface='discord', external_key=postId) row. So:
+//   - onMessageCreate resolves a post via getOrCreateConversationByChannel, which now consults
+//     conversation_surfaces (getConversationBySurface), not channel_key.
+//   - A watcher per-fire post is BOUND (bindConversationSurface) instead of repointed — the
+//     conversation keeps ingress='trigger' (origin) and merely gains a Discord presence.
+//   - "Continue in Discord" (a web button / the /pull command) materializes a web/iOS conversation
+//     as a Conversations-forum post, mirrors its recent history in, and binds it.
+//   - A BOUND conversation gets a STANDING LISTEN (re-established at boot from conversation_surfaces),
+//     so EVERY future run — including a web/iOS-originated one — streams live into its post; the
+//     owner's web/iOS user turn is mirrored in as a "🧑 …" quote first, and message_surface_refs
+//     dedups anything already in the post (the bot's own renders + Discord-originated turns).
+// When DISCORD_GUILD_ID is UNSET, none of the guild/multi-surface model runs — the bot is
+// byte-for-byte today's DM-or-mention bot.
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
+  bindConversationSurface,
   conversations as conversationsTable,
   createUserMessageRun,
   enqueueAgentRun,
+  getConversationSurfaceKey,
   getDb,
   getOrCreateConversationByChannel,
+  hasMessageSurfaceRef,
+  insertMessageSurfaceRef,
+  listBoundConversations,
+  listUnboundConversations,
   messages,
   notifications as notificationsTable,
+  OWNER_USER_ID,
   readLastAssistantText,
-  repointConversationChannel,
   resolveInteraction,
   userInteractions,
 } from '@alfred/db'
 import { executeCommand, listCommands } from '@alfred/commands'
-import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace } from '@alfred/shared'
+import { extForImageMime, imageMimeForExt, loadConfig, resolveInWorkspace, textFromContent } from '@alfred/shared'
 import { and, asc, desc, eq, gt, inArray } from 'drizzle-orm'
 import {
   ActionRowBuilder,
@@ -70,6 +90,7 @@ import {
   type Interaction,
   type Message as DiscordMessage,
   type RESTPostAPIApplicationCommandsJSONBody,
+  type SendableChannels,
 } from 'discord.js'
 import pg from 'pg'
 import {
@@ -140,6 +161,11 @@ const client = new Client({
 // render state per conversation at a time.
 interface RenderState {
   conversationId: string
+  // The Discord post (thread) channel id this conversation renders into. For an interactive turn
+  // it's the channel of the placeholder sent in onMessageCreate; for a STANDING (bound) state it's
+  // the bound post id, so a fresh run can lazily create a target message there (a bound web/iOS run
+  // has no onMessageCreate placeholder — the bot opens the target on the run's first streamed event).
+  postChannelId: string
   // The Discord messages this run has emitted, in order. We always edit the LAST one; when a delta
   // would overflow it we seal it and push a fresh continuation message (the new edit target).
   emitted: DiscordMessage[]
@@ -157,8 +183,16 @@ interface RenderState {
   // handler can wait for the buffer to be fully rendered before uploading images / tearing down.
   flushPromise: Promise<void> | undefined
   // The latest messages.id BEFORE enqueue, so the done path selects only THIS run's new
-  // assistant/tool messages for outbound images.
+  // assistant/tool messages for outbound images. Re-captured at each run's first event.
   sinceMessageId: string | null
+  // Floor for the web/iOS USER-message mirror scope (multi-surface spec 2026-06-21). DISTINCT from
+  // sinceMessageId: that image watermark is captured at the run's first event (AFTER the run's own
+  // user message U is committed), so reusing it would exclude U from the mirror. mirrorWatermark is
+  // instead seeded ONCE at standing-state creation (pull/bind + boot re-establish) to the newest
+  // message id then, and held fixed across runs — so the backfilled history is excluded but every
+  // later web/iOS user turn (incl. U) falls after it and gets a "🧑 …" quote (dedup'd by
+  // message_surface_refs). null ⇒ mirror all un-ref'd user messages.
+  mirrorWatermark: string | null
   // Open interaction (approval/question) component messages, keyed by interactionId, so an
   // `interaction_resolved` NOTIFY from ANOTHER surface (the owner answered on web, or a timeout)
   // can disable our buttons/select here too — not just the click we handle locally.
@@ -166,10 +200,48 @@ interface RenderState {
   // Serializes async event handling per conversation so two NOTIFYs (e.g. a token edit and a
   // done teardown) don't interleave their Discord calls. Chained like the worker's notifyChain.
   eventChain: Promise<void>
+  // STANDING (bound) subscription marker (multi-surface spec 2026-06-21). A bound conversation's
+  // LISTEN is persistent — it streams EVERY future run into the post, so `done` must NOT UNLISTEN
+  // it (mirrors the old guild-model `standingListens` guard the per-fire change removed). For a
+  // standing state, the terminal handlers reset the per-run render fields in place (a fresh `done`
+  // for the next run renders into a new target message) instead of tearing the state down. For an
+  // ordinary interactive turn (false) the run is one-shot and teardownRender UNLISTENs + drops it.
+  standing: boolean
+}
+
+// A run-render reset of a STANDING state: after a run reaches a terminal event we keep the LISTEN
+// + the state in the map (so the next run on this bound conversation streams in), but clear the
+// per-run render fields so the next run starts fresh (a new target message, an empty buffer).
+function resetRenderForNextRun(state: RenderState): void {
+  if (state.editTimer) {
+    clearTimeout(state.editTimer)
+    state.editTimer = undefined
+  }
+  state.emitted = []
+  state.buffer = ''
+  state.sealedLen = 0
+  state.editing = false
+  state.pendingFlush = false
+  state.flushPromise = undefined
+  state.sinceMessageId = null
+  state.eventChain = Promise.resolve()
+  // pendingComponents already drained by the caller's disablePendingComponents.
 }
 
 // channel name (`conversation:<id>`) -> render state for the active run on that conversation.
+// Holds BOTH ordinary interactive turns (one-shot, torn down on `done`) and STANDING (bound)
+// subscriptions (multi-surface spec 2026-06-21: persistent, re-establish at boot from
+// conversation_surfaces, never UNLISTENed on `done` — they stream every future run into the post).
 const renderByChannel = new Map<string, RenderState>()
+
+// Watcher conversation id -> the POST-FINAL watcher render state (multi-surface spec 2026-06-21).
+// DELIBERATELY SEPARATE from renderByChannel: a watcher conversation is now ALSO a bound
+// conversation (it gains a conversation_surfaces row at first fire), so it has a standing
+// renderByChannel state for live-streamed *replies*. The watcher's own autonomous run does NOT
+// stream (its report is rendered post-final from the DB by the notifications consumer), so its
+// approval/question component tracking + post target live here, apart from the streaming state, so
+// the two never clobber each other's emitted/buffer/sinceMessageId across an approval→result fire.
+const watcherRenderByConversation = new Map<string, RenderState>()
 
 // Edit at most ~1x/1.5s per channel (well under Discord's ~5 edits / 5s / channel limit), always
 // flushing the final state on `done`/`error`/`cancelled`.
@@ -279,14 +351,16 @@ async function editTrailing(state: RenderState, content: string): Promise<void> 
   await target.edit(content.slice(0, DISCORD_MESSAGE_LIMIT))
 }
 
-// Send a new message into the same channel as the run's first emitted message (a continuation, or
-// an attachment follow-up). Returns the sent message or null on failure (logged, never thrown).
+// Send a new message into the run's post channel (a continuation, an attachment follow-up, or a
+// freshly-opened render target). Prefers the channel of an already-emitted message, falling back to
+// fetching state.postChannelId (a STANDING bound state between runs has no emitted message yet).
+// Returns the sent message or null on failure (logged, never thrown).
 async function sendTo(
   state: RenderState,
   content: string,
   files?: AttachmentBuilder[],
 ): Promise<DiscordMessage | null> {
-  const channel = state.emitted[0]?.channel
+  const channel = state.emitted[0]?.channel ?? (await fetchSendableChannel(state.postChannelId))
   if (!channel || !channel.isSendable()) return null
   try {
     return await channel.send({ content: content.slice(0, DISCORD_MESSAGE_LIMIT), files })
@@ -294,6 +368,38 @@ async function sendTo(
     console.error(`[discord ${state.conversationId}] send failed:`, err)
     return null
   }
+}
+
+// Fetch a post (thread) channel by id, un-archiving it if Discord auto-archived it between runs.
+// Returns null (logged) if it's gone / not in our guild / not sendable.
+async function fetchSendableChannel(channelId: string): Promise<SendableChannels | null> {
+  try {
+    const channel = await client.channels.fetch(channelId).catch(() => null)
+    if (!channel || !channel.isSendable()) return null
+    if ('guildId' in channel && DISCORD_GUILD_ID && channel.guildId !== DISCORD_GUILD_ID) {
+      console.error(`[discord] channel ${channelId} not in the Alfred guild; skipping`)
+      return null
+    }
+    if (channel.isThread() && channel.archived) {
+      await channel.setArchived(false).catch(() => {})
+    }
+    return channel
+  } catch (err) {
+    console.error(`[discord] failed to open channel ${channelId}:`, err)
+    return null
+  }
+}
+
+// Ensure a STANDING state has a render target message (its emitted[0]) for the run now streaming.
+// A bound web/iOS run has no onMessageCreate placeholder, so the first streamed event lazily opens
+// one in the post. Idempotent within a run (no-op once emitted[0] exists). Returns true if a target
+// is available to render into.
+async function ensureRenderTarget(state: RenderState): Promise<boolean> {
+  if (state.emitted.length > 0) return true
+  const placeholder = await sendTo(state, '…')
+  if (!placeholder) return false
+  state.emitted.push(placeholder)
+  return true
 }
 
 // Schedule a trailing-edge throttled flush: coalesce a burst of tokens into one edit ~every
@@ -322,23 +428,75 @@ async function disablePendingComponents(state: RenderState): Promise<void> {
   state.pendingComponents.clear()
 }
 
-// Tear down a finished run's render state: disable any still-open interaction components, clear its
-// timer, drop it from the dispatch map, and UNLISTEN its channel (the shared client no longer needs
-// notifications for it). Idempotent.
+// Finish a run's render. For an ordinary interactive turn (state.standing === false) this tears the
+// state fully down: disable still-open components, clear the timer, drop it from the dispatch map,
+// and UNLISTEN its channel (the per-conversation LISTEN was opened for THIS run in onMessageCreate).
+//
+// For a STANDING (bound) subscription (multi-surface spec 2026-06-21) the LISTEN is persistent — it
+// must stream EVERY future run into the post — so we KEEP the LISTEN and the state in the map, just
+// resetting the per-run render fields so the next run starts fresh (mirrors the old guild-model
+// `standingListens` guard the per-fire change removed). Idempotent.
 async function teardownRender(channel: string): Promise<void> {
   const state = renderByChannel.get(channel)
   if (!state) return
   await disablePendingComponents(state)
+  if (state.standing) {
+    resetRenderForNextRun(state)
+    return
+  }
   if (state.editTimer) {
     clearTimeout(state.editTimer)
     state.editTimer = undefined
   }
   renderByChannel.delete(channel)
-  // The per-conversation LISTEN was opened for THIS run (onMessageCreate, an interactive turn); the
-  // run is terminal, so UNLISTEN it. There are no standing watcher subscriptions anymore — a watcher
-  // run never streams into Discord (its report is posted post-final from the notifications consumer),
-  // so the only conversation:<id> channels we LISTEN are interactive turns, all torn down here.
   await notifyClient.query(`UNLISTEN "${channel}"`).catch(() => {})
+}
+
+// Ensure a STANDING (bound) subscription exists for a conversation: a persistent renderByChannel
+// state (standing=true) + an open LISTEN on its channel, so EVERY future run on this bound
+// conversation streams live into its Discord post (multi-surface spec 2026-06-21). Idempotent —
+// re-establishes what the per-fire change removed, but ONLY for explicitly-bound conversations
+// (pulled web/iOS conversations + watcher posts), never a per-watcher reconcile.
+//
+// Carefully non-clobbering: if a state already exists for the channel we only PROMOTE it to standing
+// (so an in-flight interactive turn that just got pulled keeps its emitted/buffer and simply survives
+// `done` thereafter) and never re-open the LISTEN. A brand-new standing state starts EMPTY (no
+// emitted target) — prepareStandingRun opens the target lazily on the run's first streamed event.
+async function ensureStandingListen(conversationId: string, postChannelId: string): Promise<void> {
+  const channel = `conversation:${conversationId}`
+  const existing = renderByChannel.get(channel)
+  if (existing) {
+    existing.standing = true
+    existing.postChannelId = postChannelId
+    // Promoting an in-flight interactive turn to standing: seed the mirror floor (if not already set)
+    // to the newest message id NOW, so the just-pulled history isn't re-mirrored as quotes — only
+    // user turns AFTER the pull get a "🧑 …" line.
+    if (existing.mirrorWatermark === null) existing.mirrorWatermark = await latestMessageId(conversationId)
+    return // LISTEN already open for this channel (interactive turn or a prior standing state)
+  }
+  // Seed the mirror floor at creation time (pull/bind + boot re-establish), held fixed across runs:
+  // backfilled history sits at-or-below it (excluded), every later web/iOS user turn sits above it.
+  const mirrorWatermark = await latestMessageId(conversationId)
+  const state: RenderState = {
+    conversationId,
+    postChannelId,
+    emitted: [],
+    buffer: '',
+    sealedLen: 0,
+    editTimer: undefined,
+    editing: false,
+    pendingFlush: false,
+    flushPromise: undefined,
+    sinceMessageId: null,
+    mirrorWatermark,
+    pendingComponents: new Map(),
+    eventChain: Promise.resolve(),
+    standing: true,
+  }
+  renderByChannel.set(channel, state)
+  await notifyClient.query(`LISTEN "${channel}"`).catch((err) =>
+    console.error(`[discord ${conversationId}] standing LISTEN failed:`, err),
+  )
 }
 
 // --- Outbound images ----------------------------------------------------------------------------
@@ -389,6 +547,33 @@ async function uploadRunImages(state: RenderState): Promise<void> {
     }
   } catch (err) {
     console.error(`[discord ${state.conversationId}] outbound image upload failed:`, err)
+  }
+}
+
+// Record a message_surface_refs row for each assistant/tool message this run produced (id newer than
+// the captured watermark), so a later prep pass never re-mirrors them (the bot streamed them live —
+// they're already in the post). externalId is left null: the live render emits MANY Discord messages
+// per assistant turn (continuations past 2000 chars) so there's no single artifact id to point at;
+// the ref's job here is purely the has-it-been-rendered check, not edit targeting. Best-effort,
+// only for STANDING states (an interactive turn's own messages are Discord-originated, never mirrored).
+async function recordRunAssistantRefs(state: RenderState): Promise<void> {
+  if (!state.standing) return
+  try {
+    const rows = await db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, state.conversationId),
+          inArray(messages.role, ['assistant', 'tool']),
+          state.sinceMessageId ? gt(messages.id, state.sinceMessageId) : undefined,
+        ),
+      )
+    for (const row of rows) {
+      await insertMessageSurfaceRef(db, { messageId: row.id, surface: 'discord' }).catch(() => {})
+    }
+  } catch (err) {
+    console.error(`[discord ${state.conversationId}] assistant-ref record failed:`, err)
   }
 }
 
@@ -492,7 +677,7 @@ async function sendComponents(
   content: string,
   components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[],
 ): Promise<DiscordMessage | null> {
-  const channel = state.emitted[0]?.channel
+  const channel = state.emitted[0]?.channel ?? (await fetchSendableChannel(state.postChannelId))
   if (!channel || !channel.isSendable()) return null
   try {
     return await channel.send({ content: content.slice(0, DISCORD_MESSAGE_LIMIT), components })
@@ -532,6 +717,110 @@ function compactArgs(args: unknown): string {
 
 // --- NOTIFY dispatch ----------------------------------------------------------------------------
 
+// On the FIRST render-producing event of a run for a STANDING (bound) conversation, prepare the
+// post (multi-surface spec 2026-06-21): capture the outbound-image watermark, mirror any web/iOS
+// USER message(s) for this turn into the post as quoted "🧑 …" lines, and open the render target the
+// assistant reply will stream into. A bound web/iOS run has no onMessageCreate placeholder, so this
+// is the standing-state equivalent of that setup, driven off the first RunEvent.
+//
+// Idempotent within a run: once state.emitted has a message we've already prepped, so this no-ops.
+// Returns false if the post is unreachable (the caller skips rendering rather than buffering forever).
+async function prepareStandingRun(state: RenderState): Promise<boolean> {
+  if (state.emitted.length > 0) return true // already prepped this run
+
+  // Outbound-image watermark: the newest message id BEFORE this run appended its turns, so the done
+  // path uploads only THIS run's new images (same role-filtered select as an interactive turn). We
+  // capture it here (run start) rather than at bind time so it tracks each run, not just the pull.
+  state.sinceMessageId = await latestMessageId(state.conversationId)
+
+  // Mirror the owner's web/iOS user message(s) for this turn as quoted lines, BEFORE the reply
+  // streams. Discord-originated turns (the owner typed in the post) are already present — those
+  // messages carry a message_surface_refs row written when the bot rendered them — so the dedup
+  // below skips them and only web/iOS-originated user turns get a "🧑 …" mirror. Scoped by
+  // state.mirrorWatermark (NOT sinceMessageId, which we just captured AFTER U was committed and so
+  // would exclude this very turn's user message — the bug a single overloaded watermark caused).
+  await mirrorPendingUserMessages(state)
+
+  // Open the assistant reply's render target in the post.
+  return ensureRenderTarget(state)
+}
+
+// Mirror any not-yet-mirrored web/iOS user messages of this conversation into the bound post as
+// quoted "🧑 …" lines, recording a message_surface_refs row for each so it's never re-posted (its own
+// later re-walk, or a Discord-originated turn that's already in the post). Scopes to messages after
+// state.mirrorWatermark (the fixed standing-state floor seeded at pull/boot, so the backfilled
+// history is excluded) — NOT the per-run image watermark sinceMessageId, which is captured after this
+// turn's user message commits and would wrongly exclude it. Best-effort.
+async function mirrorPendingUserMessages(state: RenderState): Promise<void> {
+  let rows
+  try {
+    rows = await db
+      .select({ id: messages.id, content: messages.content })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, state.conversationId),
+          eq(messages.role, 'user'),
+          state.mirrorWatermark ? gt(messages.id, state.mirrorWatermark) : undefined,
+        ),
+      )
+      .orderBy(asc(messages.id))
+  } catch (err) {
+    console.error(`[discord ${state.conversationId}] user-message mirror read failed:`, err)
+    return
+  }
+  for (const row of rows) {
+    // Skip a user message already present in the post: a Discord-originated turn (rendered by
+    // onMessageCreate and ref'd at done) or one this loop already mirrored.
+    if (await hasMessageSurfaceRef(db, row.id, 'discord').catch(() => true)) continue
+    const text = textFromContent(row.content).trim()
+    if (!text) {
+      // A bare-image user turn: record the ref so we don't re-check it, but don't post an empty quote.
+      await insertMessageSurfaceRef(db, { messageId: row.id, surface: 'discord' }).catch(() => {})
+      continue
+    }
+    const quoted = `🧑 ${text}`
+      .split('\n')
+      .map((l) => `> ${l}`)
+      .join('\n')
+    const sent = await sendTo(state, quoted)
+    await insertMessageSurfaceRef(db, {
+      messageId: row.id,
+      surface: 'discord',
+      externalId: sent?.id ?? null,
+    }).catch(() => {})
+  }
+}
+
+// Mark this conversation's newest user message(s) (id > the captured watermark) as already mirrored
+// to Discord, WITHOUT posting a quoted line — for a Discord-ORIGINATED turn (the owner typed in a
+// bound post). The owner's text is already visible in the post, so we only need a message_surface_refs
+// row so the standing path's mirrorPendingUserMessages never re-posts it as a "🧑 …" quote. Records
+// the placeholder is the visible turn anchor; externalId is left null (no single artifact to edit).
+// Best-effort. Scoped to id > sinceMessageId so we never touch older (already-ref'd) history.
+async function recordDiscordOriginatedUserTurn(
+  conversationId: string,
+  sinceMessageId: string | null,
+): Promise<void> {
+  try {
+    const rows = await db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, conversationId),
+          eq(messages.role, 'user'),
+          sinceMessageId ? gt(messages.id, sinceMessageId) : undefined,
+        ),
+      )
+    for (const row of rows) {
+      await insertMessageSurfaceRef(db, { messageId: row.id, surface: 'discord' }).catch(() => {})
+    }
+  } catch (err) {
+    console.error(`[discord ${conversationId}] discord-originated user-turn ref failed:`, err)
+  }
+}
+
 // Handle one RunEvent for a conversation's active render state. Mirrors the SSE consumer the web
 // client uses, translated to Discord message edits. Unknown / no-Discord-surface events
 // (title/usage/tts_audio) are ignored; tool_call_* could drive a typing indicator but are otherwise
@@ -539,11 +828,15 @@ function compactArgs(args: unknown): string {
 async function handleEvent(state: RenderState, event: { type?: string; [k: string]: unknown }): Promise<void> {
   switch (event.type) {
     case 'token': {
+      // A STANDING (bound) run streaming its first token: prep the post (mirror the user turn, open
+      // a target). For an interactive turn this is a no-op (the placeholder is already emitted[0]).
+      if (state.standing && !(await prepareStandingRun(state))) break
       state.buffer += String(event.text ?? '')
       scheduleFlush(state)
       break
     }
     case 'tool_call_start': {
+      if (state.standing && !(await prepareStandingRun(state))) break
       // Show tool usage as a quiet inline "chip" woven into the streamed message, in event order
       // (mirrors the web client's chips). Discord subtext (`-#`) renders small + muted. Args are
       // shown only when present (the worker omits large ones to stay under the NOTIFY cap) and
@@ -560,6 +853,9 @@ async function handleEvent(state: RenderState, event: { type?: string; [k: strin
     case 'interaction_required': {
       const interactionId = String(event.interactionId ?? '')
       if (!interactionId) break
+      // A standing run can pause for approval as its FIRST event (before any token) — prep the post
+      // (mirror the user turn, open a target) so the approval card lands beneath the quoted prompt.
+      if (state.standing && !(await prepareStandingRun(state))) break
       if (event.kind === 'question') await renderQuestion(state, interactionId)
       else await renderApproval(state, interactionId)
       break
@@ -580,10 +876,17 @@ async function handleEvent(state: RenderState, event: { type?: string; [k: strin
       break
     }
     case 'done': {
+      // A standing run that produced no streamed token (e.g. a tool-only or trivial run) still needs
+      // its user turn mirrored and a target opened so the reply/images land. No-op for interactive
+      // turns and for a standing run already prepped by an earlier token/tool/interaction event.
+      if (state.standing) await prepareStandingRun(state)
       // Drain (not just request) the final flush so an in-flight throttled edit can't be skipped
       // past — the final token state renders BEFORE the image follow-up and before teardown.
       await drainRender(state)
       await uploadRunImages(state)
+      // Record a surface ref for each assistant/tool message this run produced, so the live stream
+      // (which the bot itself rendered) is never re-mirrored as a quoted line by a later prep pass.
+      await recordRunAssistantRefs(state)
       await teardownRender(`conversation:${state.conversationId}`)
       break
     }
@@ -751,14 +1054,17 @@ async function handleWatcherNotification(row: {
   if (!post) return // forums unavailable / not in our guild — Web Push still delivered it
 
   // Register (or reuse) a lightweight render state for this post so the approval/question renderers
-  // (which post into state.emitted[0]'s channel) and the component-resolve tracking work. Watcher
-  // runs don't stream, so we never LISTEN this conversation channel — the state only carries the post
-  // message + the pendingComponents map.
-  const channel = `conversation:${conversationId}`
-  let state = renderByChannel.get(channel)
+  // (which post into the post channel) and the component-resolve tracking work across the
+  // approval→result notification sequence. This is a DEDICATED map (watcherRenderByConversation),
+  // SEPARATE from the streaming renderByChannel: a watcher conversation is now BOUND, so it ALSO has
+  // a standing renderByChannel state (for live-streamed replies) — keeping the post-final watcher
+  // state apart means the two never clobber each other's emitted/buffer/sinceMessageId. Watcher runs
+  // don't stream, so this state carries only the post message + the pendingComponents map.
+  let state = watcherRenderByConversation.get(conversationId)
   if (!state) {
     state = {
       conversationId,
+      postChannelId: post.channelId,
       emitted: [post],
       buffer: '',
       sealedLen: 0,
@@ -767,10 +1073,12 @@ async function handleWatcherNotification(row: {
       pendingFlush: false,
       flushPromise: undefined,
       sinceMessageId: null,
+      mirrorWatermark: null,
       pendingComponents: new Map(),
       eventChain: Promise.resolve(),
+      standing: false,
     }
-    renderByChannel.set(channel, state)
+    watcherRenderByConversation.set(conversationId, state)
   }
 
   switch (row.kind) {
@@ -805,33 +1113,48 @@ async function handleWatcherNotification(row: {
 }
 
 // Ensure the watcher conversation has a Discord post, creating one on the first notification and
-// repointing the conversation to it. Returns the post's starter message (the surface the renderers
-// post into) or null if the forum is unavailable / not in our guild.
+// BINDING the conversation to it via conversation_surfaces (multi-surface spec 2026-06-21, replacing
+// the old repointConversationChannel: the conversation keeps ingress='trigger' as origin, and gains a
+// conversation_surfaces(discord, postId) row instead of having its ingress overwritten). Returns the
+// post's starter message (the surface the renderers post into) or null if the forum is unavailable.
 //
 // Three cases:
 //   1. We already created a post this process (watcherPosts) — fetch + reuse it.
-//   2. The conversation is already ingress='discord' (a prior fire repointed it, surviving in the DB
-//      across a bot restart) — its channelKey IS the post; fetch + reuse, no new post.
-//   3. Still ingress='trigger' (worker just created it) — create a NEW post in the watchers forum and
-//      repoint the conversation to (ingress='discord', channel_key=<post id>).
+//   2. The conversation is already bound to a Discord post (a prior fire bound it, surviving in the DB
+//      across a bot restart, via getConversationSurfaceKey) — its binding's external_key IS the post;
+//      fetch + reuse, no new post.
+//   3. Unbound (worker just created the per-fire conversation) — create a NEW post in the watchers
+//      forum and write a conversation_surfaces(discord, post.id) binding so a reply resolves back.
+//
+// We deliberately do NOT open a standing LISTEN here. The watcher's OWN autonomous run (isTrigger,
+// human_in_loop=false) DOES emit token/done NOTIFYs on conversation:<id> (run.ts) — but it must
+// render POST-FINAL from the DB (the new post is the alert), so a standing LISTEN open during that
+// run would double-render it live. Mid-fire, the run can park on an approval and resume emitting
+// tokens AFTER this consumer runs, so opening the LISTEN here is exactly the unsafe window. The
+// binding alone is enough: a DISCORD-originated reply streams via onMessageCreate's own per-turn
+// LISTEN, and a WEB/iOS-originated reply streams via the standing LISTEN re-established at the NEXT
+// boot (by when the autonomous run is long terminal — boot is the safe time). A web reply to a
+// just-fired watcher before the next boot lands in the DB + on web but won't live-mirror to Discord
+// that session — an accepted gap (watcher conversations lean post-final per spec).
 async function ensureWatcherPost(
   conversationId: string,
-  ingress: string,
-  channelKey: string,
+  _ingress: string,
+  _channelKey: string,
   convTitle: string | null,
   notificationTitle: string,
 ): Promise<DiscordMessage | null> {
-  // Case 1/2: a post channel id is known (in-process map, or the conversation is already on Discord).
-  const knownPostId = watcherPosts.get(conversationId) ?? (ingress === 'discord' ? channelKey : undefined)
+  // Case 1/2: a post channel id is known (in-process map, or a persisted binding survives a restart).
+  const boundKey = await getConversationSurfaceKey(db, conversationId, 'discord').catch(() => undefined)
+  const knownPostId = watcherPosts.get(conversationId) ?? boundKey
   if (knownPostId) {
     const msg = await fetchPostTarget(knownPostId)
     if (msg) {
       watcherPosts.set(conversationId, knownPostId)
-      // We created the post but a prior repoint failed (conversation still ingress='trigger') — retry
-      // so a reply in the post resolves. A no-op once it's already ingress='discord'.
-      if (ingress !== 'discord') {
-        await repointConversationChannel(db, { id: conversationId, ingress: 'discord', channelKey: knownPostId }).catch(
-          (err) => console.error(`[discord ${conversationId}] repoint retry failed:`, err instanceof Error ? err.message : err),
+      // We created the post but a prior bind failed (no binding row yet) — retry so a reply in the
+      // post resolves. Idempotent (onConflictDoNothing) once the binding exists.
+      if (!boundKey) {
+        await bindConversationSurface(db, { conversationId, surface: 'discord', externalKey: knownPostId }).catch(
+          (err) => console.error(`[discord ${conversationId}] bind retry failed:`, err instanceof Error ? err.message : err),
         )
       }
       return msg
@@ -856,14 +1179,15 @@ async function ensureWatcherPost(
     return null
   }
   try {
-    await repointConversationChannel(db, { id: conversationId, ingress: 'discord', channelKey: post.id })
+    await bindConversationSurface(db, { conversationId, surface: 'discord', externalKey: post.id })
   } catch (err) {
-    // The repoint failed — the conversation stays ingress='trigger', so a reply in the post won't
-    // resolve (onMessageCreate keys on channelId). Still post the report (better than silence), but
-    // log loudly. Best-effort; a next notification re-attempts the repoint via case 3 again.
-    console.error(`[discord ${conversationId}] repoint to post ${post.id} failed:`, err instanceof Error ? err.message : err)
+    // The bind failed — without the binding row a reply in the post won't resolve back to this
+    // conversation. Still post the report (better than silence), but log loudly. Best-effort; a next
+    // notification re-attempts the bind via case 2's retry.
+    console.error(`[discord ${conversationId}] bind to post ${post.id} failed:`, err instanceof Error ? err.message : err)
   }
   watcherPosts.set(conversationId, post.id)
+  // No standing LISTEN here (see the header note): the autonomous run renders post-final.
   // The starter message of the post is its first renderable target (createForumPost seeds it with '…').
   const starter = await post.fetchStarterMessage().catch(() => null)
   return starter ?? (await fetchPostTarget(post.id))
@@ -906,6 +1230,210 @@ async function postWatcherText(target: DiscordMessage, text: string): Promise<vo
       console.error(`[discord] watcher report continuation failed:`, err),
     )
   }
+}
+
+// --- Pull-to-Discord (materialize a web/iOS conversation as a forum post) -----------------------
+//
+// The bot is the ONLY process that can create a Discord post, so the explicit "Continue in Discord"
+// action — a web button (POST /api/conversations/:id/surfaces/discord) or the /pull slash command —
+// hands off to the bot over the 'discord-pull' NOTIFY channel (requestDiscordPull). On receipt the
+// bot materializes the conversation: create a Conversations-forum post, bind it
+// (conversation_surfaces(discord, postId)), mirror the last ~20 messages into the post (with an
+// "earlier on web →" note when older history exists), write a message_surface_refs row per mirrored
+// message so the standing path never re-posts them, and open a standing LISTEN so future runs stream
+// in. Fire-and-forget (the doorbell carries only the conversation id) — a pull while the bot is down
+// is simply lost and the owner retries (spec accepts the analogous loss for watcher fires).
+
+const HISTORY_MIRROR_LIMIT = 20
+
+// Serialize pull materializations (each is several async Discord calls) so two doorbell pings for the
+// same conversation don't race into two posts.
+let pullChain: Promise<void> = Promise.resolve()
+
+function schedulePull(conversationId: string): void {
+  pullChain = pullChain
+    .then(async () => {
+      await materializePull(conversationId)
+    })
+    .catch((err) => console.error(`[discord] pull ${conversationId} failed:`, err))
+}
+
+// Materialize a web/iOS conversation into a Discord forum post. Idempotent: if it's already bound
+// (an earlier pull, or a re-delivered doorbell), reuse the existing post and just re-ensure the
+// standing LISTEN — never a second post. Returns the post (thread) channel id, or null on failure.
+async function materializePull(conversationId: string): Promise<string | null> {
+  // Already bound? Reuse — re-ensure the standing LISTEN (it may have been lost on a restart that
+  // raced this pull) and stop. The /pull picker filters bound conversations out, and the webserver
+  // 409s a re-pull, so this mainly guards a doubled doorbell.
+  const existingKey = await getConversationSurfaceKey(db, conversationId, 'discord').catch(() => undefined)
+  if (existingKey) {
+    await ensureStandingListen(conversationId, existingKey)
+    return existingKey
+  }
+
+  if (!conversationsForum) {
+    console.error(`[discord ${conversationId}] pull requested but no conversations forum — lost (owner retries)`)
+    return null
+  }
+
+  // Title the post from the conversation's own title (falls back to a generic name). The SELECT
+  // re-asserts owner scope (defense-in-depth): the webserver pull route + the /pull picker already
+  // filter to OWNER_USER_ID, but each surface should assert its own invariant rather than trust the
+  // doorbell payload — so the bot won't materialize an arbitrary conversation id handed to it
+  // (cheap, single-user; matters the day this is ever multi-user or NOTIFYable from a lesser path).
+  const [conv] = await db
+    .select({ title: conversationsTable.title })
+    .from(conversationsTable)
+    .where(and(eq(conversationsTable.id, conversationId), eq(conversationsTable.userId, OWNER_USER_ID)))
+    .limit(1)
+  if (!conv) {
+    console.error(`[discord ${conversationId}] pull requested for an unknown/non-owner conversation — ignored`)
+    return null
+  }
+  const name = conv.title?.trim() || 'Conversation from web'
+
+  let post
+  try {
+    post = await createForumPost(
+      conversationsForum,
+      name,
+      `**${name}** — continued from web.`,
+      10080,
+    )
+  } catch (err) {
+    console.error(`[discord ${conversationId}] pull post creation failed:`, err instanceof Error ? err.message : err)
+    return null
+  }
+
+  try {
+    await bindConversationSurface(db, { conversationId, surface: 'discord', externalKey: post.id })
+  } catch (err) {
+    console.error(`[discord ${conversationId}] pull bind failed:`, err instanceof Error ? err.message : err)
+    // Without the binding a reply won't resolve back; still mirror history (better than an empty
+    // dangling post), and the next pull/notification can re-bind via case-2's retry.
+  }
+
+  await mirrorRecentHistory(conversationId, post)
+  await ensureStandingListen(conversationId, post.id)
+  return post.id
+}
+
+// Mirror the conversation's last ~HISTORY_MIRROR_LIMIT messages into the freshly-created post so it
+// reads as a real thread, recording a message_surface_refs row for each so the standing path never
+// re-posts them. Prepends an "earlier on web →" note when older history was truncated. Renders text
+// (user as a "🧑 …" quote, assistant as plain text) and any workspace image parts as attachments.
+// Best-effort throughout — a single render failure logs and continues.
+async function mirrorRecentHistory(
+  conversationId: string,
+  post: import('discord.js').ThreadChannel,
+): Promise<void> {
+  let recent: { id: string; role: string; content: unknown }[]
+  let totalCount: number
+  try {
+    // Newest HISTORY_MIRROR_LIMIT (desc by uuidv7 id), then reverse to chronological for posting.
+    const rows = await db
+      .select({ id: messages.id, role: messages.role, content: messages.content })
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(desc(messages.id))
+      .limit(HISTORY_MIRROR_LIMIT + 1) // +1 to detect whether older history exists
+    totalCount = rows.length
+    recent = rows.slice(0, HISTORY_MIRROR_LIMIT).reverse()
+  } catch (err) {
+    console.error(`[discord ${conversationId}] history read for pull failed:`, err)
+    return
+  }
+
+  if (totalCount > HISTORY_MIRROR_LIMIT) {
+    await post.send({ content: '_… earlier on web →_' }).catch(() => {})
+  }
+
+  for (const row of recent) {
+    try {
+      await mirrorOneHistoryMessage(conversationId, post, row)
+    } catch (err) {
+      console.error(`[discord ${conversationId}] history mirror of ${row.id} failed:`, err)
+    }
+    // Record the ref even on a partial failure so a re-pull / the standing path doesn't double-post.
+    await insertMessageSurfaceRef(db, { messageId: row.id, surface: 'discord' }).catch(() => {})
+  }
+}
+
+// Render one historical message into the post: text (user quoted "🧑 …", assistant plain) followed by
+// any image parts as attachments. Skips system/tool rows and empty text. Best-effort.
+async function mirrorOneHistoryMessage(
+  conversationId: string,
+  post: import('discord.js').ThreadChannel,
+  row: { id: string; role: string; content: unknown },
+): Promise<void> {
+  if (!post.isSendable()) return
+  const text = textFromContent(row.content).trim()
+  if (text) {
+    let body: string
+    if (row.role === 'user') {
+      body = `🧑 ${text}`
+        .split('\n')
+        .map((l) => `> ${l}`)
+        .join('\n')
+    } else if (row.role === 'assistant') {
+      body = text
+    } else {
+      body = '' // system/tool turns aren't mirrored as text
+    }
+    if (body) {
+      for (const chunk of chunkMessage(body, DISCORD_MESSAGE_LIMIT)) {
+        await post.send({ content: chunk }).catch((err) =>
+          console.error(`[discord ${conversationId}] history text mirror failed:`, err),
+        )
+      }
+    }
+  }
+
+  // Image parts (any role) — upload as attachments so a screenshot/generated image shows in-thread.
+  const parts = Array.isArray(row.content) ? (row.content as unknown[]) : []
+  const files: AttachmentBuilder[] = []
+  for (const part of parts) {
+    if (!isImageRef(part)) continue
+    try {
+      const abs = resolveInWorkspace(conversationId, part.path)
+      const bytes = await readFile(abs)
+      const ext = extForImageMime(part.mimeType) ?? 'png'
+      files.push(new AttachmentBuilder(bytes, { name: `${path.basename(part.path, path.extname(part.path))}.${ext}` }))
+    } catch (err) {
+      console.error(`[discord ${conversationId}] history image read failed (${part.path}):`, err)
+    }
+  }
+  for (let i = 0; i < files.length; i += 10) {
+    await post.send({ files: files.slice(i, i + 10) }).catch(() => {})
+  }
+}
+
+// Handle the /pull picker's selection (multi-surface spec 2026-06-21): materialize the chosen
+// conversation into a Discord post and reply with a link to it. We materialize DIRECTLY here (the
+// bot is itself the pull consumer) rather than NOTIFY'ing 'discord-pull', so the owner gets the post
+// link in the ephemeral reply instead of fire-and-forget. Owner-checked already by onInteractionCreate.
+async function handlePullPick(
+  interaction: import('discord.js').StringSelectMenuInteraction,
+): Promise<void> {
+  await interaction.deferUpdate().catch(() => {})
+  const conversationId = interaction.values[0]
+  if (!conversationId) return
+  // Serialize through the same chain materializePull uses so a /pull and a doorbell can't race.
+  const postId = await new Promise<string | null>((resolve) => {
+    pullChain = pullChain.then(async () => {
+      try {
+        resolve(await materializePull(conversationId))
+      } catch (err) {
+        console.error(`[discord] /pull materialize ${conversationId} failed:`, err)
+        resolve(null)
+      }
+    })
+  })
+  const content = postId
+    ? `Continuing here: <#${postId}>`
+    : 'Could not pull that conversation (check my Manage Channels permission and that the conversations forum exists).'
+  // The picker message is the ephemeral /pull reply — edit it (disabling the select) with the result.
+  await interaction.editReply({ content, components: [] }).catch(() => {})
 }
 
 // --- Inbound message flow -----------------------------------------------------------------------
@@ -1014,8 +1542,29 @@ async function onMessageCreate(message: DiscordMessage): Promise<void> {
     throw err
   }
 
+  // A reply in a BOUND post (a pulled web/iOS conversation, or a watcher post) must NOT create a
+  // fresh interactive state: the conversation already has a STANDING state with an open LISTEN that
+  // will render this run. Reuse it — prep its render fields for this turn (a fresh target + the
+  // captured watermark) and skip the per-turn LISTEN (the standing one is already live). The
+  // standing state also survives `done` (teardownRender keeps it), so the next reply streams too.
+  const existing = renderByChannel.get(channel)
+  if (existing?.standing) {
+    // Discord-originated turn: this run's reply will stream into the post via the standing LISTEN.
+    // Record a surface ref for the just-inserted user message so the standing path never re-mirrors
+    // it as a "🧑 …" quoted line (the owner already typed it visibly in the post) — and so the
+    // placeholder we sent above IS the user's visible line; the assistant reply streams below it.
+    existing.sinceMessageId = sinceMessageId
+    existing.emitted = [placeholder]
+    existing.buffer = ''
+    existing.sealedLen = 0
+    await recordDiscordOriginatedUserTurn(conversationId, sinceMessageId)
+    await enqueueAgentRun(runId)
+    return
+  }
+
   const state: RenderState = {
     conversationId,
+    postChannelId: target.id,
     emitted: [placeholder],
     buffer: '',
     sealedLen: 0,
@@ -1024,8 +1573,10 @@ async function onMessageCreate(message: DiscordMessage): Promise<void> {
     pendingFlush: false,
     flushPromise: undefined,
     sinceMessageId,
+    mirrorWatermark: null,
     pendingComponents: new Map(),
     eventChain: Promise.resolve(),
+    standing: false,
   }
   renderByChannel.set(channel, state)
   await notifyClient.query(`LISTEN "${channel}"`)
@@ -1160,6 +1711,42 @@ async function handleSlashCommand(
     return
   }
 
+  // /pull is bot-LOCAL (multi-surface spec 2026-06-21) — list recent web/iOS conversations not yet
+  // in Discord as a picker; the owner's choice is handled by handlePullPick (the select component).
+  if (interaction.commandName === 'pull') {
+    if (!conversationsForum) {
+      await interaction
+        .editReply({ content: 'The Alfred server isn’t set up for posts yet (no conversations forum).' })
+        .catch(() => {})
+      return
+    }
+    const rows = await listUnboundConversations(db, { userId: OWNER_USER_ID, surface: 'discord', limit: 25 })
+    if (rows.length === 0) {
+      await interaction.editReply({ content: 'No conversations to pull — every recent one is already in Discord.' }).catch(() => {})
+      return
+    }
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('pull-pick')
+      .setPlaceholder('Pick a conversation to continue here')
+      .setMinValues(1)
+      .setMaxValues(1)
+      .addOptions(
+        rows.map((r) => ({
+          // The option VALUE is the conversation id; the label is the title (or a generic name).
+          label: (r.title?.trim() || 'Untitled conversation').slice(0, 100),
+          value: r.id,
+          description: r.ingress !== 'web' ? r.ingress.slice(0, 100) : undefined,
+        })),
+      )
+    await interaction
+      .editReply({
+        content: 'Which conversation should I continue here?',
+        components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
+      })
+      .catch(() => {})
+    return
+  }
+
   const conversationId = await getOrCreateConversationByChannel(db, {
     ingress: 'discord',
     channelKey: interaction.channelId,
@@ -1191,6 +1778,16 @@ async function handleComponent(
   // per-conversation, so an interaction the bot rendered is one it owns. Removing any of these (e.g.
   // multi-user, or sourcing the interactionId from user input) would break confinement — add a real
   // conversation-ownership assertion before doing so.
+
+  // The /pull picker's select (multi-surface spec 2026-06-21) uses its own customId namespace
+  // ('pull-pick'), deliberately NOT one parseCustomId recognizes — handle it here before the
+  // approval/question routing so it isn't dropped. The chosen value is the conversation id to
+  // materialize into a Discord post.
+  if (interaction.isStringSelectMenu() && interaction.customId === 'pull-pick') {
+    await handlePullPick(interaction)
+    return
+  }
+
   const parsed = parseCustomId(interaction.customId)
   if (!parsed) return
   const { action, interactionId } = parsed
@@ -1330,7 +1927,16 @@ function buildSlashCommands(): RESTPostAPIApplicationCommandsJSONBody[] {
     .addStringOption((opt) => opt.setName('title').setDescription('Optional title for the conversation').setRequired(false))
     .toJSON()
 
-  return [...registry, newCmd]
+  // The bot-local /pull (multi-surface spec 2026-06-21) — list recent (not-yet-in-Discord)
+  // conversations as a picker; choosing one materializes it as a Conversations-forum post so the
+  // owner can continue a web/iOS conversation in Discord. Also a guild-only act (no conversations
+  // forum ⇒ its handler reports unavailable).
+  const pullCmd = new SlashCommandBuilder()
+    .setName('pull')
+    .setDescription('Continue a recent web/iOS conversation here in Discord')
+    .toJSON()
+
+  return [...registry, newCmd, pullCmd]
 }
 
 async function registerSlashCommands(applicationId: string): Promise<void> {
@@ -1487,7 +2093,23 @@ if (DISCORD_GUILD_ID) {
     console.error('[discord] notifications LISTEN connection ended unexpectedly — exiting for pm2 restart')
     process.exit(1)
   })
-  notifClient.on('notification', () => scheduleNotifDrain())
+  // notifClient carries TWO doorbell channels — branch by name. 'notifications' is the per-fire
+  // watcher outbox (drain + post). 'discord-pull' is the explicit "Continue in Discord" request
+  // (multi-surface spec 2026-06-21): the payload is the bare conversation id to materialize.
+  notifClient.on('notification', (msg) => {
+    if (msg.channel === 'discord-pull') {
+      const conversationId = msg.payload?.trim()
+      // The payload is a conversation UUID (requestDiscordPull). Validate before use — it flows into an
+      // unparameterized LISTEN "conversation:<id>" inside ensureStandingListen, so a non-UUID (a stray
+      // NOTIFY) must never reach it. A genuine pull always matches.
+      if (conversationId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationId)) {
+        schedulePull(conversationId)
+      }
+      return
+    }
+    // Default ('notifications'): re-read + post any unseen watcher rows.
+    scheduleNotifDrain()
+  })
   // Seed the dedupe set with the EXISTING backlog so a fire that happened while the bot was down is
   // NOT given a catch-up post (spec "Re-pointing when the bot is down → Web Push only"). Only rows
   // inserted after this point get a post. Bounded to the most-recent rows (uuidv7 id desc) — well
@@ -1503,7 +2125,24 @@ if (DISCORD_GUILD_ID) {
     console.error('[discord] notifications boot-seed failed (a stale fire may get a catch-up post):', err)
   }
   await notifClient.query('LISTEN "notifications"')
-  console.log('[discord] notifications consumer listening (per-fire watcher posts)')
+  // The pull doorbell (the webserver / our /pull command NOTIFY it).
+  await notifClient.query('LISTEN "discord-pull"')
+  console.log('[discord] notifications + pull consumers listening')
+
+  // Re-establish a standing LISTEN for every conversation already bound to Discord (multi-surface
+  // spec 2026-06-21) — re-adds what the per-fire change removed, but ONLY for the curated set of
+  // explicitly-bound conversations (pulled web/iOS conversations + watcher posts), NOT a per-watcher
+  // reconcile. A bound conversation's future runs then stream live into its post. Best-effort — a
+  // missing post (deleted) just means that conversation's standing render no-ops until re-bound.
+  try {
+    const bound = await listBoundConversations(db, 'discord')
+    for (const { conversationId, externalKey } of bound) {
+      await ensureStandingListen(conversationId, externalKey)
+    }
+    console.log(`[discord] standing LISTENs re-established for ${bound.length} bound conversation(s)`)
+  } catch (err) {
+    console.error('[discord] standing-LISTEN re-establish failed:', err)
+  }
 }
 
 // Log in to the Discord gateway.

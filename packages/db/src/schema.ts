@@ -56,10 +56,47 @@ export const conversations = pgTable(
     lastActiveAt: timestamp('last_active_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    unique('conversations_ingress_channel_key_unique').on(t.ingress, t.channelKey),
+    // unique(ingress, channel_key) was DROPPED (multi-surface spec 2026-06-21, migration 0013):
+    // Discord post→conversation routing moved from conversations.channel_key to the
+    // conversation_surfaces binding table. `ingress` now records only where a conversation was
+    // BORN (origin metadata; still drives human_in_loop) and `channel_key` is just that origin's
+    // key (web: =id self-ref; discord-born: the channel id; trigger: =id self-ref) — neither is
+    // a uniqueness/routing key any more, so a conversation can have a Discord presence (a
+    // conversation_surfaces row) without changing its ingress.
     index('conversations_user_last_active_idx').on(t.userId, t.lastActiveAt.desc()),
     // Recurring watcher runs resolve their automation by this column per run, so index it.
     index('conversations_automation_idx').on(t.automationId),
+  ],
+)
+
+// conversation_surfaces: the Discord-post → conversation routing index (multi-surface spec
+// 2026-06-21). Replaces unique(ingress, channel_key) as the resolution key for Discord. A row
+// binds a surface's external key (a Discord forum-post/thread channel id) to its canonical
+// conversation; `unique(surface, external_key)` makes that mapping 1:1 so a reply in a post
+// resolves to exactly one conversation. v1 holds only surface='discord' rows — web/iOS/voice
+// resolve by conversation_id directly (no binding row), so this is effectively "the Discord
+// materialization index," not yet a general N-surface registry. Written explicitly: on pull-to-
+// Discord (bot creates the post) and at watcher per-fire materialization (replacing the old
+// repointConversationChannel). The conversation's own id never changes, so web deep-links + the
+// all-ingress sidebar are unaffected.
+export const conversationSurfaces = pgTable(
+  'conversation_surfaces',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    conversationId: uuid('conversation_id')
+      .notNull()
+      .references(() => conversations.id),
+    surface: text('surface').notNull(), // 'discord' (v1); future 'web'/'voice' if they ever need a binding
+    externalKey: text('external_key').notNull(), // the surface's external id (Discord: post/thread channel id)
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // The routing index: a Discord post id → its conversation, 1:1.
+    unique('conversation_surfaces_surface_external_key_unique').on(t.surface, t.externalKey),
+    // Reverse lookup: every surface bound to a conversation (bot boot standing-LISTEN re-establish).
+    index('conversation_surfaces_conversation_idx').on(t.conversationId),
   ],
 )
 
@@ -77,6 +114,32 @@ export const messages = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('messages_conversation_created_idx').on(t.conversationId, t.createdAt)],
+)
+
+// message_surface_refs: mirror-idempotency ledger (multi-surface spec 2026-06-21). Records which
+// messages have already been rendered to which surface (and the surface's id for the rendered
+// artifact — e.g. the Discord message id, so an edit can target it), so the bot never re-posts a
+// message already present in a bound Discord post (its own renders, or Discord-originated turns).
+// `unique(message_id, surface)` keeps one ref per (message, surface) — at-most-once mirroring per
+// surface. No bridge process: the bot writes these as it mirrors. external_id is nullable for
+// surfaces that don't return an addressable artifact id (kept open; v1 Discord always has one).
+export const messageSurfaceRefs = pgTable(
+  'message_surface_refs',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    messageId: uuid('message_id')
+      .notNull()
+      .references(() => messages.id),
+    surface: text('surface').notNull(), // 'discord'
+    externalId: text('external_id'), // the rendered artifact's id on the surface (Discord message id); nullable
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    unique('message_surface_refs_message_surface_unique').on(t.messageId, t.surface),
+    index('message_surface_refs_message_idx').on(t.messageId),
+  ],
 )
 
 // agent_runs: one row per job. Full columns per docs/DATABASE.md, but this step only

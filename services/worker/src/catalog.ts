@@ -16,6 +16,7 @@ import {
   makeGenerateImageTool,
   makeSetTitleTool,
   runAutomationTool,
+  updateAutomationTool,
 } from './tools.js'
 
 // Browser tools are process-static (the bridge is a singleton; the tools carry no per-run
@@ -50,6 +51,7 @@ export function buildRunTools(
     makeAskUserTool(askUserPause ?? askUserPauseStub),
     makeCreateAutomationTool(conversationId, runId),
     listTriggersTool,
+    updateAutomationTool,
     disableTriggerTool,
     deleteTriggerTool,
     runAutomationTool,

@@ -12,6 +12,7 @@ import {
   listTriggers,
   OWNER_USER_ID,
   setTriggerEnabled,
+  updateAutomation,
 } from '@alfred/db'
 import { imageMimeForExt, resolveInWorkspace } from '@alfred/shared'
 import { eq } from 'drizzle-orm'
@@ -274,10 +275,11 @@ export const MAX_SELF_SCHEDULE_TRIGGERS = 25
 // comma list of those. Used by the validator below — pg-boss cron is the standard 5-field form.
 const CRON_FIELD_TOKEN = /^(\*|\d+)(-\d+)?(\/\d+)?$/
 
-// The decision create_automation makes from its `when` arg, as a pure value so it's unit-testable
-// without a db write. `kind:'schedule'` ⇒ a recurring cron trigger; `kind:'self'` ⇒ a one-shot
-// trigger firing once at `nextFireAt`; `error` ⇒ a rejection (bad cron / unparseable timestamp)
-// surfaced to the agent as a clear tool error.
+// The decision create_automation / update_automation make from a `when` arg, as a pure value so it's
+// unit-testable without a db write. `kind:'schedule'` ⇒ a recurring cron trigger; `kind:'self'` ⇒ a
+// one-shot trigger firing once at `nextFireAt`; `error` ⇒ a rejection (bad cron / unparseable
+// timestamp). The error is tool-agnostic (no tool-name prefix) so both callers can reuse it and add
+// their own prefix.
 export type WhenDecision =
   | { kind: 'schedule'; cron: string }
   | { kind: 'self'; nextFireAt: Date }
@@ -315,18 +317,18 @@ function validateCron(expr: string): string | null {
 // error, never a silently never-firing trigger.
 export function decideWhen(rawWhen: string): WhenDecision {
   const when = rawWhen.trim()
-  if (!when) return { error: 'create_automation requires a non-empty when' }
+  if (!when) return { error: 'a non-empty when is required (a cron expression or an ISO-8601 timestamp)' }
   // More than one whitespace-separated field ⇒ the agent meant a cron expression. Validate it
   // strictly (5 fields, valid tokens) rather than treating a malformed 5-token string as a valid cron
   // that never fires.
   if (/\s/.test(when)) {
     const err = validateCron(when)
-    return err ? { error: `create_automation: ${err}` } : { kind: 'schedule', cron: when }
+    return err ? { error: err } : { kind: 'schedule', cron: when }
   }
   // A single token: an absolute one-shot timestamp.
   const ms = Date.parse(when)
   if (Number.isNaN(ms)) {
-    return { error: `create_automation: "${when}" is neither a cron expression nor a parseable timestamp` }
+    return { error: `"${when}" is neither a cron expression nor a parseable timestamp` }
   }
   return { kind: 'self', nextFireAt: new Date(ms) }
 }
@@ -369,6 +371,13 @@ export function makeCreateAutomationTool(conversationId: string, runId?: string)
     inputSchema: {
       type: 'object',
       properties: {
+        name: {
+          type: 'string',
+          description:
+            'A short human label for this automation (≤80 chars). It names the automation and titles ' +
+            'each conversation the automation spawns when it fires, so prefer a clear noun phrase ' +
+            '(e.g. "Morning inbox digest", "Rent reminder"). Defaults to the start of the objective if omitted.',
+        },
         trigger: {
           type: 'string',
           enum: TRIGGER_NAMES,
@@ -400,12 +409,14 @@ export function makeCreateAutomationTool(conversationId: string, runId?: string)
     group: 'triggers',
     async invoke(args: unknown): Promise<unknown> {
       const {
+        name: rawName,
         trigger: rawTrigger,
         params: rawParams,
         when: rawWhen,
         objective: rawObjective,
         notify_policy: rawNotifyPolicy,
       } = (args ?? {}) as {
+        name?: unknown
         trigger?: unknown
         params?: unknown
         when?: unknown
@@ -449,7 +460,7 @@ export function makeCreateAutomationTool(conversationId: string, runId?: string)
       let nextFireAt: Date | null = null
       if (!isPush) {
         const decision = decideWhen(String(rawWhen ?? ''))
-        if ('error' in decision) return { ok: false, error: decision.error }
+        if ('error' in decision) return { ok: false, error: `create_automation: ${decision.error}` }
         if (decision.kind === 'schedule') schedule = decision.cron
         else nextFireAt = decision.nextFireAt
       }
@@ -473,8 +484,10 @@ export function makeCreateAutomationTool(conversationId: string, runId?: string)
       const isOneShot = !schedule && nextFireAt != null
       const { id } = await insertAutomation(db, {
         userId: OWNER_USER_ID,
-        // A short human label from the objective (the row's `name`).
-        name: objective.slice(0, 80),
+        // The agent-supplied label (≤80 chars), else a short label derived from the objective. This
+        // `name` is the automation's label AND the title of each per-fire conversation it spawns
+        // (createAutomationRun passes automation.name as the conversation title).
+        name: String(rawName ?? '').trim().slice(0, 80) || objective.slice(0, 80),
         trigger: triggerName,
         conversationId: isOneShot ? conversationId : null,
         schedule,
@@ -557,6 +570,164 @@ export const deleteTriggerTool: Tool = {
     if (!id) return { ok: false, error: 'delete_trigger requires a trigger id' }
     const { deleted } = await deleteTrigger(getDb(), { userId: OWNER_USER_ID, id })
     return deleted ? { ok: true, id } : { ok: false, error: 'no such trigger' }
+  },
+}
+
+// Edit an existing automation's mutable definition fields (name / objective / params / when /
+// notify_policy / enabled), keyed by id. write-tier like disable/delete: a prompt-injected agent must
+// not be able to silently repurpose or reschedule the owner's standing automations (approval is
+// owner-overridable from the Tools page). Only the supplied fields change; the rest are left as-is.
+// The trigger MECHANISM itself isn't changeable here — to switch trigger type, delete and recreate
+// (keeps the detection-cursor semantics simple). The scheduler picks up schedule/enabled changes on
+// its next reconcile. group 'triggers'.
+export const updateAutomationTool: Tool = {
+  name: 'update_automation',
+  description:
+    'Edit an existing automation/watcher by id (from list_triggers). Supply only the fields to ' +
+    'change — omitted fields are left as-is. Editable: name (its label + the title of each ' +
+    'conversation it spawns), objective (what it does when it fires), params (the trigger\'s params, ' +
+    're-validated against its schema; triggers: ' +
+    TRIGGER_CATALOG_DESCRIPTION +
+    '), when (reschedule — a cron expression for recurring or an ISO-8601 timestamp for one-time; ' +
+    'poll triggers only), notify_policy, and enabled (false to pause, true to resume). To change the ' +
+    'trigger MECHANISM itself, delete and recreate instead.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'The automation id from list_triggers.' },
+      name: {
+        type: 'string',
+        description: 'New human label (≤80 chars); also titles each per-fire conversation it spawns.',
+      },
+      objective: { type: 'string', description: 'New seed prompt — what the run does when it fires.' },
+      params: {
+        type: 'object',
+        description:
+          "Replace the trigger's params (re-validated against the trigger's schema). Changing params " +
+          're-baselines detection — the automation will not fire on already-existing items, only on ' +
+          'new ones after the change.',
+      },
+      when: {
+        type: 'string',
+        description:
+          'Reschedule: a cron expression (recurring) or an absolute ISO-8601 timestamp (one-time). ' +
+          'Only for poll triggers (email/timer); a webhook trigger has no schedule.',
+      },
+      notify_policy: {
+        type: 'string',
+        enum: ['always', 'on_change', 'on_threshold', 'digest'],
+        description: 'When a finished run should push a notification.',
+      },
+      enabled: { type: 'boolean', description: 'false to pause (like disable_trigger), true to resume.' },
+    },
+    required: ['id'],
+  },
+  trustTier: 'write',
+  group: 'triggers',
+  async invoke(args: unknown): Promise<unknown> {
+    const a = (args ?? {}) as Record<string, unknown>
+    const id = String(a.id ?? '').trim()
+    if (!id) return { ok: false, error: 'update_automation requires an automation id' }
+
+    const db = getDb()
+    const automation = await getAutomation(db, id)
+    if (!automation || automation.userId !== OWNER_USER_ID) return { ok: false, error: 'no such automation' }
+
+    // The trigger is fixed across an update; resolve it once (it was validated at create, but a
+    // direct DB row could carry an unknown name — guard rather than throw).
+    let trigger: ReturnType<typeof lookupTrigger>
+    try {
+      trigger = lookupTrigger(automation.trigger)
+    } catch {
+      return {
+        ok: false,
+        error: `update_automation: automation has an unknown trigger "${automation.trigger}" — delete and recreate it`,
+      }
+    }
+
+    const fields: {
+      name?: string
+      objective?: string
+      params?: unknown
+      schedule?: string | null
+      nextFireAt?: Date | null
+      notifyPolicy?: string
+      enabled?: boolean
+      cursor?: unknown
+      pendingCursor?: unknown
+    } = {}
+
+    // `!= null` (not `!== undefined`) so a JSON `null` is treated as "field omitted", never coerced
+    // (String(null) would otherwise store the literal "null").
+    if (a.name != null) {
+      const name = String(a.name).trim()
+      if (!name) return { ok: false, error: 'update_automation: name must be non-empty' }
+      fields.name = name.slice(0, 80)
+    }
+    if (a.objective != null) {
+      const objective = String(a.objective).trim()
+      if (!objective) return { ok: false, error: 'update_automation: objective must be non-empty' }
+      fields.objective = objective
+    }
+    if (a.params != null) {
+      const paramErr = validateParams(trigger.paramsSchema, a.params)
+      if (paramErr) return { ok: false, error: `update_automation: invalid params for "${automation.trigger}" — ${paramErr}` }
+      fields.params = a.params
+      // Re-baseline detection on a params change: the prior cursor may be incomparable under the new
+      // params (e.g. an email `mailbox` switch — IMAP UIDs are per-mailbox), which would silently drop
+      // or re-report items. Nulling both makes the next detect() establish a fresh baseline (it won't
+      // fire on the pre-existing backlog). Trigger-agnostic, so no per-trigger special-casing here.
+      fields.cursor = null
+      fields.pendingCursor = null
+    }
+    if (a.when != null) {
+      // A push Trigger (webhook) is ingress-enqueued, never scheduled — it has no `when` (mirrors create).
+      if (trigger.mode === 'push') {
+        return { ok: false, error: `update_automation: a "${automation.trigger}" (webhook) trigger has no schedule — omit when` }
+      }
+      const decision = decideWhen(String(a.when))
+      if ('error' in decision) return { ok: false, error: `update_automation: ${decision.error}` }
+      // Set exactly one cadence column and null the other, so a row never looks both recurring
+      // (schedule) and one-shot (nextFireAt) to the scheduler.
+      if (decision.kind === 'schedule') {
+        fields.schedule = decision.cron
+        fields.nextFireAt = null
+      } else {
+        fields.nextFireAt = decision.nextFireAt
+        fields.schedule = null
+      }
+    }
+    if (a.notify_policy != null) {
+      const np = String(a.notify_policy)
+      if (np !== 'always' && np !== 'on_change' && np !== 'on_threshold' && np !== 'digest') {
+        return { ok: false, error: 'update_automation: notify_policy must be one of always | on_change | on_threshold | digest' }
+      }
+      fields.notifyPolicy = np
+    }
+    if (a.enabled != null) {
+      // Accept a real boolean or a stringified one — Boolean('false') is truthy, so a model that
+      // sends "false" must not be read as enable.
+      const enabled = a.enabled === true || a.enabled === 'true'
+      // Re-enabling a paused automation re-checks the standing-automation cap (§16) — the same bound
+      // create_automation enforces, since a disabled row doesn't occupy a slot.
+      if (enabled && !automation.enabled) {
+        const enabledRows = await listEnabledAutomations(db, OWNER_USER_ID)
+        if (enabledRows.length >= MAX_SELF_SCHEDULE_TRIGGERS) {
+          return {
+            ok: false,
+            error: `update_automation: already at the cap of ${MAX_SELF_SCHEDULE_TRIGGERS} enabled automations — disable another before resuming this one.`,
+          }
+        }
+      }
+      fields.enabled = enabled
+    }
+
+    if (Object.keys(fields).length === 0) {
+      return { ok: false, error: 'update_automation: nothing to update — supply at least one field besides id' }
+    }
+
+    const { updated } = await updateAutomation(db, { userId: OWNER_USER_ID, id, ...fields })
+    return updated ? { ok: true, id } : { ok: false, error: 'no such automation' }
   },
 }
 
